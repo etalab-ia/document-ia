@@ -9,11 +9,13 @@ from document_ia_schemas.field_metrics import Metric
 
 
 class BeneficiaireModel(BaseModel):
-    nom: str = Field(
+    nom: Optional[str] = Field(
+        default=None,
         description="Nom de famille du bénéficiaire / locataire",
         json_schema_extra={"metrics": Metric.LEVENSHTEIN_DISTANCE},
     )
-    prenoms: str = Field(
+    prenoms: Optional[str] = Field(
+        default=None,
         description="Prénoms du bénéficiaire / locataire",
         json_schema_extra={"metrics": Metric.LEVENSHTEIN_DISTANCE},
     )
