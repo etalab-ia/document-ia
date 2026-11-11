@@ -71,7 +71,11 @@ class DownloadFileStep(BaseFileManipulationStep[DownloadFileResult]):
         return DownloadFileResult.__name__
 
     async def _prepare_step(self) -> None:
+<<<<<<< HEAD
         logger.info("Preparing download step (execution_id=%s)", self.execution_id)
+=======
+        logger.info("Preparing download step for execution: %s", self.execution_id)
+>>>>>>> b92dedb6 (fix(worker): handle s3 delete return and protect s3_key in logs)
         tmp_dir = Path(self.tmp_folder_path)
         validate_safe_path(tmp_dir, self.sandbox_root)
         if not tmp_dir.exists():
@@ -259,9 +263,8 @@ class DownloadFileStep(BaseFileManipulationStep[DownloadFileResult]):
     ) -> tuple[DownloadFileResult, None]:
         start_time = time.perf_counter()
         s3_key_value = file_info.s3_key.get_secret_value()
-        logger.info(
-            "Downloading file from S3 storage (execution_id=%s)", self.execution_id
-        )
+        logger.info("Downloading file from S3 for execution: %s", self.execution_id)
+
         # Security: Extract basename safely and confine to sandbox
         safe_basename = Path(s3_key_value).name
         if not safe_basename or safe_basename in {".", ".."}:
@@ -297,11 +300,19 @@ class DownloadFileStep(BaseFileManipulationStep[DownloadFileResult]):
             logger.info("Cleaning up S3 files for execution: %s", self.execution_id)
             s3_manager = S3Manager()
             try:
-                s3_manager.delete_file(self.file_info.s3_key.get_secret_value())
-                logger.info(
-                    "S3 file deleted successfully (execution_id=%s)",
-                    self.execution_id,
+                deleted = s3_manager.delete_file(
+                    self.file_info.s3_key.get_secret_value()
                 )
+                if deleted:
+                    logger.info(
+                        "S3 file deleted successfully for execution %s",
+                        self.execution_id,
+                    )
+                else:
+                    logger.warning(
+                        "Failed to delete S3 file for execution %s",
+                        self.execution_id,
+                    )
             except S3AuthentificationException as e:
                 logger.error("S3 authentication failed during file deletion.")
                 raise RuntimeError("Error while deleting S3 file") from e
