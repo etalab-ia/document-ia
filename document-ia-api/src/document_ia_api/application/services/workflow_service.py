@@ -21,6 +21,7 @@ from document_ia_api.api.exceptions.entity_not_found_exception import (
 )
 from document_ia_api.application.services.execution_acceptance import (
     EXECUTION_RESERVATION_LOST_ERROR,
+    compensate_s3_upload,
     fail_abandoned_execution,
     fail_unscheduled_execution,
     scheduling_log_context,
@@ -116,6 +117,7 @@ class WorkflowService:
             execution_id = execution_id or str(uuid.uuid4())
 
             file_info: Optional[FileInfo] = None
+            s3_key_to_compensate: Optional[str] = None
 
             if file is not None:
                 # Validate uploaded file
@@ -128,6 +130,7 @@ class WorkflowService:
                 s3_upload_result = await self._upload_file_to_s3(
                     file_content, file.filename, detected_mime_type, metadata
                 )
+                s3_key_to_compensate = s3_upload_result["s3_key"]
 
                 # Prepare file info
 
@@ -182,6 +185,7 @@ class WorkflowService:
                     "Workflow execution %s: started event could not be persisted",
                     execution_id,
                 )
+                await compensate_s3_upload(s3_key_to_compensate, execution_id)
                 # Nothing is scheduled, so the caller must not be told the
                 # execution was accepted; the route releases the reservation and
                 # the client can retry with the same key.
@@ -204,6 +208,7 @@ class WorkflowService:
                 ReservationLostError,
                 IdempotencyReservationLostException,
             ):
+                await compensate_s3_upload(s3_key_to_compensate, execution_id)
                 await fail_abandoned_execution(
                     self.db_session,
                     execution_id=execution_id,
@@ -231,6 +236,7 @@ class WorkflowService:
             except PublishFailedError as publish_error:
                 # Aucun message ne programme le traitement : ne pas annoncer une
                 # exécution acceptée en `processing` (issue #120).
+                await compensate_s3_upload(s3_key_to_compensate, execution_id)
                 logger.error(
                     "Workflow execution %s: scheduling failed",
                     execution_id,
