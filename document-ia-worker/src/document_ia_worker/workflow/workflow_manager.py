@@ -187,6 +187,7 @@ class WorkflowManager:
         )
         need_to_notify_webhook = True
         is_success = True
+        is_retry_scheduled = False
         err_type: Optional[str] = None
         err_message: Optional[str] = None
         failed_step: Optional[str] = None
@@ -257,6 +258,7 @@ class WorkflowManager:
                         and not self.is_last_retry
                     ):
                         need_to_notify_webhook = False
+                        is_retry_scheduled = True
 
                     if self.event_dto is not None:
                         try:
@@ -351,6 +353,21 @@ class WorkflowManager:
         finally:
             self._reset_logging_context_vars()
             ActiveExecutionTracker.remove(self.message.workflow_execution_id)
+            if (
+                not ActiveExecutionTracker.is_active(self.message.workflow_execution_id)
+                and not is_retry_scheduled
+            ):
+                try:
+                    sandbox_root = get_execution_sandbox_root(
+                        self.message.workflow_execution_id
+                    )
+                    safe_cleanup_directory(sandbox_root, sandbox_root=sandbox_root)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to clean up sandbox on workflow completion for %s: %s",
+                        self.message.workflow_execution_id,
+                        exc,
+                    )
             # We destroy correctly the databaeManager
             try:
                 await local_database_manager.dispose_async()
@@ -738,20 +755,23 @@ class WorkflowManager:
                 )
 
                 await self._notify_webhook_execution_finished(session)
+
+                if not ActiveExecutionTracker.is_active(
+                    self.message.workflow_execution_id
+                ):
+                    try:
+                        sandbox_root = get_execution_sandbox_root(
+                            self.message.workflow_execution_id
+                        )
+                        safe_cleanup_directory(sandbox_root, sandbox_root=sandbox_root)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to clean up sandbox on watchdog terminal failure for %s: %s",
+                            self.message.workflow_execution_id,
+                            exc,
+                        )
         finally:
             self._reset_logging_context_vars()
-            ActiveExecutionTracker.remove(self.message.workflow_execution_id)
-            try:
-                sandbox_root = get_execution_sandbox_root(
-                    self.message.workflow_execution_id
-                )
-                safe_cleanup_directory(sandbox_root, sandbox_root=sandbox_root)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to clean up sandbox on watchdog terminal failure for %s: %s",
-                    self.message.workflow_execution_id,
-                    exc,
-                )
             # Cette entrée construit son propre moteur de base et son propre
             # gestionnaire Redis : les libérer explicitement, sinon des échecs
             # terminaux répétés accumulent des connexions jusqu'au GC.
