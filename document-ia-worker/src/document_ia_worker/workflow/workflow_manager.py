@@ -7,6 +7,10 @@ import sys
 from datetime import datetime, UTC
 from typing import Optional, Any
 
+from document_ia_infra.core.file.safe_path import (
+    get_execution_sandbox_root,
+    safe_cleanup_directory,
+)
 from document_ia_infra.data.database import DatabaseManager
 from document_ia_infra.data.event.dto.event_dto import EventDTO
 from document_ia_infra.data.event.dto.event_type_enum import EventType
@@ -48,6 +52,7 @@ from document_ia_worker.core.aggregator_log import (
     start_time_var,
     handle_finish_execution,
 )
+from document_ia_worker.core.temp_file_sweeper import ActiveExecutionTracker
 from document_ia_worker.exception.no_event_attached_to_execution_exception import (
     NoEventAttachedToExecutionException,
 )
@@ -173,6 +178,7 @@ class WorkflowManager:
             )
 
     async def start(self):
+        ActiveExecutionTracker.add(self.message.workflow_execution_id)
         self.main_workflow_context = MainWorkflowContext(
             execution_id=self.message.workflow_execution_id,
             start_time=datetime.now(UTC),
@@ -344,6 +350,7 @@ class WorkflowManager:
                         )
         finally:
             self._reset_logging_context_vars()
+            ActiveExecutionTracker.remove(self.message.workflow_execution_id)
             # We destroy correctly the databaeManager
             try:
                 await local_database_manager.dispose_async()
@@ -733,6 +740,18 @@ class WorkflowManager:
                 await self._notify_webhook_execution_finished(session)
         finally:
             self._reset_logging_context_vars()
+            ActiveExecutionTracker.remove(self.message.workflow_execution_id)
+            try:
+                sandbox_root = get_execution_sandbox_root(
+                    self.message.workflow_execution_id
+                )
+                safe_cleanup_directory(sandbox_root, sandbox_root=sandbox_root)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clean up sandbox on watchdog terminal failure for %s: %s",
+                    self.message.workflow_execution_id,
+                    exc,
+                )
             # Cette entrée construit son propre moteur de base et son propre
             # gestionnaire Redis : les libérer explicitement, sinon des échecs
             # terminaux répétés accumulent des connexions jusqu'au GC.
