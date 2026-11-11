@@ -75,7 +75,9 @@ class S3Manager:
             )
             return False
         except Exception as e:
-            logger.error("Unexpected error during file deletion: %s", type(e).__name__)
+            logger.error(
+                "Unexpected error during file deletion from S3: %s", type(e).__name__
+            )
             return False
 
     @staticmethod
