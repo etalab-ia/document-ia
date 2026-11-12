@@ -72,11 +72,7 @@ class DownloadFileStep(BaseFileManipulationStep[DownloadFileResult]):
         return DownloadFileResult.__name__
 
     async def _prepare_step(self) -> None:
-<<<<<<< HEAD
         logger.info("Preparing download step (execution_id=%s)", self.execution_id)
-=======
-        logger.info("Preparing download step for execution: %s", self.execution_id)
->>>>>>> b92dedb6 (fix(worker): handle s3 delete return and protect s3_key in logs)
         tmp_dir = Path(self.tmp_folder_path)
         validate_safe_path(tmp_dir, self.sandbox_root)
         if not tmp_dir.exists():
@@ -278,7 +274,9 @@ class DownloadFileStep(BaseFileManipulationStep[DownloadFileResult]):
 
         s3_manager = S3Manager()
         try:
-            s3_manager.download_file(s3_key_value, str(file_path))
+            await asyncio.to_thread(
+                s3_manager.download_file, s3_key_value, str(file_path)
+            )
             elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
             logger.info(
                 "File downloaded successfully from S3 storage in %sms (execution_id=%s)",
@@ -315,4 +313,3 @@ class DownloadFileStep(BaseFileManipulationStep[DownloadFileResult]):
                     "Failed to delete S3 file for execution %s",
                     self.execution_id,
                 )
-
