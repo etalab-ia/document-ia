@@ -46,6 +46,11 @@ else
     SSH_AUTH_MOUNT="/run/host-services/ssh-auth.sock"
 fi
 
+EXTRA_MOUNTS=()
+if [ -f "$(pwd)/docker-compose-agent.yaml" ]; then
+    EXTRA_MOUNTS+=(-v "$(pwd)/docker-compose-agent.yaml:/root/docker-compose-agent.yaml:ro")
+fi
+
 echo "==> Démarrage du conteneur Antigravity '${CONTAINER_NAME}'..."
 echo "    - Branche : ${BRANCH}"
 echo "    - Données Antigravity : ${AGENT_DATA_DIR}"
@@ -59,6 +64,7 @@ exec docker run -it --rm \
   -e AGENT_ID="${AGENT_ID}" \
   -e REPO_URL="${REPO_URL}" \
   -e BRANCH="${BRANCH}" \
+  -e UV_PYTHON="python3" \
   -e SSH_AUTH_SOCK=/ssh-agent \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "${SSH_AUTH_MOUNT}:/ssh-agent" \
@@ -66,4 +72,5 @@ exec docker run -it --rm \
   -v "${AGENT_DATA_DIR}:/root/.gemini/antigravity-cli" \
   -v "$HOME/.gemini/config:/root/.gemini/config" \
   -v "$HOME/.agentmemory:/root/.agentmemory" \
+  "${EXTRA_MOUNTS[@]}" \
   "${IMAGE_NAME}" "${@:-bash}"

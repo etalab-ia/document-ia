@@ -39,7 +39,9 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | bash && \
     ln -sf /root/.local/bin/agy /usr/local/bin/antigravity
 
 # 4. Variables d'environnement
+ENV UV_PYTHON="python3"
 ENV UV_PYTHON_PREFERENCE="only-system"
+ENV UV_LINK_MODE="copy"
 ENV PATH="/root/.nix-profile/bin:/root/.local/bin:/usr/local/bin:$PATH"
 ENV LD_LIBRARY_PATH="/root/.nix-profile/lib:/usr/local/lib"
 
@@ -51,6 +53,7 @@ RUN echo "StrictHostKeyChecking accept-new" >> /root/.ssh/config && \
     chmod 600 /root/.ssh/config
 
 COPY .env.agent* /root/
+COPY docker-compose-agent.yaml /root/docker-compose-agent.yaml
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

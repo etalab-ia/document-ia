@@ -2,6 +2,9 @@
 set -e
 
 export PATH="/root/.nix-profile/bin:/usr/local/bin:/root/.local/bin:${PATH}"
+export UV_PYTHON="python3"
+export UV_PYTHON_PREFERENCE="only-system"
+export UV_LINK_MODE="copy"
 
 INSTANCE_ID=${AGENT_ID:-"agent-$(date +%s)"}
 export COMPOSE_PROJECT_NAME="stack_${INSTANCE_ID}"
@@ -57,13 +60,31 @@ export REDIS_HOST=redis
 export S3_ENDPOINT_URL="http://minio:9000"
 export LD_LIBRARY_PATH="/root/.nix-profile/lib:/usr/local/lib:${LD_LIBRARY_PATH}"
 export UV_PYTHON_PREFERENCE="only-system"
+export UV_LINK_MODE="copy"
+
+# 4. Détection du fichier Docker Compose adapté
+COMPOSE_FILE=""
+if [ -f "docker-compose-agent.yaml" ]; then
+    COMPOSE_FILE="docker-compose-agent.yaml"
+elif [ -f "docker-compose-agent.yml" ]; then
+    COMPOSE_FILE="docker-compose-agent.yml"
+elif [ -f "/root/docker-compose-agent.yaml" ]; then
+    COMPOSE_FILE="/root/docker-compose-agent.yaml"
+elif [ -f "docker-compose.yml" ]; then
+    COMPOSE_FILE="docker-compose.yml"
+fi
+export COMPOSE_FILE
 
 # Persister les variables dans /root/.bashrc pour toutes les sous-sessions shell interactives
-cat <<'EOF' > /root/.bashrc
+cat <<EOF > /root/.bashrc
 # Agent Sandbox Environment
-export LD_LIBRARY_PATH="/root/.nix-profile/lib:/usr/local/lib:$LD_LIBRARY_PATH"
-export PATH="/root/.nix-profile/bin:/usr/local/bin:/root/.local/bin:$PATH"
+export LD_LIBRARY_PATH="/root/.nix-profile/lib:/usr/local/lib:\$LD_LIBRARY_PATH"
+export PATH="/root/.nix-profile/bin:/usr/local/bin:/root/.local/bin:\$PATH"
+export UV_PYTHON="python3"
 export UV_PYTHON_PREFERENCE="only-system"
+export UV_LINK_MODE="copy"
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME}"
+export COMPOSE_FILE="${COMPOSE_FILE}"
 
 if [ -f "/workspace/.env" ]; then
     set -a
@@ -82,24 +103,14 @@ if command -v socat >/dev/null 2>&1; then
     socat TCP-LISTEN:3111,fork,reuseaddr TCP:host.docker.internal:3111 >/dev/null 2>&1 &
 fi
 
-# 4. Lancement de Docker Compose avec --env-file explicite
-COMPOSE_FILE=""
-if [ -f "docker-compose-agent.yaml" ]; then
-    COMPOSE_FILE="docker-compose-agent.yaml"
-elif [ -f "docker-compose-agent.yml" ]; then
-    COMPOSE_FILE="docker-compose-agent.yml"
-elif [ -f "docker-compose.yml" ]; then
-    COMPOSE_FILE="docker-compose.yml"
-fi
-
 if [ -n "$COMPOSE_FILE" ]; then
     echo "==> [${INSTANCE_ID}] Lancement de la stack ($COMPOSE_FILE)..."
     docker compose --env-file .env -f "$COMPOSE_FILE" up -d
 fi
 
 # 5. Détection des conteneurs et connexion de l'agent au réseau Compose
-MINIO_CONTAINER_ID=$(docker compose -f "$COMPOSE_FILE" ps -q minio 2>/dev/null || docker ps -qf "name=${COMPOSE_PROJECT_NAME}-minio-1")
-POSTGRES_CONTAINER_ID=$(docker compose -f "$COMPOSE_FILE" ps -q postgres 2>/dev/null || docker ps -qf "name=${COMPOSE_PROJECT_NAME}-postgres-1")
+MINIO_CONTAINER_ID=$(docker compose --env-file .env -f "$COMPOSE_FILE" ps -q minio 2>/dev/null || docker compose -f "$COMPOSE_FILE" ps -q minio 2>/dev/null || docker ps -qf "name=${COMPOSE_PROJECT_NAME}-minio-1")
+POSTGRES_CONTAINER_ID=$(docker compose --env-file .env -f "$COMPOSE_FILE" ps -q postgres 2>/dev/null || docker compose -f "$COMPOSE_FILE" ps -q postgres 2>/dev/null || docker ps -qf "name=${COMPOSE_PROJECT_NAME}-postgres-1")
 AGENT_CONTAINER_ID=$(cat /etc/hostname)
 
 if [ -n "$MINIO_CONTAINER_ID" ]; then
@@ -156,7 +167,7 @@ SUBPROJECTS="document-ia-schemas document-ia-infra document-ia-api document-ia-w
 
 for SUBPROJECT in $SUBPROJECTS; do
     SUBPROJECT_PATH="/workspace/$SUBPROJECT"
-    
+
     if [ -d "$SUBPROJECT_PATH" ]; then
         if [ -f "$SUBPROJECT_PATH/pyproject.toml" ] || [ -f "$SUBPROJECT_PATH/requirements.txt" ]; then
             echo "--> [${INSTANCE_ID}] Synchronisation de $SUBPROJECT..."
@@ -172,4 +183,13 @@ done
 cd /workspace
 
 echo "==> [${INSTANCE_ID}] Environnement prêt !"
-exec "$@"
+
+# Si aucun argument n'est fourni ou si seul 'bash' est demandé, lancer agy automatiquement tout en permettant de basculer sur bash à la sortie
+if [ $# -eq 0 ] || { [ "$1" = "bash" ] && [ $# -eq 1 ]; } || { [ "$1" = "/bin/bash" ] && [ $# -eq 1 ]; }; then
+    echo "==> [${INSTANCE_ID}] Lancement automatique de Antigravity (agy)..."
+    agy --dangerously-skip-permissions || true
+    echo "==> [${INSTANCE_ID}] Session agy terminée, bascule sur bash..."
+    exec /bin/bash
+else
+    exec "$@"
+fi

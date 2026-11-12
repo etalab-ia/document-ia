@@ -38,7 +38,7 @@ Le projet applique les principes de la **Clean Architecture** et de la séparati
    - Gestion standardisée des erreurs via ProblemDetails (RFC 7807) et `exception_handlers.py`.
 
 > [!IMPORTANT]
-> **Règle d'or `.cursorrules`** : *KEEP IT SIMPLE ! STAY PRAGMATIC*.  
+> **Règle d'or `.cursorrules`** : *KEEP IT SIMPLE ! STAY PRAGMATIC*.
 > Éviter toute sur-ingénierie inutile, privilégier des solutions simples, modulaires, lisibles et directement testables.
 
 ---
@@ -87,7 +87,7 @@ Le projet applique les principes de la **Clean Architecture** et de la séparati
 ## 🎨 5. Développement & Interface Streamlit (`developing-with-streamlit`)
 
 > [!IMPORTANT]
-> **Activation impérative du skill `developing-with-streamlit`** :  
+> **Activation impérative du skill `developing-with-streamlit`** :
 > Pour toute modification, création ou débogage concernant l'interface ou les composants Streamlit (notamment sous `document-ia-evals/`, pages, widgets, gestion d'état, authentification ou intégration ASGI/Starlette), le développeur **doit obligatoirement activer et appliquer les directives et références du skill [`.agents/skills/developing-with-streamlit`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/.agents/skills/developing-with-streamlit/SKILL.md)**.
 
 ### Règles clés à appliquer systématiquement :
