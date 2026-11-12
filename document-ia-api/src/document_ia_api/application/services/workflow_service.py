@@ -186,10 +186,14 @@ class WorkflowService:
                     execution_id,
                 )
                 await compensate_s3_upload(s3_key_to_compensate, execution_id)
+                s3_key_to_compensate = None
                 # Nothing is scheduled, so the caller must not be told the
                 # execution was accepted; the route releases the reservation and
                 # the client can retry with the same key.
                 raise scheduling_unavailable(execution_id) from emit_error
+            except BaseException:
+                await compensate_s3_upload(s3_key_to_compensate, execution_id)
+                raise
             logger.debug(f"Workflow started event emitted for execution {execution_id}")
 
             # Publication is fenced by reservation ownership in one Redis
@@ -209,6 +213,7 @@ class WorkflowService:
                 IdempotencyReservationLostException,
             ):
                 await compensate_s3_upload(s3_key_to_compensate, execution_id)
+                s3_key_to_compensate = None
                 await fail_abandoned_execution(
                     self.db_session,
                     execution_id=execution_id,
@@ -237,6 +242,7 @@ class WorkflowService:
                 # Aucun message ne programme le traitement : ne pas annoncer une
                 # exécution acceptée en `processing` (issue #120).
                 await compensate_s3_upload(s3_key_to_compensate, execution_id)
+                s3_key_to_compensate = None
                 logger.error(
                     "Workflow execution %s: scheduling failed",
                     execution_id,
@@ -250,6 +256,9 @@ class WorkflowService:
                     error=publish_error,
                 )
                 raise scheduling_unavailable(execution_id) from publish_error
+            except BaseException:
+                await compensate_s3_upload(s3_key_to_compensate, execution_id)
+                raise
 
             return WorkflowExecutionData(
                 execution_id=execution_id,

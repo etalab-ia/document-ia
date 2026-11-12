@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from datetime import datetime
@@ -79,7 +80,7 @@ class S3Service:
                 "presigned_url": presigned_url,
             }
 
-            logger.info(f"File uploaded successfully: {file_id}")
+            logger.info("File uploaded to S3 successfully")
             return result
 
         except NoCredentialsError as e:
@@ -94,7 +95,7 @@ class S3Service:
             raise Exception(f"File upload failed: {type(e).__name__}")
 
     async def delete_file(self, s3_key: str) -> bool:
-        return self.s3_manager.delete_file(s3_key)
+        return await asyncio.to_thread(self.s3_manager.delete_file, s3_key)
 
     async def get_file_info(self, s3_key: str) -> Optional[Dict[str, Any]]:
         return self.s3_manager.get_file_info(s3_key)

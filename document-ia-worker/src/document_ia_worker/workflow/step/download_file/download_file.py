@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -265,12 +266,13 @@ class DownloadFileStep(BaseFileManipulationStep[DownloadFileResult]):
         s3_key_value = file_info.s3_key.get_secret_value()
         logger.info("Downloading file from S3 for execution: %s", self.execution_id)
 
-        # Security: Extract basename safely and confine to sandbox
-        safe_basename = Path(s3_key_value).name
-        if not safe_basename or safe_basename in {".", ".."}:
-            safe_basename = f"{uuid4().hex}.bin"
+        # Security: Purely random local filename without exposing s3_key basename
+        ext = Path(s3_key_value).suffix
+        if not ext or len(ext) > 10 or not ext[1:].isalnum():
+            ext = ".bin"
+
         file_path = validate_safe_path(
-            Path(self.tmp_folder_path) / f"{uuid4().hex}_{safe_basename}",
+            Path(self.tmp_folder_path) / f"{uuid4().hex}{ext}",
             self.sandbox_root,
         )
 
@@ -299,20 +301,18 @@ class DownloadFileStep(BaseFileManipulationStep[DownloadFileResult]):
         if is_last_cleanup and self.file_info is not None:
             logger.info("Cleaning up S3 files for execution: %s", self.execution_id)
             s3_manager = S3Manager()
-            try:
-                deleted = s3_manager.delete_file(
-                    self.file_info.s3_key.get_secret_value()
+            deleted = await asyncio.to_thread(
+                s3_manager.delete_file,
+                self.file_info.s3_key.get_secret_value(),
+            )
+            if deleted:
+                logger.info(
+                    "S3 file deleted successfully for execution %s",
+                    self.execution_id,
                 )
-                if deleted:
-                    logger.info(
-                        "S3 file deleted successfully for execution %s",
-                        self.execution_id,
-                    )
-                else:
-                    logger.warning(
-                        "Failed to delete S3 file for execution %s",
-                        self.execution_id,
-                    )
-            except S3AuthentificationException as e:
-                logger.error("S3 authentication failed during file deletion.")
-                raise RuntimeError("Error while deleting S3 file") from e
+            else:
+                logger.warning(
+                    "Failed to delete S3 file for execution %s",
+                    self.execution_id,
+                )
+
