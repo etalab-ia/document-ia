@@ -102,7 +102,7 @@ def _fd_path(fd: int) -> Path | None:
             raw = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024)
             return Path(raw.split(b"\x00", 1)[0].decode("utf-8"))
         return Path(os.readlink(f"/proc/self/fd/{fd}"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
 
 
