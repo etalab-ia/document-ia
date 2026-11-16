@@ -118,7 +118,7 @@ class CarteGriseExtractSchema(BaseDocumentTypeSchema[CarteGriseModel]):
 
 ## 🧪 Tests locaux et qualité
 
-Pré-requis: Python 3.13+, Poetry
+Pré-requis: Python 3.14+, Poetry
 
 ```bash
 poetry install
