@@ -28,6 +28,32 @@ _O_CLOEXEC: int = getattr(os, "O_CLOEXEC", 0)
 _O_BINARY: int = getattr(os, "O_BINARY", 0)
 
 
+def normalize_non_symlink_directory(path: Path | str) -> Path:
+    """Normalize a directory path to a lexical absolute path, rejecting symlinks.
+
+    Args:
+        path: Directory path (relative or absolute).
+
+    Returns:
+        Lexically normalized absolute Path.
+
+    Raises:
+        PathTraversalException: If the path (before or after lexical normalization)
+            is a symlink.
+    """
+    raw_dir = Path(path)
+    if raw_dir.is_symlink():
+        raise PathTraversalException(
+            f"Directory {raw_dir} is a symlink; refusing to use it"
+        )
+    abs_dir = Path(os.path.normpath(raw_dir.absolute()))
+    if abs_dir.is_symlink():
+        raise PathTraversalException(
+            f"Directory {abs_dir} is a symlink; refusing to use it"
+        )
+    return abs_dir
+
+
 def ensure_directory_permissions(path: Path | str, mode: int = 0o700) -> Path:
     """Ensure directory exists and has strict permissions, rejecting symlinks.
 

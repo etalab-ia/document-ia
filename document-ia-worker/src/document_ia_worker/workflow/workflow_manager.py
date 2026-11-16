@@ -352,17 +352,17 @@ class WorkflowManager:
                         )
         finally:
             self._reset_logging_context_vars()
-            ActiveExecutionTracker.remove(self.message.workflow_execution_id)
             tracker = get_current_progress_tracker()
             is_aborted_with_retries_left = (
                 tracker is not None and tracker.is_aborted and not self.is_last_retry
             )
-            if (
-                not ActiveExecutionTracker.is_active(self.message.workflow_execution_id)
-                and not is_retry_scheduled
-                and not is_aborted_with_retries_left
-            ):
-                self._cleanup_execution_sandbox("workflow completion")
+            if is_retry_scheduled or is_aborted_with_retries_left:
+                ActiveExecutionTracker.remove(self.message.workflow_execution_id)
+            else:
+                ActiveExecutionTracker.remove_and_cleanup_if_inactive(
+                    self.message.workflow_execution_id,
+                    lambda: self._cleanup_execution_sandbox("workflow completion"),
+                )
             # We destroy correctly the databaeManager
             try:
                 await local_database_manager.dispose_async()
@@ -683,7 +683,7 @@ class WorkflowManager:
             retry_count=self.retry_count,
         )
 
-    def _cleanup_execution_sandbox(self, context_label: str) -> None:
+    def _cleanup_execution_sandbox(self, context_label: str) -> bool:
         """Clean up the execution sandbox directory if it exists."""
         try:
             sandbox_root = get_execution_sandbox_root(
@@ -691,7 +691,8 @@ class WorkflowManager:
                 create_base=False,
             )
             if sandbox_root.exists() or sandbox_root.is_symlink():
-                safe_cleanup_directory(sandbox_root, sandbox_root=sandbox_root)
+                return safe_cleanup_directory(sandbox_root, sandbox_root=sandbox_root)
+            return True
         except Exception as exc:
             logger.warning(
                 "Failed to clean up sandbox on %s for %s: %s",
@@ -699,6 +700,7 @@ class WorkflowManager:
                 self.message.workflow_execution_id,
                 exc,
             )
+            return False
 
     async def record_watchdog_terminal_failure(self, reason: str) -> None:
         """Enregistre l'échec terminal d'une tentative dont les reprises sont épuisées.
@@ -768,10 +770,13 @@ class WorkflowManager:
 
                 await self._notify_webhook_execution_finished(session)
 
-                if not ActiveExecutionTracker.is_active(
-                    self.message.workflow_execution_id
-                ):
-                    self._cleanup_execution_sandbox("watchdog terminal failure")
+                await asyncio.to_thread(
+                    ActiveExecutionTracker.cleanup_if_inactive,
+                    self.message.workflow_execution_id,
+                    lambda: self._cleanup_execution_sandbox(
+                        "watchdog terminal failure"
+                    ),
+                )
         finally:
             self._reset_logging_context_vars()
             # Cette entrée construit son propre moteur de base et son propre

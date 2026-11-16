@@ -1,12 +1,12 @@
 import logging
 import json
-from pathlib import Path
 from typing import Optional, Any, cast
 
 from pydantic import BaseModel
 
 from document_ia_infra.core.file.safe_path import (
     ensure_directory_permissions,
+    normalize_non_symlink_directory,
     open_confined_directory,
     validate_execution_id,
 )
@@ -111,7 +111,9 @@ class LLMExtractDocumentStep(BaseStep[LLMExtractionResult]):
         document_type: SupportedDocumentType,
     ) -> None:
         valid_uuid = validate_execution_id(self.execution_id)
-        replay_dir = Path(settings.OPENAI_REPLAY_PAYLOAD_SAVE_PATH)
+        replay_dir = normalize_non_symlink_directory(
+            settings.OPENAI_REPLAY_PAYLOAD_SAVE_PATH
+        )
         ensure_directory_permissions(replay_dir, 0o700)
 
         document_type_name = (

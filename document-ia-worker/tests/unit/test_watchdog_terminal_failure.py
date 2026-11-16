@@ -96,7 +96,6 @@ def test_is_terminal_event_distinguishes_retryable_failure():
     )
 
 
-
 class _FakeSession:
     async def commit(self) -> None:
         pass

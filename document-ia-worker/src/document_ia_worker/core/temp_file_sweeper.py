@@ -12,10 +12,12 @@ import stat
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 from document_ia_infra.core.file.safe_path import (
     DEFAULT_SANDBOX_BASE,
+    normalize_non_symlink_directory,
     open_confined_directory,
     safe_cleanup_directory,
     validate_execution_id,
@@ -40,16 +42,52 @@ class ActiveExecutionTracker:
     """Thread-safe in-memory registry of execution IDs currently being processed on this worker.
 
     Uses reference counting to handle overlapping executions (e.g., when a retry starts
-    while a previous thread fenced by the watchdog is still completing).
+    while a previous thread fenced by the watchdog is still completing), and coordinates
+    cleanup atomically per execution_id so deletion cannot race with a newly started retry.
     """
 
     _active_counts: Counter[str] = Counter()
+    _cleaning: set[str] = set()
     _lock: threading.Lock = threading.Lock()
+    _cond: threading.Condition = threading.Condition(_lock)
+
+    @classmethod
+    def _decrement_locked(cls, execution_id: str) -> int:
+        if execution_id in cls._active_counts:
+            cls._active_counts[execution_id] -= 1
+            if cls._active_counts[execution_id] <= 0:
+                del cls._active_counts[execution_id]
+        count = cls._active_counts.get(execution_id, 0)
+        logger.debug(
+            "ActiveExecutionTracker: removed %s (count: %d)",
+            execution_id,
+            count,
+        )
+        return count
+
+    @classmethod
+    def _run_cleanup_guarded(
+        cls,
+        execution_id: str,
+        cleanup_fn: Callable[[], bool],
+    ) -> bool:
+        try:
+            return cleanup_fn()
+        finally:
+            with cls._cond:
+                cls._cleaning.discard(execution_id)
+                cls._cond.notify_all()
 
     @classmethod
     def add(cls, execution_id: str) -> None:
-        """Register an execution_id as actively running."""
-        with cls._lock:
+        """Register an execution_id as actively running.
+
+        Waits if cleanup for the same execution_id is currently executing so
+        sandbox deletion and directory recreation never interleave.
+        """
+        with cls._cond:
+            while execution_id in cls._cleaning:
+                cls._cond.wait()
             cls._active_counts[execution_id] += 1
             logger.debug(
                 "ActiveExecutionTracker: added %s (count: %d)",
@@ -60,34 +98,63 @@ class ActiveExecutionTracker:
     @classmethod
     def remove(cls, execution_id: str) -> None:
         """Deregister an execution_id when its processing completes or terminates."""
-        with cls._lock:
-            if execution_id in cls._active_counts:
-                cls._active_counts[execution_id] -= 1
-                if cls._active_counts[execution_id] <= 0:
-                    del cls._active_counts[execution_id]
-            logger.debug(
-                "ActiveExecutionTracker: removed %s (count: %d)",
-                execution_id,
-                cls._active_counts.get(execution_id, 0),
-            )
+        with cls._cond:
+            cls._decrement_locked(execution_id)
 
     @classmethod
     def is_active(cls, execution_id: str) -> bool:
         """Check whether an execution_id is currently active on this worker."""
-        with cls._lock:
+        with cls._cond:
             return cls._active_counts.get(execution_id, 0) > 0
+
+    @classmethod
+    def cleanup_if_inactive(
+        cls,
+        execution_id: str,
+        cleanup_fn: Callable[[], bool],
+    ) -> bool:
+        """Atomically verify execution_id is inactive and run cleanup_fn.
+
+        Holds a per-execution cleanup marker while cleanup_fn runs so concurrent
+        add(execution_id) calls wait instead of racing, without blocking other
+        execution IDs.
+        """
+        with cls._cond:
+            if (
+                cls._active_counts.get(execution_id, 0) > 0
+                or execution_id in cls._cleaning
+            ):
+                return False
+            cls._cleaning.add(execution_id)
+        return cls._run_cleanup_guarded(execution_id, cleanup_fn)
+
+    @classmethod
+    def remove_and_cleanup_if_inactive(
+        cls,
+        execution_id: str,
+        cleanup_fn: Callable[[], bool],
+    ) -> bool:
+        """Atomically decrement active count and run cleanup_fn if count reaches 0."""
+        with cls._cond:
+            count = cls._decrement_locked(execution_id)
+            if count > 0 or execution_id in cls._cleaning:
+                return False
+            cls._cleaning.add(execution_id)
+        return cls._run_cleanup_guarded(execution_id, cleanup_fn)
 
     @classmethod
     def active_ids(cls) -> set[str]:
         """Return a copy of all active execution IDs."""
-        with cls._lock:
+        with cls._cond:
             return {k for k, v in cls._active_counts.items() if v > 0}
 
     @classmethod
     def clear(cls) -> None:
         """Clear all active executions (useful for test isolation)."""
-        with cls._lock:
+        with cls._cond:
             cls._active_counts.clear()
+            cls._cleaning.clear()
+            cls._cond.notify_all()
 
 
 class TempFileSweeper:
@@ -159,8 +226,12 @@ class TempFileSweeper:
         Removes unexpected symlinks inside sandbox_base safely and returns
         (execution_id, age_seconds) pairs for inactive directories past grace_period.
         """
-        if base.is_symlink():
-            logger.error("Sandbox base %s is a symlink; refusing to sweep", base)
+        try:
+            base = normalize_non_symlink_directory(base)
+        except PathTraversalException as exc:
+            logger.error(
+                "Sandbox base %s is a symlink; refusing to sweep (%s)", base, exc
+            )
             return []
 
         if not base.exists():
@@ -246,7 +317,14 @@ class TempFileSweeper:
         Returns:
             Number of orphaned directories purged.
         """
-        base = sandbox_base or self.sandbox_base
+        raw_base = sandbox_base or self.sandbox_base
+        try:
+            base = normalize_non_symlink_directory(raw_base)
+        except PathTraversalException as exc:
+            logger.error(
+                "Sandbox base %s is a symlink; refusing to sweep (%s)", raw_base, exc
+            )
+            return 0
         grace_period = (
             max_age_seconds if max_age_seconds is not None else self.grace_period_s
         )
@@ -306,7 +384,11 @@ class TempFileSweeper:
             )
             try:
                 if await asyncio.to_thread(
-                    safe_cleanup_directory, entry_path, sandbox_root=base
+                    ActiveExecutionTracker.cleanup_if_inactive,
+                    name,
+                    lambda entry=entry_path: safe_cleanup_directory(
+                        entry, sandbox_root=base
+                    ),
                 ):
                     purged_count += 1
             except Exception as exc:
@@ -326,15 +408,17 @@ class TempFileSweeper:
         Returns:
             Number of expired JSON payload files purged.
         """
-        target_dir = Path(replay_dir if replay_dir is not None else self.replay_dir)
+        raw_dir = replay_dir if replay_dir is not None else self.replay_dir
         retention_hours = (
             max_age_hours if max_age_hours is not None else self.replay_retention_hours
         )
         max_age_seconds = retention_hours * 3600.0
 
-        if target_dir.is_symlink():
+        try:
+            target_dir = normalize_non_symlink_directory(raw_dir)
+        except PathTraversalException as exc:
             logger.error(
-                "Replay directory %s is a symlink; refusing to sweep", target_dir
+                "Replay directory %s is a symlink; refusing to sweep (%s)", raw_dir, exc
             )
             return 0
 

@@ -105,3 +105,64 @@ async def test_save_openai_replay_payload_permissions_and_default_disabled(
     assert saved["model"] == "gpt-4o"
     assert saved["system_prompt"] == "sys prompt"
     assert saved["user_prompt"] == "page text\n\n"
+
+
+def test_save_openai_replay_payload_supports_relative_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """[QUAL-02] Relative OPENAI_REPLAY_PAYLOAD_SAVE_PATH must work safely and still reject symlinks."""
+    from document_ia_infra.exception.security_exception import PathTraversalException
+
+    monkeypatch.chdir(tmp_path)
+
+    execution_id = str(uuid4())
+    step = LLMExtractDocumentStep.__new__(LLMExtractDocumentStep)
+    step.execution_id = execution_id
+
+    with patch(
+        "document_ia_worker.workflow.step.llm_extract_document.llm_extract_document.settings",
+        LLMExtractDocumentSettings(
+            OPENAI_REPLAY_PAYLOAD_SAVE_ENABLED=True,
+            OPENAI_REPLAY_PAYLOAD_SAVE_PATH="replays",
+        ),
+    ):
+        step._save_openai_replay_payload(
+            system_prompt="sys prompt",
+            user_prompt="user prompt",
+            model="gpt-4o",
+            document_type=SupportedDocumentType.CNI,
+        )
+
+    replay_dir = tmp_path / "replays"
+    assert replay_dir.exists()
+    assert stat.S_IMODE(replay_dir.stat().st_mode) == 0o700
+
+    payload_file = replay_dir / f"{execution_id}.json"
+    assert payload_file.exists()
+    assert stat.S_IMODE(payload_file.stat().st_mode) == 0o600
+    saved = json.loads(payload_file.read_text(encoding="utf-8"))
+    assert saved["execution_id"] == execution_id
+
+    # Relative symlink must still be rejected
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    sym_dir = tmp_path / "sym_replays"
+    sym_dir.symlink_to(outside_dir, target_is_directory=True)
+
+    with patch(
+        "document_ia_worker.workflow.step.llm_extract_document.llm_extract_document.settings",
+        LLMExtractDocumentSettings(
+            OPENAI_REPLAY_PAYLOAD_SAVE_ENABLED=True,
+            OPENAI_REPLAY_PAYLOAD_SAVE_PATH="sym_replays",
+        ),
+    ):
+        with pytest.raises(PathTraversalException):
+            step._save_openai_replay_payload(
+                system_prompt="sys prompt",
+                user_prompt="user prompt",
+                model="gpt-4o",
+                document_type=SupportedDocumentType.CNI,
+            )
+
+    assert not (outside_dir / f"{execution_id}.json").exists()

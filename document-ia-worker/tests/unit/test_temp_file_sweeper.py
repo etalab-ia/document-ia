@@ -802,9 +802,13 @@ def test_ensure_permissions_fails_closed_on_eperm_or_wrong_owner(tmp_path: Path)
         "document_ia_infra.core.file.safe_path.os.fchmod",
         side_effect=PermissionError(1, "Operation not permitted"),
     ):
-        with pytest.raises(PathTraversalException, match="Failed to enforce permissions"):
+        with pytest.raises(
+            PathTraversalException, match="Failed to enforce permissions"
+        ):
             ensure_directory_permissions(target_dir, 0o700)
-        with pytest.raises(PathTraversalException, match="Failed to enforce permissions"):
+        with pytest.raises(
+            PathTraversalException, match="Failed to enforce permissions"
+        ):
             ensure_file_permissions(target_file, 0o600)
 
     # 2. fstat reports foreign owner UID
@@ -822,9 +826,13 @@ def test_ensure_permissions_fails_closed_on_eperm_or_wrong_owner(tmp_path: Path)
             "document_ia_infra.core.file.safe_path.os.fstat",
             side_effect=fake_fstat,
         ):
-            with pytest.raises(PathTraversalException, match="not owned by current user"):
+            with pytest.raises(
+                PathTraversalException, match="not owned by current user"
+            ):
                 ensure_directory_permissions(target_dir, 0o700)
-            with pytest.raises(PathTraversalException, match="not owned by current user"):
+            with pytest.raises(
+                PathTraversalException, match="not owned by current user"
+            ):
                 ensure_file_permissions(target_file, 0o600)
 
 
@@ -934,3 +942,133 @@ async def test_sweep_sandbox_reuses_redis_connection_across_entries(tmp_path: Pa
     assert purged_down == 0
     assert mock_rm_down.get_connection.await_count == 1
     assert all(d.exists() for d in preserved_dirs)
+
+
+@pytest.mark.asyncio
+async def test_sweep_sandbox_skips_when_retry_registers_during_redis_lease_check(
+    tmp_path: Path,
+):
+    """[SEC-03] If a retry starts and registers in ActiveExecutionTracker after the initial check
+    (e.g. during Redis lease exists()), sweep_sandbox must NOT delete the directory.
+    """
+    exec_id = str(uuid4())
+    exec_dir = tmp_path / exec_id
+    exec_dir.mkdir()
+    doc = exec_dir / "active_doc.pdf"
+    doc.write_bytes(b"active retry data")
+    past = time.time() - 3600
+    os.utime(exec_dir, (past, past))
+
+    async def racing_exists(_key: str) -> int:
+        # Simulate a retry starting on another thread between Redis lease check and cleanup
+        ActiveExecutionTracker.add(exec_id)
+        return 0
+
+    mock_conn = MagicMock()
+    mock_conn.exists = AsyncMock(side_effect=racing_exists)
+    mock_rm = MagicMock()
+    mock_rm.get_connection = AsyncMock(return_value=mock_conn)
+
+    sweeper = TempFileSweeper(
+        sandbox_base=tmp_path,
+        redis_manager=mock_rm,
+        grace_period_s=900.0,
+    )
+
+    with patch(
+        "document_ia_worker.core.temp_file_sweeper.safe_cleanup_directory"
+    ) as mock_cleanup:
+        purged = await sweeper.sweep_sandbox()
+
+    assert purged == 0
+    mock_cleanup.assert_not_called()
+    assert exec_dir.exists()
+    assert doc.exists()
+
+
+def test_active_execution_tracker_cleanup_if_inactive_serializes_concurrent_add():
+    """[SEC-03] cleanup_if_inactive blocks add() only for the same execution_id, never others."""
+    exec_id = str(uuid4())
+    other_id = str(uuid4())
+
+    started = threading.Event()
+    release = threading.Event()
+    cleanup_result: list[bool] = []
+    add_same_finished = threading.Event()
+
+    def slow_cleanup() -> bool:
+        started.set()
+        assert release.wait(timeout=5.0)
+        return True
+
+    def run_cleanup() -> None:
+        cleanup_result.append(
+            ActiveExecutionTracker.cleanup_if_inactive(exec_id, slow_cleanup)
+        )
+
+    def add_same_exec() -> None:
+        ActiveExecutionTracker.add(exec_id)
+        add_same_finished.set()
+
+    cleanup_thread = threading.Thread(target=run_cleanup)
+    cleanup_thread.start()
+    assert started.wait(timeout=5.0)
+
+    # Another execution_id must NOT block while exec_id is being cleaned up
+    ActiveExecutionTracker.add(other_id)
+    assert ActiveExecutionTracker.is_active(other_id)
+    ActiveExecutionTracker.remove(other_id)
+
+    # Adding the same execution_id must wait until cleanup finishes
+    add_thread = threading.Thread(target=add_same_exec)
+    add_thread.start()
+    assert not add_same_finished.wait(timeout=0.1)
+
+    release.set()
+    cleanup_thread.join(timeout=5.0)
+    add_thread.join(timeout=5.0)
+
+    assert cleanup_result == [True]
+    assert add_same_finished.is_set()
+    assert ActiveExecutionTracker.is_active(exec_id)
+
+
+def test_sweep_replay_payloads_supports_relative_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """[QUAL-02] sweep_replay_payloads must handle relative replay_dir paths and still reject symlinks."""
+    monkeypatch.chdir(tmp_path)
+
+    replay_dir = Path("replays")
+    replay_dir.mkdir()
+    expired_file = replay_dir / "expired.json"
+    fresh_file = replay_dir / "fresh.json"
+    expired_file.write_text('{"old": true}', encoding="utf-8")
+    fresh_file.write_text('{"new": true}', encoding="utf-8")
+
+    past = time.time() - (48 * 3600)
+    os.utime(expired_file, (past, past))
+
+    sweeper = TempFileSweeper(
+        replay_dir=Path("replays"),
+        replay_retention_hours=24.0,
+    )
+    purged = sweeper.sweep_replay_payloads()
+
+    assert purged == 1
+    assert not expired_file.exists()
+    assert fresh_file.exists()
+
+    # Relative symlink must still be refused
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_expired = outside_dir / "outside_expired.json"
+    outside_expired.write_text('{"secret": true}', encoding="utf-8")
+    os.utime(outside_expired, (past, past))
+
+    sym_dir = Path("sym_replays")
+    sym_dir.symlink_to(outside_dir, target_is_directory=True)
+    purged_sym = sweeper.sweep_replay_payloads(replay_dir=Path("sym_replays"))
+    assert purged_sym == 0
+    assert outside_expired.exists()
