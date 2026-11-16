@@ -777,7 +777,7 @@ requires-dist = [
     { name = "document-ia-api", editable = "document-ia-api" },
     { name = "document-ia-infra", editable = "document-ia-infra" },
     { name = "document-ia-schemas", editable = "document-ia-schemas" },
-    { name = "label-studio-sdk", specifier = "==2.1.3" },
+    { name = "label-studio-sdk", specifier = "==2.1.4" },
     { name = "pandas", specifier = "==3.1.1" },
     { name = "plotly", specifier = "==7.1.0" },
     { name = "psycopg2-binary", specifier = "==2.9.13" },
@@ -1387,7 +1387,7 @@ wheels = [
 
 [[package]]
 name = "label-studio-sdk"
-version = "2.1.3"
+version = "2.1.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "appdirs" },
@@ -1413,9 +1413,9 @@ dependencies = [
     { name = "watchfiles" },
     { name = "xmljson" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bf/ae/1aecf901087600750776c05a34bb374cfcfc869e143d5ebc93b09d35f779/label_studio_sdk-2.1.3.tar.gz", hash = "sha256:809dc17d72a7aeaecdc585b10225a1c958dcb49a36f67dbc1f2c4de265e910de", size = 605853, upload-time = "2026-10-29T12:54:52.439Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/e3/c9572139f2bf8978fafa630c14bbca1543abd7d906e712fa2ebe2ee668e9/label_studio_sdk-2.1.4.tar.gz", hash = "sha256:d3349b16fb2e2aad0d4d4a1324d80b1c01f89c4ffd8b076688de93d6152306be", size = 607551, upload-time = "2026-11-05T16:33:06.496Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3e/9b/a23b994a647de83fb3d471ab5d694a96432ec96da317166840cbfb40e116/label_studio_sdk-2.1.3-py3-none-any.whl", hash = "sha256:3cade4baddf5fea04d4328aa111b6275b3fa61aa6726d278822f267d3a3f1d00", size = 1116302, upload-time = "2026-10-29T12:54:50.581Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/2f/2ac2f748b36a2bbb2d73f118ea9ffc58c4f92c582af607779ecf9b252803/label_studio_sdk-2.1.4-py3-none-any.whl", hash = "sha256:6d67454cadb9f9ffd63de5df25e6c223f52ceadb9ebf12e4ce8aeb28ee6f3012", size = 1117812, upload-time = "2026-11-05T16:33:04.776Z" },
 ]
 
 [[package]]
