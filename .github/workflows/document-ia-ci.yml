@@ -352,3 +352,43 @@ jobs:
         run: |
           cd ${{ matrix.project }}
           uv run pyright src
+
+  uv-workspace-lock:
+    name: uv (verrou de workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.0"
+          enable-cache: true
+
+      # Le monorepo n'a qu'un verrou, à la racine. Les six uv.lock des
+      # sous-projets doivent rester des liens vers celui-ci : c'est ce que le
+      # buildpack Scalingo détecte au répertoire de build (PROJECT_DIR), et un
+      # fichier ordinaire y ferait divergerer le verrou en six copies.
+      - name: Les uv.lock des sous-projets sont des liens vers la racine
+        run: |
+          status=0
+          for member in document-ia-*/; do
+            member="${member%/}"
+            [ -f "$member/pyproject.toml" ] || continue
+            lock="$member/uv.lock"
+            if [ ! -L "$lock" ]; then
+              echo "::error file=$lock::doit être un lien symbolique vers ../uv.lock"
+              status=1
+            elif [ "$(readlink "$lock")" != "../uv.lock" ]; then
+              echo "::error file=$lock::lien vers $(readlink "$lock"), attendu ../uv.lock"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Le verrou de la racine est à jour
+        run: uv lock --check

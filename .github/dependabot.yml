@@ -6,6 +6,13 @@ updates:
   # travailler Dependabot sur six vues du même lock.
   - package-ecosystem: "uv"
     directory: "/"
+    # Le workspace uv n'a qu'un seul verrou, à la racine. Les six uv.lock des
+    # sous-projets sont des liens symboliques vers celui-ci : les laisser
+    # inspecter par Dependabot lui permettrait de les réécrire comme des
+    # fichiers ordinaires, ce qui dupliquerait le verrou en six copies
+    # divergentes et remplacerait silencieusement les liens.
+    exclude-paths:
+      - "document-ia-*/uv.lock"
     schedule:
       interval: "weekly"
     cooldown:
