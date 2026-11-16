@@ -11,7 +11,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "streamlit == 1.67.0",
-    "pandas == 3.1.0",
+    "pandas == 3.1.1",
     "plotly == 7.1.0",
     "python-dotenv == 1.2.4",
     "label-studio-sdk==2.1.3",
