@@ -53,17 +53,24 @@ def ensure_directory_permissions(path: Path | str, mode: int = 0o700) -> Path:
     try:
         fd = os.open(target, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC)
         try:
+            st = os.fstat(fd)
+            if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+                raise PathTraversalException(
+                    f"Directory {target} is not owned by current user (uid={st.st_uid})"
+                )
             os.fchmod(fd, mode)
         finally:
             os.close(fd)
     except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+        if exc.errno == errno.ELOOP or (
+            exc.errno == errno.ENOTDIR and target.is_symlink()
+        ):
             raise PathTraversalException(
                 f"Directory {target} was replaced by a symlink"
             ) from exc
-        logger.warning(
-            "Failed to set permissions %o on directory %s: %s", mode, target, exc
-        )
+        raise PathTraversalException(
+            f"Failed to enforce permissions {mode:o} on directory {target}: {exc}"
+        ) from exc
     return target
 
 
@@ -86,6 +93,11 @@ def ensure_file_permissions(path: Path | str, mode: int = 0o600) -> Path:
     try:
         fd = os.open(target, os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC)
         try:
+            st = os.fstat(fd)
+            if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+                raise PathTraversalException(
+                    f"File {target} is not owned by current user (uid={st.st_uid})"
+                )
             os.fchmod(fd, mode)
         finally:
             os.close(fd)
@@ -96,7 +108,9 @@ def ensure_file_permissions(path: Path | str, mode: int = 0o600) -> Path:
             raise PathTraversalException(
                 f"File {target} was replaced by a symlink"
             ) from exc
-        logger.warning("Failed to set permissions %o on file %s: %s", mode, target, exc)
+        raise PathTraversalException(
+            f"Failed to enforce permissions {mode:o} on file {target}: {exc}"
+        ) from exc
     return target
 
 
@@ -131,12 +145,18 @@ class ConfinedDirectory:
             os.close(self._fd)
             self._fd = -1
 
+    @staticmethod
+    def _validate_entry_name(name: str) -> None:
+        if not name or "/" in name or "\0" in name or name in (".", ".."):
+            raise PathTraversalException(
+                f"Refusing invalid, nested or relative name inside sandbox: {name!r}"
+            )
+
     def open_file(self, name: str, mode: str = "wb") -> IO[bytes]:
         """Open (creating) a file relative to this descriptor, never a symlink."""
-        if "/" in name or name in (".", ".."):
-            raise PathTraversalException(
-                f"Refusing nested or relative name inside sandbox: {name!r}"
-            )
+        self._validate_entry_name(name)
+        if "r" in mode or "a" in mode or "+" in mode:
+            raise ValueError(f"Unsupported mode for confined file creation: {mode!r}")
         flags: int = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW | _O_CLOEXEC
         if "b" in mode:
             flags |= _O_BINARY
@@ -151,10 +171,7 @@ class ConfinedDirectory:
     def replace(self, source_name: str, target_name: str) -> None:
         """Atomically rename within this directory."""
         for candidate in (source_name, target_name):
-            if "/" in candidate or candidate in (".", ".."):
-                raise PathTraversalException(
-                    f"Refusing nested or relative name inside sandbox: {candidate!r}"
-                )
+            self._validate_entry_name(candidate)
         os.rename(
             source_name,
             target_name,
@@ -163,10 +180,7 @@ class ConfinedDirectory:
         )
 
     def unlink(self, name: str) -> None:
-        if "/" in name or name in (".", ".."):
-            raise PathTraversalException(
-                f"Refusing nested or relative name inside sandbox: {name!r}"
-            )
+        self._validate_entry_name(name)
         try:
             os.unlink(name, dir_fd=self._fd)
         except FileNotFoundError:
@@ -291,6 +305,8 @@ def validate_execution_id(execution_id: str) -> UUID:
 def get_execution_sandbox_root(
     execution_id: str,
     base_dir: Path | str = DEFAULT_SANDBOX_BASE,
+    *,
+    create_base: bool = True,
 ) -> Path:
     """Return the canonical, confinement-verified sandbox root for an execution.
 
@@ -311,7 +327,8 @@ def get_execution_sandbox_root(
         )
     base_path = raw_base.resolve()
 
-    ensure_directory_permissions(base_path, 0o700)
+    if create_base or base_path.exists():
+        ensure_directory_permissions(base_path, 0o700)
 
     # The boundary is `<base>/<execution_id>` by construction, never a value
     # derived from the filesystem. Canonicalising the entry would adopt whatever
@@ -451,42 +468,63 @@ def safe_cleanup_directory(
         True if the directory was successfully removed (or already absent), False on error.
     """
     raw_path = Path(directory_path)
+    effective_root = Path(sandbox_root if sandbox_root is not None else raw_path.parent)
 
-    # If the directory target itself is a symlink, delete the symlink without following
-    if raw_path.is_symlink():
+    try:
+        if effective_root.is_symlink():
+            raise PathTraversalException(
+                f"Sandbox root {effective_root} is a symlink; refusing to use it"
+            )
+        root_lexical = Path(os.path.normpath(effective_root.absolute()))
+        target_lexical = validate_safe_path(raw_path, root_lexical)
+    except PathTraversalException as exc:
+        logger.error("Refusing to clean up %s: %s", raw_path, exc)
+        return False
+
+    def _unlink_non_dir_via_parent() -> bool:
         try:
-            raw_path.unlink()
-            logger.info("Removed symlink: %s", raw_path)
+            if target_lexical != root_lexical:
+                with open_confined_directory(
+                    target_lexical.parent, root_lexical
+                ) as parent_confined:
+                    os.unlink(target_lexical.name, dir_fd=parent_confined.fd)
+            else:
+                p_fd = os.open(
+                    target_lexical.parent,
+                    os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC,
+                )
+                try:
+                    os.unlink(target_lexical.name, dir_fd=p_fd)
+                finally:
+                    os.close(p_fd)
+            logger.info("Removed non-directory entry: %s", target_lexical)
             return True
+        except FileNotFoundError:
+            return True
+        except PathTraversalException as exc:
+            logger.error("Refusing to clean up %s: %s", raw_path, exc)
+            return False
         except OSError as exc:
             logger.warning(
-                "Failed to remove symlink %s: %s; deferred to background sweeper",
+                "Failed to remove %s: %s; deferred to background sweeper",
                 raw_path,
                 exc,
             )
             return False
+
+    # If the target itself is a symlink, delete the symlink via its confined parent
+    if raw_path.is_symlink():
+        return _unlink_non_dir_via_parent()
 
     # Open the target itself with no-follow semantics, then work only through
     # descriptors. The confinement re-check happens on the descriptor held.
     try:
-        confined = open_confined_directory(
-            raw_path, sandbox_root if sandbox_root is not None else raw_path.parent
-        )
+        confined = open_confined_directory(target_lexical, root_lexical)
     except FileNotFoundError:
         logger.debug("Directory does not exist for cleanup: %s", raw_path)
         return True
     except NotADirectoryError:
-        try:
-            raw_path.unlink()
-            logger.info("Deleted file: %s", raw_path)
-            return True
-        except OSError as exc:
-            logger.warning(
-                "Failed to delete file %s: %s; deferred to background sweeper",
-                raw_path,
-                exc,
-            )
-            return False
+        return _unlink_non_dir_via_parent()
     except PathTraversalException as exc:
         logger.error("Refusing to clean up %s: %s", raw_path, exc)
         return False
@@ -498,7 +536,7 @@ def safe_cleanup_directory(
         # Remove the directory itself through its parent, still no-follow.
         parent_fd = os.open(
             os.path.dirname(confined.path) or ".",
-            os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC,
+            os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC,
         )
         os.rmdir(os.path.basename(confined.path), dir_fd=parent_fd)
         logger.info("Removed sandbox directory: %s", confined.path)

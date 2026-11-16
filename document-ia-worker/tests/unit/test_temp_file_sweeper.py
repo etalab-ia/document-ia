@@ -633,3 +633,304 @@ def test_sweeper_uses_settings_replay_retention_hours(monkeypatch: pytest.Monkey
 
     custom_sweeper = TempFileSweeper(replay_retention_hours=12.0)
     assert custom_sweeper.replay_retention_hours == 12.0
+
+
+@pytest.mark.asyncio
+async def test_sweep_sandbox_fails_closed_on_redis_error(tmp_path: Path):
+    """If Redis lease check fails or returns None connection, sweeper must fail closed and keep the sandbox."""
+    exec_id = str(uuid4())
+    exec_dir = tmp_path / exec_id
+    exec_dir.mkdir()
+    (exec_dir / "doc.pdf").write_bytes(b"data")
+    past = time.time() - 3600
+    os.utime(exec_dir, (past, past))
+
+    # Case 1: Redis raises an exception
+    mock_rm_err = MagicMock()
+    mock_rm_err.get_connection = AsyncMock(side_effect=ConnectionError("Redis down"))
+    sweeper_err = TempFileSweeper(
+        sandbox_base=tmp_path,
+        redis_manager=mock_rm_err,
+        grace_period_s=0.0,
+    )
+    purged = await sweeper_err.sweep_sandbox()
+    assert purged == 0
+    assert exec_dir.exists()
+
+    # Case 2: Redis returns None connection
+    mock_rm_none = MagicMock()
+    mock_rm_none.get_connection = AsyncMock(return_value=None)
+    sweeper_none = TempFileSweeper(
+        sandbox_base=tmp_path,
+        redis_manager=mock_rm_none,
+        grace_period_s=0.0,
+    )
+    purged = await sweeper_none.sweep_sandbox()
+    assert purged == 0
+    assert exec_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_workflow_manager_aborted_non_last_retry_preserves_sandbox(
+    tmp_path: Path,
+):
+    """Watchdog-aborted attempt with retries left (is_last_retry=False) must preserve sandbox in finally;
+    with is_last_retry=True and no active attempt, sandbox must be cleaned up.
+    """
+    from types import SimpleNamespace
+    from document_ia_infra.redis.model.workflow_execution_message import (
+        WorkflowExecutionMessage,
+    )
+    from document_ia_worker.workflow.workflow_manager import WorkflowManager
+
+    exec_id = str(uuid4())
+    sandbox_dir = tmp_path / exec_id
+    sandbox_dir.mkdir()
+    (sandbox_dir / "temp.pdf").write_bytes(b"data")
+
+    fake_tracker = SimpleNamespace(is_aborted=True)
+
+    class FakeDbManager:
+        def __init__(self, **kwargs):
+            pass
+
+        def local_session(self):
+            class _Ctx:
+                async def __aenter__(self):
+                    return MagicMock()
+
+                async def __aexit__(self, *args):
+                    return False
+
+            return _Ctx()
+
+        async def dispose_async(self):
+            pass
+
+    # 1. Aborted non-last retry -> preserve sandbox
+    msg = WorkflowExecutionMessage(workflow_execution_id=exec_id)
+    manager = WorkflowManager(msg, retry_count=0, is_last_retry=False)
+    with (
+        patch.object(manager, "_prepare_workflow", new=AsyncMock(return_value=False)),
+        patch(
+            "document_ia_worker.workflow.workflow_manager.get_execution_sandbox_root",
+            return_value=sandbox_dir,
+        ),
+        patch(
+            "document_ia_worker.workflow.workflow_manager.get_current_progress_tracker",
+            return_value=fake_tracker,
+        ),
+        patch(
+            "document_ia_worker.workflow.workflow_manager.DatabaseManager",
+            FakeDbManager,
+        ),
+        patch.object(manager._webhook_redis_manager, "close", new=AsyncMock()),
+    ):
+        await manager.start()
+
+    assert sandbox_dir.exists(), (
+        "Sandbox must be preserved when aborted with retries left"
+    )
+
+    # 2. Aborted last retry -> clean up sandbox when no other attempt is active
+    manager_last = WorkflowManager(msg, retry_count=2, is_last_retry=True)
+    with (
+        patch.object(
+            manager_last, "_prepare_workflow", new=AsyncMock(return_value=False)
+        ),
+        patch(
+            "document_ia_worker.workflow.workflow_manager.get_execution_sandbox_root",
+            return_value=sandbox_dir,
+        ),
+        patch(
+            "document_ia_worker.workflow.workflow_manager.get_current_progress_tracker",
+            return_value=fake_tracker,
+        ),
+        patch(
+            "document_ia_worker.workflow.workflow_manager.DatabaseManager",
+            FakeDbManager,
+        ),
+        patch.object(manager_last._webhook_redis_manager, "close", new=AsyncMock()),
+    ):
+        await manager_last.start()
+
+    assert not sandbox_dir.exists(), (
+        "Sandbox must be cleaned up when aborted on last retry and inactive"
+    )
+
+
+def test_sweep_replay_payloads_continues_on_unlink_oserror(tmp_path: Path):
+    """An OSError when unlinking one expired replay payload must not stop purging remaining payloads."""
+    from document_ia_infra.core.file.safe_path import ConfinedDirectory
+
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    file_a = replay_dir / "a.json"
+    file_b = replay_dir / "b.json"
+    file_a.write_text('{"a": 1}', encoding="utf-8")
+    file_b.write_text('{"b": 2}', encoding="utf-8")
+
+    past = time.time() - (48 * 3600)
+    os.utime(file_a, (past, past))
+    os.utime(file_b, (past, past))
+
+    sweeper = TempFileSweeper(replay_dir=replay_dir, replay_retention_hours=24.0)
+    real_unlink = ConfinedDirectory.unlink
+
+    def flaky_unlink(self: ConfinedDirectory, name: str) -> None:
+        if name == "a.json":
+            raise PermissionError("denied")
+        real_unlink(self, name)
+
+    with patch.object(ConfinedDirectory, "unlink", flaky_unlink):
+        purged = sweeper.sweep_replay_payloads()
+
+    assert purged == 1
+    assert file_a.exists()
+    assert not file_b.exists()
+
+
+def test_ensure_permissions_fails_closed_on_eperm_or_wrong_owner(tmp_path: Path):
+    """ensure_directory_permissions and ensure_file_permissions must fail closed on EPERM or foreign UID."""
+    target_dir = tmp_path / "owned_dir"
+    target_dir.mkdir(mode=0o700)
+    target_file = target_dir / "owned_file.bin"
+    target_file.write_bytes(b"secret")
+
+    # 1. fchmod raises PermissionError (EPERM)
+    with patch(
+        "document_ia_infra.core.file.safe_path.os.fchmod",
+        side_effect=PermissionError(1, "Operation not permitted"),
+    ):
+        with pytest.raises(PathTraversalException, match="Failed to enforce permissions"):
+            ensure_directory_permissions(target_dir, 0o700)
+        with pytest.raises(PathTraversalException, match="Failed to enforce permissions"):
+            ensure_file_permissions(target_file, 0o600)
+
+    # 2. fstat reports foreign owner UID
+    if hasattr(os, "geteuid"):
+        foreign_uid = os.geteuid() + 1
+        real_fstat = os.fstat
+
+        def fake_fstat(fd: int):
+            real_st = real_fstat(fd)
+            fake_st = MagicMock(wraps=real_st)
+            fake_st.st_uid = foreign_uid
+            return fake_st
+
+        with patch(
+            "document_ia_infra.core.file.safe_path.os.fstat",
+            side_effect=fake_fstat,
+        ):
+            with pytest.raises(PathTraversalException, match="not owned by current user"):
+                ensure_directory_permissions(target_dir, 0o700)
+            with pytest.raises(PathTraversalException, match="not owned by current user"):
+                ensure_file_permissions(target_file, 0o600)
+
+
+@pytest.mark.asyncio
+async def test_run_periodic_sweep_purges_and_recovers_from_error(tmp_path: Path):
+    """run_periodic_sweep must survive transient sweep errors and purge orphans on subsequent ticks."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+
+    orphan_dir = sandbox / str(uuid4())
+    orphan_dir.mkdir()
+    (orphan_dir / "artifact.pdf").write_bytes(b"data")
+    past = time.time() - 1200
+    os.utime(orphan_dir, (past, past))
+
+    sweeper = TempFileSweeper(
+        sandbox_base=sandbox,
+        replay_dir=replay_dir,
+        grace_period_s=900.0,
+    )
+    stop_event = asyncio.Event()
+    real_sweep_sandbox = sweeper.sweep_sandbox
+    call_count = 0
+
+    async def flaky_sweep_sandbox() -> int:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("transient filesystem error")
+        purged = await real_sweep_sandbox()
+        stop_event.set()
+        return purged
+
+    with patch.object(sweeper, "sweep_sandbox", side_effect=flaky_sweep_sandbox):
+        await asyncio.wait_for(
+            sweeper.run_periodic_sweep(stop_event, interval_seconds=0.01),
+            timeout=5.0,
+        )
+
+    assert call_count == 2
+    assert not orphan_dir.exists()
+
+
+def test_sweep_replay_payloads_unlinks_symlink_safely(tmp_path: Path):
+    """sweep_replay_payloads must unlink .json symlinks in replay_dir without touching external targets."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    outside_file = tmp_path / "outside.json"
+    outside_file.write_text('{"sensitive": true}', encoding="utf-8")
+
+    symlink_entry = replay_dir / f"{uuid4()}.json"
+    symlink_entry.symlink_to(outside_file)
+
+    sweeper = TempFileSweeper(replay_dir=replay_dir, replay_retention_hours=0.0)
+    purged = sweeper.sweep_replay_payloads()
+
+    assert purged == 0
+    assert not symlink_entry.exists()
+    assert not symlink_entry.is_symlink()
+    assert outside_file.exists()
+    assert outside_file.read_text(encoding="utf-8") == '{"sensitive": true}'
+
+
+@pytest.mark.asyncio
+async def test_sweep_sandbox_reuses_redis_connection_across_entries(tmp_path: Path):
+    """sweep_sandbox must resolve Redis connection once per pass and fail closed when Redis is down."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    past = time.time() - 1200
+
+    orphan_ids = [str(uuid4()) for _ in range(3)]
+    for oid in orphan_ids:
+        d = sandbox / oid
+        d.mkdir()
+        os.utime(d, (past, past))
+
+    mock_conn = AsyncMock()
+    mock_conn.exists = AsyncMock(return_value=0)
+    mock_rm = MagicMock()
+    mock_rm.get_connection = AsyncMock(return_value=mock_conn)
+
+    sweeper = TempFileSweeper(
+        sandbox_base=sandbox,
+        redis_manager=mock_rm,
+        grace_period_s=900.0,
+    )
+    purged = await sweeper.sweep_sandbox()
+
+    assert purged == 3
+    assert mock_rm.get_connection.await_count == 1
+    assert mock_conn.exists.await_count == 3
+
+    # Fail-closed when Redis is unavailable: only 1 get_connection() attempt, 0 deletions
+    preserved_dirs = []
+    for _ in range(2):
+        d = sandbox / str(uuid4())
+        d.mkdir()
+        os.utime(d, (past, past))
+        preserved_dirs.append(d)
+
+    mock_rm_down = MagicMock()
+    mock_rm_down.get_connection = AsyncMock(side_effect=ConnectionError("Redis down"))
+    purged_down = await sweeper.sweep_sandbox(redis_manager=mock_rm_down)
+
+    assert purged_down == 0
+    assert mock_rm_down.get_connection.await_count == 1
+    assert all(d.exists() for d in preserved_dirs)

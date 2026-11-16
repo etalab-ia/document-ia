@@ -20,7 +20,10 @@ from document_ia_infra.core.file.safe_path import (
     safe_cleanup_directory,
     validate_execution_id,
 )
-from document_ia_infra.exception.security_exception import InvalidUUIDException
+from document_ia_infra.exception.security_exception import (
+    InvalidUUIDException,
+    PathTraversalException,
+)
 from document_ia_infra.redis.redis_manager import RedisManager
 from document_ia_infra.redis.stream_delivery import StreamDelivery
 from document_ia_worker.workflow.step.llm_extract_document.settings import (
@@ -31,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ORPHAN_GRACE_PERIOD_S: float = 900.0  # 15 minutes
 DEFAULT_SWEEP_INTERVAL_S: float = 600.0  # 10 minutes
-DEFAULT_REPLAY_RETENTION_HOURS: float = 24.0  # 24 hours
 
 
 class ActiveExecutionTracker:
@@ -126,19 +128,106 @@ class TempFileSweeper:
         if rm is not None:
             try:
                 conn = await rm.get_connection()
-                if conn is not None:
-                    lease_key = StreamDelivery.execution_lease_key(execution_id)
-                    exists = await conn.exists(lease_key)
-                    if exists:
-                        return True
+                if conn is None:
+                    logger.warning(
+                        "No Redis connection available to check lease for execution %s; assuming active (fail-closed)",
+                        execution_id,
+                    )
+                    return True
+                lease_key = StreamDelivery.execution_lease_key(execution_id)
+                exists = await conn.exists(lease_key)
+                if exists:
+                    return True
             except Exception as exc:
                 logger.warning(
-                    "Failed to check Redis lease for execution %s: %s",
+                    "Failed to check Redis lease for execution %s: %s; assuming active (fail-closed)",
                     execution_id,
                     exc,
                 )
+                return True
 
         return False
+
+    def _scan_sandbox_sync(
+        self,
+        base: Path,
+        grace_period: float,
+        now: float,
+    ) -> list[tuple[str, float]]:
+        """Synchronously scan sandbox_base using a confined descriptor.
+
+        Removes unexpected symlinks inside sandbox_base safely and returns
+        (execution_id, age_seconds) pairs for inactive directories past grace_period.
+        """
+        if base.is_symlink():
+            logger.error("Sandbox base %s is a symlink; refusing to sweep", base)
+            return []
+
+        if not base.exists():
+            return []
+
+        candidates: list[tuple[str, float]] = []
+        try:
+            with open_confined_directory(base, base) as confined_base:
+                for name in os.listdir(confined_base.fd):
+                    try:
+                        st = os.stat(
+                            name, dir_fd=confined_base.fd, follow_symlinks=False
+                        )
+                    except OSError as exc:
+                        logger.warning("Failed to stat sandbox entry %s: %s", name, exc)
+                        continue
+
+                    if stat.S_ISLNK(st.st_mode):
+                        logger.warning(
+                            "Removing unexpected symlink in sandbox base: %s", name
+                        )
+                        try:
+                            confined_base.unlink(name)
+                        except OSError as exc:
+                            logger.warning("Failed to remove symlink %s: %s", name, exc)
+                        continue
+
+                    if not stat.S_ISDIR(st.st_mode):
+                        continue
+
+                    # 1. Enforce canonical UUID format; skip non-UUID folders (e.g. .models, cache)
+                    try:
+                        uid = validate_execution_id(name)
+                    except InvalidUUIDException:
+                        logger.debug("Skipping non-UUID directory in sandbox: %s", name)
+                        continue
+                    if str(uid) != name:
+                        logger.debug(
+                            "Skipping non-canonical UUID directory in sandbox: %s",
+                            name,
+                        )
+                        continue
+
+                    # 2. Check local in-memory tracker first (no I/O)
+                    if ActiveExecutionTracker.is_active(name):
+                        logger.debug(
+                            "Execution %s is active locally; skipping sweep", name
+                        )
+                        continue
+
+                    # 3. Check mtime against grace period before issuing Redis network call
+                    age_seconds = now - st.st_mtime
+                    if age_seconds < grace_period:
+                        logger.debug(
+                            "Execution directory %s is in grace period (age=%.1fs < %.1fs); skipping",
+                            name,
+                            age_seconds,
+                            grace_period,
+                        )
+                        continue
+
+                    candidates.append((name, age_seconds))
+        except (OSError, PathTraversalException) as exc:
+            logger.warning("Could not scan sandbox base directory %s: %s", base, exc)
+            return []
+
+        return candidates
 
     async def sweep_sandbox(
         self,
@@ -149,7 +238,7 @@ class TempFileSweeper:
         """Scan sandbox_base and securely delete abandoned orphaned execution directories.
 
         Protection rules:
-        1. Ignored if directory name is not a valid UUID (protects non-execution folders like model caches).
+        1. Ignored if directory name is not a canonical UUID (protects non-execution folders like model caches).
         2. Skipped if execution is currently active locally or in Redis cluster.
         3. Skipped if directory age (mtime) is under grace period (allows retries/restarts).
         4. When age exceeds grace period and execution is inactive, safe_cleanup_directory is invoked.
@@ -162,77 +251,68 @@ class TempFileSweeper:
             max_age_seconds if max_age_seconds is not None else self.grace_period_s
         )
         rm = redis_manager or self.redis_manager
-
-        if base.is_symlink():
-            logger.error("Sandbox base %s is a symlink; refusing to sweep", base)
-            return 0
-
-        if not base.exists():
-            return 0
-
-        purged_count = 0
         now = time.time()
 
-        try:
-            entries = list(base.iterdir())
-        except OSError as exc:
-            logger.warning("Could not list sandbox base directory %s: %s", base, exc)
+        candidates = await asyncio.to_thread(
+            self._scan_sandbox_sync, base, grace_period, now
+        )
+        if not candidates:
             return 0
 
-        for entry in entries:
-            # If an entry is a symlink directly in sandbox base, remove it safely
-            if entry.is_symlink():
-                logger.warning("Removing unexpected symlink in sandbox base: %s", entry)
-                try:
-                    entry.unlink()
-                except OSError as exc:
-                    logger.warning("Failed to remove symlink %s: %s", entry, exc)
-                continue
-
-            if not entry.is_dir():
-                continue
-
-            # 1. Enforce standard UUID format; skip and protect any other folder (e.g., .models, cache)
+        redis_conn = None
+        if rm is not None:
             try:
-                validate_execution_id(entry.name)
-            except InvalidUUIDException:
-                logger.debug("Skipping non-UUID directory in sandbox: %s", entry.name)
-                continue
-
-            # 2. Check active execution (in-memory tracker or Redis cluster lease)
-            if await self.is_execution_active(entry.name, rm):
-                logger.debug("Execution %s is active; skipping sweep", entry.name)
-                continue
-
-            # 3. Check mtime against grace period
-            try:
-                mtime = entry.stat().st_mtime
-            except OSError as exc:
-                logger.warning("Failed to stat sandbox directory %s: %s", entry, exc)
-                continue
-
-            age_seconds = now - mtime
-            if age_seconds < grace_period:
-                logger.debug(
-                    "Execution directory %s is in grace period (age=%.1fs < %.1fs); skipping",
-                    entry.name,
-                    age_seconds,
-                    grace_period,
+                redis_conn = await rm.get_connection()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to connect to Redis during sandbox sweep: %s; skipping sweep (fail-closed)",
+                    exc,
                 )
+                return 0
+            if redis_conn is None:
+                logger.warning(
+                    "No Redis connection available during sandbox sweep; skipping sweep (fail-closed)"
+                )
+                return 0
+
+        purged_count = 0
+        for name, age_seconds in candidates:
+            if ActiveExecutionTracker.is_active(name):
+                logger.debug("Execution %s is active locally; skipping sweep", name)
                 continue
 
-            # 4. Directory is orphaned and grace period has elapsed -> purge
+            # 4. Check Redis cluster lease (fail-closed on Redis errors)
+            if redis_conn is not None:
+                try:
+                    lease_key = StreamDelivery.execution_lease_key(name)
+                    if await redis_conn.exists(lease_key):
+                        logger.debug("Execution %s is active; skipping sweep", name)
+                        continue
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to check Redis lease for execution %s: %s; aborting sweep (fail-closed)",
+                        name,
+                        exc,
+                    )
+                    return purged_count
+
+            # 5. Directory is orphaned and grace period has elapsed -> purge
+            entry_path = base / name
             logger.info(
                 "Purging abandoned orphaned execution sandbox: %s (age=%.1fs, grace_period=%.1fs)",
-                entry,
+                entry_path,
                 age_seconds,
                 grace_period,
             )
             try:
-                if safe_cleanup_directory(entry, sandbox_root=base):
+                if await asyncio.to_thread(
+                    safe_cleanup_directory, entry_path, sandbox_root=base
+                ):
                     purged_count += 1
             except Exception as exc:
-                logger.warning("Failed to sweep orphaned directory %s: %s", entry, exc)
+                logger.warning(
+                    "Failed to sweep orphaned directory %s: %s", entry_path, exc
+                )
 
         return purged_count
 
@@ -278,7 +358,14 @@ class TempFileSweeper:
                         logger.warning(
                             "Removing unexpected symlink in replay dir: %s", name
                         )
-                        confined.unlink(name)
+                        try:
+                            confined.unlink(name)
+                        except OSError as exc:
+                            logger.warning(
+                                "Failed to remove symlink %s in replay dir: %s",
+                                name,
+                                exc,
+                            )
                         continue
                     if not stat.S_ISREG(st.st_mode):
                         continue
@@ -290,8 +377,15 @@ class TempFileSweeper:
                             age_seconds / 3600.0,
                             retention_hours,
                         )
-                        confined.unlink(name)
-                        purged_count += 1
+                        try:
+                            confined.unlink(name)
+                            purged_count += 1
+                        except OSError as exc:
+                            logger.warning(
+                                "Failed to unlink expired replay payload %s: %s",
+                                name,
+                                exc,
+                            )
         except Exception as exc:
             logger.warning("Could not sweep replay directory %s: %s", target_dir, exc)
             return purged_count
@@ -305,7 +399,7 @@ class TempFileSweeper:
         )
         try:
             purged_dirs = await self.sweep_sandbox()
-            purged_replays = self.sweep_replay_payloads()
+            purged_replays = await asyncio.to_thread(self.sweep_replay_payloads)
             logger.info(
                 "[sweeper] Startup cleanup finished: %d orphaned sandboxes purged, %d expired replay payloads purged",
                 purged_dirs,
@@ -337,7 +431,7 @@ class TempFileSweeper:
 
             try:
                 purged_dirs = await self.sweep_sandbox()
-                purged_replays = self.sweep_replay_payloads()
+                purged_replays = await asyncio.to_thread(self.sweep_replay_payloads)
                 if purged_dirs > 0 or purged_replays > 0:
                     logger.info(
                         "[sweeper] Periodic sweep finished: %d sandboxes purged, %d replay payloads purged",

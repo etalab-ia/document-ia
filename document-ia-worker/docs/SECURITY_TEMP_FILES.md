@@ -25,7 +25,7 @@ This document formalizes the architecture, permission model, and lifecycle gover
 | Threat Vector | OWASP Ref | Vulnerability Mechanism | Implemented Defense |
 | :--- | :--- | :--- | :--- |
 | **Information Disclosure via Shared `/tmp`** | A01:2021 | Default umask (`0022` or `0002`) creates world- or group-readable temporary directories (`0755` / `0777`). Local untrusted processes can inspect extracted documents. | Explicit permission enforcement: sandbox root and execution directories are created with `0o700` (`rwx------`); generated files are opened with `0o600` (`rw-------`). |
-| **Sandbox Inode Accumulation (Disk DoS)** | A04:2021 | Unhandled exceptions, watchdog fencing, or hard process termination (`SIGKILL`) leave orphaned files in `/tmp/document_ia_worker.tmp/`, eventually exhausting disk space or inodes. | Background `TempFileSweeper` sweeps directories older than `ORPHAN_DIR_GRACE_PERIOD_S` (15 min) with no active local handler and no active Redis lease. |
+| **Sandbox Inode Accumulation (Disk DoS)** | A04:2021 | Unhandled exceptions, watchdog fencing, or hard process termination (`SIGKILL`) leave orphaned files in `/tmp/document_ia_worker.tmp/`, eventually exhausting disk space or inodes. | Background `TempFileSweeper` sweeps directories older than `DEFAULT_ORPHAN_GRACE_PERIOD_S` (15 min) with no active local handler and no active Redis lease. |
 | **Premature Deletion of Retried Tasks** | A04:2021 | A naive startup cleaner or aggressive sweeper deletes files of a workflow currently executing or scheduled for an immediate retry. | In-flight tracking via `ActiveExecutionTracker` and distributed Redis lease checks (`StreamDelivery.execution_lease_key`) prevent deletion of active workflows. |
 | **Model Cache Confusion / Tampering** | A01:2021 | A sweeper blindly deleting under `/tmp` or root inadvertently purges YOLO-World or QRDet model weights (`.models/`, `~/.cache`), forcing re-downloads or breaking offline container boot. | Sweeper is strictly confined to `DEFAULT_SANDBOX_BASE` and `OPENAI_REPLAY_PAYLOAD_SAVE_PATH`. Subdirectories must strictly match standard UUID patterns; non-UUID entries are ignored. |
 | **Replay Payload Leakage** | A01:2021 | Prompts and extracted text saved under `/tmp/document-ia-openai-replay` remain permanently on disk with permissive rights. | Replay feature remains disabled by default (`OPENAI_REPLAY_PAYLOAD_SAVE_ENABLED=False`). When enabled, writes are enforced at `0o700`/`0o600` and pruned after 24 hours. |
@@ -51,7 +51,7 @@ This document formalizes the architecture, permission model, and lifecycle gover
 1. **Base Sandbox**: Created on demand with `ensure_directory_permissions(DEFAULT_SANDBOX_BASE, 0o700)`.
 2. **Execution Sandbox**: Created via `get_execution_sandbox_root(execution_id)` with `ensure_directory_permissions(root, 0o700)`.
 3. **File Descriptors**: Opened via `ConfinedDirectory.open_file` with `os.O_CREAT | os.O_WRONLY | _O_NOFOLLOW | _O_CLOEXEC` and mode `0o600`.
-4. **Third-party Outputs**: OpenCV (`cv2.imwrite`) and PyMuPDF (`pix.save`) outputs are immediately secured using `ensure_file_permissions(path, 0o600)`.
+4. **Third-party Outputs**: Pillow (`PIL.Image.save`) and PyMuPDF (`pix.save`) outputs are immediately secured using `ensure_file_permissions(path, 0o600)`.
 
 ---
 
@@ -85,7 +85,7 @@ flowchart TD
 2. **Distributed Redis Lease (`StreamDelivery.execution_lease_key`)**:
    - Workflows in a cluster hold a distributed lease key (`lock:workflow_execution:{execution_id}`).
    - If a valid lease is found in Redis, the execution is considered active on another worker.
-3. **Grace Period Threshold (`ORPHAN_DIR_GRACE_PERIOD_S = 900`)**:
+3. **Grace Period Threshold (`DEFAULT_ORPHAN_GRACE_PERIOD_S = 900`)**:
    - With a maximal workflow processing timeout of 120 seconds, a 15-minute grace period provides a conservative safety margin to absorb transient retries before concluding that a directory is abandoned.
 
 ---
@@ -97,7 +97,7 @@ At worker boot, an initial sweep pass (`TempFileSweeper.startup_cleanup()`) re-e
 
 The primary role of the background cleaner is **in-process lifecycle cleanup**:
 - Runs as an asynchronous background task (`asyncio.create_task`) spawned inside `document-ia-worker/main.py`.
-- Awakens every 10 minutes (`SWEEP_INTERVAL_S = 600`).
+- Awakens every 10 minutes (`DEFAULT_SWEEP_INTERVAL_S = 600`).
 - Performs two passes:
   1. **Sandbox Sweep**: Reclaims abandoned execution sandboxes in `/tmp/document_ia_worker.tmp/`.
   2. **Replay Sweep**: Purges `.json` payloads in `/tmp/document-ia-openai-replay/` older than 24 hours (`OPENAI_REPLAY_RETENTION_HOURS = 24`).

@@ -151,14 +151,17 @@ async def main() -> None:
 
     # Startup cleanup and periodic background sweeper for temporary files
     sweeper_redis_manager = RedisManager()
-    sweeper = TempFileSweeper(redis_manager=sweeper_redis_manager)
-    await sweeper.startup_cleanup()
-    sweeper_task = asyncio.create_task(sweeper.run_periodic_sweep(stop_event))
-
-    consumer_task = asyncio.create_task(run_consumer(stop_event))
-    stop_wait = asyncio.create_task(stop_event.wait())
+    sweeper_task: asyncio.Task[None] | None = None
+    consumer_task: asyncio.Task[None] | None = None
+    stop_wait: asyncio.Task[bool] | None = None
 
     try:
+        sweeper = TempFileSweeper(redis_manager=sweeper_redis_manager)
+        await sweeper.startup_cleanup()
+        sweeper_task = asyncio.create_task(sweeper.run_periodic_sweep(stop_event))
+
+        consumer_task = asyncio.create_task(run_consumer(stop_event))
+        stop_wait = asyncio.create_task(stop_event.wait())
         done, _ = await asyncio.wait(
             {consumer_task, stop_wait}, return_when=asyncio.FIRST_COMPLETED
         )
@@ -210,11 +213,11 @@ async def main() -> None:
         for s in registered_sigs or ():
             with contextlib.suppress(Exception):
                 loop.remove_signal_handler(s)
-        if not stop_wait.done():
+        if stop_wait is not None and not stop_wait.done():
             stop_wait.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await stop_wait
-        if not sweeper_task.done():
+        if sweeper_task is not None and not sweeper_task.done():
             sweeper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sweeper_task

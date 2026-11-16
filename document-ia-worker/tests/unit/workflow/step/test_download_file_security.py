@@ -1057,3 +1057,43 @@ def test_open_confined_directory_blocks_toctou_root_swap_on_subdir(tmp_path: Pat
 
     assert secret.exists(), "outside secret must not be affected"
     assert secret.read_text() == "critical host data"
+
+
+def test_safe_cleanup_directory_on_regular_file(tmp_path: Path):
+    """safe_cleanup_directory must unlink a confined regular file and return True."""
+    from document_ia_infra.core.file.safe_path import safe_cleanup_directory
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    regular_file = sandbox / "file.txt"
+    regular_file.write_text("hello", encoding="utf-8")
+
+    result = safe_cleanup_directory(regular_file, sandbox_root=sandbox)
+
+    assert result is True
+    assert not regular_file.exists()
+
+
+def test_cleanup_never_deletes_symlink_inside_replaced_sandbox_root(tmp_path: Path):
+    """If sandbox_root is replaced by a symlink to an outside directory containing a symlink,
+    safe_cleanup_directory must refuse and never delete the outside symlink.
+    """
+    from document_ia_infra.core.file.safe_path import safe_cleanup_directory
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target_file = outside / "secret.txt"
+    target_file.write_text("secret", encoding="utf-8")
+    outside_link = outside / "preprocess"
+    outside_link.symlink_to(target_file)
+
+    execution_dir = tmp_path / str(uuid4())
+    execution_dir.symlink_to(outside, target_is_directory=True)
+
+    result = safe_cleanup_directory(
+        execution_dir / "preprocess", sandbox_root=execution_dir
+    )
+
+    assert result is False
+    assert outside_link.is_symlink(), "Outside symlink must not be deleted"
+    assert target_file.exists()
