@@ -87,6 +87,7 @@ class SupportedDocumentType(str, Enum):
     TAXE_FONCIERE = "taxe_fonciere"
     DEVIS_PAC = "devis_pac"
     CARTE_GRISE = "carte_grise"
+    DECISION_COMED = "decision_comed"
     LICENCE_NAVIGANT_FCL = "licence_navigant_fcl"
     AUTRE = "autre"
 
