@@ -87,9 +87,7 @@ def test_pages_resolve_key_from_session_not_global_config(page: str):
 def test_custom_environment_never_receives_default_key():
     """A custom URL without its own key yields an empty key, not the default."""
     with patch.object(config, "DOCUMENT_IA_API_KEY", DEFAULT_KEY):
-        with patch(
-            "streamlit.session_state", {"custom_document_ia_url": CUSTOM_URL}
-        ):
+        with patch("streamlit.session_state", {"custom_document_ia_url": CUSTOM_URL}):
             cfg = get_current_config()
             assert cfg["base_url"] == CUSTOM_URL
             assert cfg["api_key"] == ""
@@ -316,7 +314,10 @@ def test_workflow_cache_is_keyed_by_active_configuration():
 
     with patch(
         "streamlit.session_state",
-        {"custom_document_ia_url": CUSTOM_URL, "custom_document_ia_api_key": CUSTOM_KEY},
+        {
+            "custom_document_ia_url": CUSTOM_URL,
+            "custom_document_ia_api_key": CUSTOM_KEY,
+        },
     ):
         custom_fp = wc._config_fingerprint()
 
@@ -390,11 +391,19 @@ def test_configurator_refetches_after_environment_switch():
     with patch.object(wc, "get_workflows", side_effect=fake_get_workflows):
         with patch("streamlit.session_state", session):
             with patch.object(wc.st, "spinner"):
-                with patch.object(wc.st, "selectbox", side_effect=lambda *a, **k: k["options"][0]):
-                    with patch.object(wc.st, "columns", return_value=[_Null(), _Null()]):
-                        with patch.object(wc.st, "markdown"), patch.object(wc.st, "write"), patch.object(
-                            wc.st, "subheader"
-                        ), patch.object(wc.st, "warning"), patch.object(wc.st, "error"):
+                with patch.object(
+                    wc.st, "selectbox", side_effect=lambda *a, **k: k["options"][0]
+                ):
+                    with patch.object(
+                        wc.st, "columns", return_value=[_Null(), _Null()]
+                    ):
+                        with (
+                            patch.object(wc.st, "markdown"),
+                            patch.object(wc.st, "write"),
+                            patch.object(wc.st, "subheader"),
+                            patch.object(wc.st, "warning"),
+                            patch.object(wc.st, "error"),
+                        ):
                             session.update(
                                 custom_document_ia_url=CUSTOM_URL,
                                 custom_document_ia_api_key=CUSTOM_KEY,
@@ -403,7 +412,9 @@ def test_configurator_refetches_after_environment_switch():
                             # Administrator switches back to the default environment.
                             session.pop("custom_document_ia_url")
                             session.pop("custom_document_ia_api_key")
-                            wc.render_workflow_configurator(DEFAULT_KEY, key_suffix="_t")
+                            wc.render_workflow_configurator(
+                                DEFAULT_KEY, key_suffix="_t"
+                            )
 
     assert calls == [CUSTOM_KEY, DEFAULT_KEY]
 

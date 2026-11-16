@@ -303,7 +303,7 @@ def update_evals_user(
             user = session.scalars(
                 select(EvalsUser).where(EvalsUser.id == parsed_uuid)
             ).first()
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             pass
 
         if not user:

@@ -220,7 +220,7 @@ def test_patch_streamlit_oidc_prompt() -> None:
 
         client, _ = s_routes._create_oauth_client("proconnect")  # pyright: ignore [reportPrivateUsage]
         assert "prompt" not in client.client_kwargs
-    except (ImportError, AttributeError):
+    except ImportError, AttributeError:
         import streamlit.web.server.oauth_authlib_routes as routes  # pyright: ignore [reportMissingImports]
 
         client, _ = routes.create_oauth_client("proconnect")
