@@ -1,0 +1,50 @@
+# OSV-Scanner vérifie les dépendances contre la base de vulnérabilités OSV.
+# - Les pull requests échouent uniquement sur les vulnérabilités introduites
+#   par le changement.
+# - Les scans hebdomadaires et sur branche publient l'inventaire complet dans
+#   Code Scanning sans bloquer.
+#
+# Ce workflow remplace l'installation manuelle d'osv-scanner par curl et
+# couvre désormais les sept fichiers uv.lock du dépôt, et non le seul fichier
+# à la racine.
+name: OSV-Scanner
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+  merge_group:
+  schedule:
+    - cron: "12 12 * * 1"
+
+permissions: {}
+
+jobs:
+  scan-scheduled:
+    name: OSV-Scanner (inventaire complet)
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+    with:
+      # Les vulnérabilités existantes alimentent Code Scanning ; le scan de PR
+      # reste la barrière bloquante pour celles qui sont nouvellement
+      # introduites.
+      fail-on-vuln: false
+
+  scan-pr:
+    name: OSV-Scanner (nouvelles vulnérabilités)
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+    with:
+      fail-on-vuln: true
+      # Les PR issues d'un fork disposent d'un GITHUB_TOKEN en lecture seule,
+      # donc l'envoi du SARIF échouerait en 403 quel que soit le résultat du
+      # scan. Leurs trouvailles restent visibles dans les journaux du job.
+      upload-sarif: ${{ github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository }}

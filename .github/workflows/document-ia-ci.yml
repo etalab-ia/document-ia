@@ -267,45 +267,6 @@ jobs:
         run: |
           gitleaks git --config .gitleaks.toml --baseline-path .gitleaks-baseline.json --verbose --redact .
 
-  osv-scan:
-    name: OSV Scanner (dépendances)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      actions: read
-      security-events: write
-    # Non bloquant : le scanner signale aussi des vulnérabilités transitives
-    # existantes. Corriger cryptography et filelock ne suffit pas à blanchir
-    # l'inventaire ; rendre ce job bloquant après cette remédiation globale.
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install OSV Scanner
-        run: |
-          OSV_VERSION="2.0.2"
-          curl -sSfL "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64" -o /usr/local/bin/osv-scanner
-          chmod +x /usr/local/bin/osv-scanner
-          osv-scanner --version
-
-      - name: Run OSV Scanner
-        # Le job reste non bloquant, mais le rapport doit quand même être généré.
-        continue-on-error: true
-        run: |
-          osv-scanner \
-            --lockfile=uv.lock \
-            --format=sarif \
-            --output=results.sarif
-
-      - name: Upload SARIF
-        if: ${{ always() && hashFiles('results.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v3
-        with:
-          sarif_file: results.sarif
-          wait-for-processing: true
-
   pyright:
     name: Pyright (${{ matrix.name }})
     runs-on: ubuntu-latest
