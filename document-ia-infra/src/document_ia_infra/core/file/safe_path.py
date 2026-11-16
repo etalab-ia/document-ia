@@ -106,6 +106,29 @@ def _fd_path(fd: int) -> Path | None:
         return None
 
 
+def _is_symlink_open_error(
+    exc: OSError,
+    target: Path | str,
+    *,
+    dir_fd: int | None = None,
+) -> bool:
+    """Return True only when an O_DIRECTORY|O_NOFOLLOW open failed due to a symlink.
+
+    Regular files fail O_DIRECTORY with ENOTDIR (NotADirectoryError) and must
+    propagate as NotADirectoryError so callers such as safe_cleanup_directory()
+    can handle non-directory targets without misclassifying them as traversals.
+    """
+    if exc.errno == errno.ELOOP:
+        return True
+    if exc.errno != errno.ENOTDIR:
+        return False
+    try:
+        st = os.stat(target, dir_fd=dir_fd, follow_symlinks=False)
+        return stat.S_ISLNK(st.st_mode)
+    except OSError:
+        return False
+
+
 def open_confined_directory(
     directory_path: Path | str,
     sandbox_root: Path | str,
@@ -127,7 +150,7 @@ def open_confined_directory(
     try:
         current_fd = os.open(root_resolved, open_flags)
     except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+        if _is_symlink_open_error(exc, root_resolved):
             raise PathTraversalException(
                 f"Sandbox root {root_resolved} is a symlink"
             ) from exc
@@ -151,7 +174,7 @@ def open_confined_directory(
             try:
                 next_fd = os.open(part, open_flags, dir_fd=current_fd)
             except OSError as exc:
-                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                if _is_symlink_open_error(exc, part, dir_fd=current_fd):
                     raise PathTraversalException(
                         f"Sandbox directory component {part!r} in {resolved} was replaced by a symlink"
                     ) from exc

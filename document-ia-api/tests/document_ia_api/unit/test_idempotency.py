@@ -949,3 +949,151 @@ class TestReconciliationReadIsBounded:
         publisher = Publisher("event_stream", current_redis_manager=manager)
 
         assert await publisher.execution_is_queued("exec-A") is False
+
+
+class TestExecutionIsQueuedPagination:
+    """Pagination and unresolved-budget handling in Publisher.execution_is_queued()."""
+
+    @pytest.mark.asyncio
+    async def test_execution_found_on_second_page_returns_true(self):
+        import json
+
+        from document_ia_infra.redis.publisher import Publisher
+
+        page_one = [
+            (
+                f"{1000 + idx}-0",
+                {"data": json.dumps({"workflow_execution_id": f"other-{idx}"})},
+            )
+            for idx in range(1000)
+        ]
+        page_two = [
+            (
+                b"2000-0",
+                {"data": json.dumps({"workflow_execution_id": "exec-target"})},
+            ),
+        ]
+
+        connection = AsyncMock()
+        connection.xrange.side_effect = [page_one, page_two]
+        manager = AsyncMock()
+        manager.get_connection.return_value = connection
+        publisher = Publisher("event_stream", current_redis_manager=manager)
+
+        result = await publisher.execution_is_queued("exec-target")
+
+        assert result is True
+        assert connection.xrange.await_count == 2
+        first_call = connection.xrange.await_args_list[0]
+        second_call = connection.xrange.await_args_list[1]
+        assert first_call.kwargs["min"] == "-"
+        assert first_call.kwargs["count"] == 1000
+        assert second_call.kwargs["min"] == "(1999-0"
+        assert second_call.kwargs["count"] == 1000
+
+    @pytest.mark.asyncio
+    async def test_bytes_cursor_is_decoded_for_subsequent_page(self):
+        import json
+
+        from document_ia_infra.redis.publisher import Publisher
+
+        page_one = [
+            (
+                f"{1000 + idx}-0".encode(),
+                {"data": json.dumps({"workflow_execution_id": f"other-{idx}"})},
+            )
+            for idx in range(1000)
+        ]
+        page_two = []
+
+        connection = AsyncMock()
+        connection.xrange.side_effect = [page_one, page_two]
+        manager = AsyncMock()
+        manager.get_connection.return_value = connection
+        publisher = Publisher("event_stream", current_redis_manager=manager)
+
+        result = await publisher.execution_is_queued("exec-missing")
+
+        assert result is False
+        assert connection.xrange.await_args_list[1].kwargs["min"] == "(1999-0"
+
+    @pytest.mark.asyncio
+    async def test_truncated_scan_when_budget_exhausted_returns_none_and_avoids_publish_failed(
+        self,
+    ):
+        import json
+
+        from document_ia_infra.redis.publisher import (
+            PublicationOutcomeUnknownError,
+            Publisher,
+        )
+        from document_ia_infra.redis.redis_settings import redis_settings
+
+        full_page = [
+            (
+                f"{1000 + idx}-0",
+                {"data": json.dumps({"workflow_execution_id": f"other-{idx}"})},
+            )
+            for idx in range(1000)
+        ]
+
+        async def slow_page(*args, **kwargs):
+            await asyncio.sleep(0.08)
+            return full_page
+
+        connection = AsyncMock()
+        connection.xrange.side_effect = slow_page
+        manager = AsyncMock()
+        manager.get_connection.return_value = connection
+        publisher = Publisher("event_stream", current_redis_manager=manager)
+        publisher.publish_message_fenced = AsyncMock(
+            side_effect=PublicationOutcomeUnknownError("event_stream", "TimeoutError")
+        )
+
+        service = AsyncMock(spec=IdempotencyService)
+        reservation = IdempotencyReservation(
+            service, key="k", execution_id="exec-target", lock_ttl_seconds=60
+        )
+
+        with patch.object(redis_settings, "PUBLISH_TIMEOUT_SECONDS", 0.1):
+            await reservation.publish(publisher, "message")
+
+        assert reservation.outcome_unresolved is True
+
+    @pytest.mark.asyncio
+    async def test_truncated_scan_when_max_pages_reached_returns_none(self):
+        import json
+
+        from document_ia_infra.redis import publisher as publisher_module
+        from document_ia_infra.redis.publisher import (
+            PublicationOutcomeUnknownError,
+            Publisher,
+        )
+
+        full_page = [
+            (
+                f"{1000 + idx}-0",
+                {"data": json.dumps({"workflow_execution_id": f"other-{idx}"})},
+            )
+            for idx in range(1000)
+        ]
+
+        connection = AsyncMock()
+        connection.xrange.return_value = full_page
+        manager = AsyncMock()
+        manager.get_connection.return_value = connection
+        publisher = Publisher("event_stream", current_redis_manager=manager)
+        publisher.publish_message_fenced = AsyncMock(
+            side_effect=PublicationOutcomeUnknownError("event_stream", "TimeoutError")
+        )
+
+        service = AsyncMock(spec=IdempotencyService)
+        reservation = IdempotencyReservation(
+            service, key="k", execution_id="exec-target", lock_ttl_seconds=60
+        )
+
+        with patch.object(publisher_module, "_EXECUTION_LOOKUP_MAX_PAGES", 2):
+            await reservation.publish(publisher, "message")
+
+        assert connection.xrange.await_count == 2
+        assert reservation.outcome_unresolved is True

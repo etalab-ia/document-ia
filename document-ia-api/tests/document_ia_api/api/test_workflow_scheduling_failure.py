@@ -653,3 +653,240 @@ class TestWorkflowExecutionSchedulingFailure:
 
         assert len(uploaded_keys) == 1
         assert deleted_keys == uploaded_keys
+
+
+class TestWorkflowCancellationS3Protection:
+    """CancelledError during publication must not delete an S3 file that may be queued."""
+
+    @pytest.mark.asyncio
+    async def test_v1_execute_does_not_compensate_s3_on_cancelled_publish(self):
+        import asyncio
+        import io
+
+        from fastapi import UploadFile
+
+        from document_ia_api.application.services.workflow_service import (
+            WorkflowService,
+        )
+
+        raw_s3_key = "uploads/2026/11/16/cancelled_publish_v1.pdf"
+        service = WorkflowService(db_session=AsyncMock())
+        before_publish = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with (
+            patch(
+                "document_ia_api.application.services.workflow_service.workflow_repository.get_workflow_by_id",
+                new=AsyncMock(return_value={"id": "document-classification-v1"}),
+            ),
+            patch(
+                "document_ia_api.application.services.workflow_service.s3_service.upload_file",
+                new=AsyncMock(
+                    return_value={
+                        "s3_key": raw_s3_key,
+                        "presigned_url": "https://s3.example.com/p",
+                    }
+                ),
+            ),
+            patch(
+                "document_ia_api.infra.s3_service.s3_service.delete_file",
+                new=AsyncMock(return_value=True),
+            ) as mock_s3_delete,
+            patch(
+                "document_ia_api.application.services.workflow_service.EventStoreService.emit_workflow_started",
+                new=AsyncMock(),
+            ),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await service.execute_workflow(
+                    organization_id=uuid4(),
+                    workflow_id="document-classification-v1",
+                    file=UploadFile(filename="test.pdf", file=io.BytesIO(_pdf_file())),
+                    file_url=None,
+                    metadata_json=None,
+                    request_classification_parameter=None,
+                    request_extraction_parameter=None,
+                    before_publish=before_publish,
+                )
+
+        mock_s3_delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_v2_execute_does_not_compensate_s3_on_cancelled_publish(self):
+        import asyncio
+        import io
+
+        from fastapi import UploadFile
+
+        from document_ia_api.application.services.workflow_v2_service import (
+            WorkflowV2Service,
+        )
+
+        raw_s3_key = "uploads/2026/11/16/cancelled_publish_v2.pdf"
+        service = WorkflowV2Service(db_session=AsyncMock())
+        before_publish = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with (
+            patch(
+                "document_ia_api.application.services.workflow_v2_service.workflow_v2_repository.get_raw_workflow_by_id",
+                return_value={
+                    "id": "document-extraction-v2",
+                    "steps": [
+                        {
+                            "action": "llm_classify_document",
+                            "params": {"document_types": {"default": "all"}},
+                        }
+                    ],
+                },
+            ),
+            patch(
+                "document_ia_api.application.services.workflow_v2_service.s3_service.upload_file",
+                new=AsyncMock(
+                    return_value={
+                        "s3_key": raw_s3_key,
+                        "presigned_url": "https://s3.example.com/p",
+                    }
+                ),
+            ),
+            patch(
+                "document_ia_api.infra.s3_service.s3_service.delete_file",
+                new=AsyncMock(return_value=True),
+            ) as mock_s3_delete,
+            patch(
+                "document_ia_api.application.services.workflow_v2_service.EventStoreService.emit_workflow_started",
+                new=AsyncMock(),
+            ),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await service.execute_workflow(
+                    organization_id=uuid4(),
+                    workflow_id="document-extraction-v2",
+                    file=UploadFile(filename="test.pdf", file=io.BytesIO(_pdf_file())),
+                    file_url=None,
+                    metadata_json=None,
+                    override_payload=None,
+                    before_publish=before_publish,
+                )
+
+        mock_s3_delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_v1_execute_still_compensates_s3_on_cancelled_emit_before_publish(
+        self,
+    ):
+        import asyncio
+        import io
+
+        from fastapi import UploadFile
+
+        from document_ia_api.application.services.workflow_service import (
+            WorkflowService,
+        )
+
+        raw_s3_key = "uploads/2026/11/16/cancelled_before_publish_v1.pdf"
+        service = WorkflowService(db_session=AsyncMock())
+
+        with (
+            patch(
+                "document_ia_api.application.services.workflow_service.workflow_repository.get_workflow_by_id",
+                new=AsyncMock(return_value={"id": "document-classification-v1"}),
+            ),
+            patch(
+                "document_ia_api.application.services.workflow_service.s3_service.upload_file",
+                new=AsyncMock(
+                    return_value={
+                        "s3_key": raw_s3_key,
+                        "presigned_url": "https://s3.example.com/p",
+                    }
+                ),
+            ),
+            patch(
+                "document_ia_api.infra.s3_service.s3_service.delete_file",
+                new=AsyncMock(return_value=True),
+            ) as mock_s3_delete,
+            patch(
+                "document_ia_api.application.services.workflow_service.EventStoreService.emit_workflow_started",
+                new=AsyncMock(side_effect=asyncio.CancelledError()),
+            ),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await service.execute_workflow(
+                    organization_id=uuid4(),
+                    workflow_id="document-classification-v1",
+                    file=UploadFile(filename="test.pdf", file=io.BytesIO(_pdf_file())),
+                    file_url=None,
+                    metadata_json=None,
+                    request_classification_parameter=None,
+                    request_extraction_parameter=None,
+                )
+
+        mock_s3_delete.assert_awaited_once_with(raw_s3_key)
+
+    @pytest.mark.asyncio
+    async def test_v2_execute_still_compensates_s3_on_idempotency_reservation_lost_via_before_publish(
+        self,
+    ):
+        import io
+
+        from fastapi import UploadFile
+
+        from document_ia_api.application.services.workflow_v2_service import (
+            WorkflowV2Service,
+        )
+        from document_ia_api.core.idempotency.exceptions import (
+            IdempotencyReservationLostException,
+        )
+
+        raw_s3_key = "uploads/2026/11/16/lost_reservation_before_publish_v2.pdf"
+        service = WorkflowV2Service(db_session=AsyncMock())
+        before_publish = AsyncMock(
+            side_effect=IdempotencyReservationLostException(execution_id="exec-lost")
+        )
+
+        with (
+            patch(
+                "document_ia_api.application.services.workflow_v2_service.workflow_v2_repository.get_raw_workflow_by_id",
+                return_value={
+                    "id": "document-extraction-v2",
+                    "steps": [
+                        {
+                            "action": "llm_classify_document",
+                            "params": {"document_types": {"default": "all"}},
+                        }
+                    ],
+                },
+            ),
+            patch(
+                "document_ia_api.application.services.workflow_v2_service.s3_service.upload_file",
+                new=AsyncMock(
+                    return_value={
+                        "s3_key": raw_s3_key,
+                        "presigned_url": "https://s3.example.com/p",
+                    }
+                ),
+            ),
+            patch(
+                "document_ia_api.infra.s3_service.s3_service.delete_file",
+                new=AsyncMock(return_value=True),
+            ) as mock_s3_delete,
+            patch(
+                "document_ia_api.application.services.workflow_v2_service.EventStoreService.emit_workflow_started",
+                new=AsyncMock(),
+            ),
+            patch(
+                "document_ia_api.application.services.execution_acceptance.EventStoreService.emit_workflow_failed",
+                new=AsyncMock(),
+            ) as close_execution,
+        ):
+            with pytest.raises(IdempotencyReservationLostException):
+                await service.execute_workflow(
+                    organization_id=uuid4(),
+                    workflow_id="document-extraction-v2",
+                    file=UploadFile(filename="test.pdf", file=io.BytesIO(_pdf_file())),
+                    file_url=None,
+                    metadata_json=None,
+                    override_payload=None,
+                    before_publish=before_publish,
+                )
+
+        close_execution.assert_awaited_once()
+        mock_s3_delete.assert_awaited_once_with(raw_s3_key)

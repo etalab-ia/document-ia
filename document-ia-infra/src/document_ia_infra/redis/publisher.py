@@ -23,6 +23,9 @@ from document_ia_infra.redis.idempotent_publish import IDEMPOTENT_PUBLISH_SCRIPT
 
 logger = logging.getLogger(__name__)
 
+_EXECUTION_LOOKUP_PAGE_SIZE = 1000
+_EXECUTION_LOOKUP_MAX_PAGES = 100
+
 T = TypeVar("T", bound=SerializableMessage)
 
 
@@ -225,8 +228,10 @@ class Publisher(Generic[T]):
         lost after Redis committed, so presence on the stream is the evidence
         that the work was actually scheduled.
 
-        Returns None when the stream could not be read. That must not be
-        confused with absence: the outcome is still unresolved.
+        Paginates through the stream within the global publication timeout
+        budget and a page ceiling. Returns None when the stream could not be
+        read exhaustively (connection error, timeout, or truncated scan). That
+        must not be confused with absence: the outcome is still unresolved.
         """
         try:
             connection = await self.current_redis_manager.get_connection()
@@ -234,35 +239,73 @@ class Publisher(Generic[T]):
             return None
         if connection is None:
             return None
-        try:
-            # Bounded like the publication itself: a stalled Redis would
-            # otherwise hold the request, its pooled connection and the
-            # reservation renewal open on this read.
-            entries = await asyncio.wait_for(
-                cast(
-                    Awaitable[Any],
-                    connection.xrange(  # type: ignore[UnknownMemberType]
-                        self.stream_name, min="-", max="+", count=1000
-                    ),
-                ),
-                timeout=redis_settings.PUBLISH_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Unable to inspect stream %s to reconcile execution %s: %s; "
-                "outcome remains unresolved",
-                self.stream_name,
-                execution_id,
-                exc,
-            )
-            return None
-        for _entry_id, fields in entries:
-            raw = fields.get("data")
-            if not raw:
-                continue
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + redis_settings.PUBLISH_TIMEOUT_SECONDS
+        cursor = "-"
+        page_size = _EXECUTION_LOOKUP_PAGE_SIZE
+
+        for _ in range(_EXECUTION_LOOKUP_MAX_PAGES):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    "Timed out scanning stream %s to reconcile execution %s; "
+                    "outcome remains unresolved",
+                    self.stream_name,
+                    execution_id,
+                )
+                return None
+
             try:
-                if json.loads(raw).get("workflow_execution_id") == execution_id:
-                    return True
-            except ValueError, AttributeError:
-                continue
-        return False
+                # Bounded by the remaining publication budget: a stalled Redis
+                # would otherwise hold the request, its pooled connection and
+                # the reservation renewal open on this read.
+                entries = await asyncio.wait_for(
+                    cast(
+                        Awaitable[Any],
+                        connection.xrange(  # type: ignore[UnknownMemberType]
+                            self.stream_name, min=cursor, max="+", count=page_size
+                        ),
+                    ),
+                    timeout=remaining,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Unable to inspect stream %s to reconcile execution %s: %s; "
+                    "outcome remains unresolved",
+                    self.stream_name,
+                    execution_id,
+                    exc,
+                )
+                return None
+
+            if not entries:
+                return False
+
+            for _entry_id, fields in entries:
+                raw = fields.get("data") or fields.get(b"data")
+                if not raw:
+                    continue
+                try:
+                    if json.loads(raw).get("workflow_execution_id") == execution_id:
+                        return True
+                except ValueError, AttributeError:
+                    continue
+
+            if len(entries) < page_size:
+                return False
+
+            last_id = entries[-1][0]
+            last_id_str = (
+                last_id.decode("utf-8") if isinstance(last_id, bytes) else str(last_id)
+            )
+            cursor = f"({last_id_str}"
+
+        logger.warning(
+            "Exceeded max lookup pages (%d) scanning stream %s to reconcile "
+            "execution %s; outcome remains unresolved",
+            _EXECUTION_LOOKUP_MAX_PAGES,
+            self.stream_name,
+            execution_id,
+        )
+        return None

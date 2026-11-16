@@ -12,16 +12,28 @@ programmation récupérable du traitement.
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from document_ia_infra.redis.publisher import PublishFailedError
+from document_ia_api.core.idempotency.exceptions import (
+    IdempotencyReservationLostException,
+)
+from document_ia_api.infra.s3_service import s3_service
+from document_ia_infra.redis.model.workflow_execution_message import (
+    WorkflowExecutionMessage,
+)
+from document_ia_infra.redis.publisher import (
+    PublicationOutcomeUnknownError,
+    PublishFailedError,
+    ReservationLostError,
+)
 from document_ia_infra.redis.redis_settings import redis_settings
 from document_ia_infra.service.event_store_service import EventStoreService
-from document_ia_api.infra.s3_service import s3_service
 
 logger = logging.getLogger(__name__)
 
@@ -169,3 +181,116 @@ async def compensate_s3_upload(
             execution_id,
             type(e).__name__,
         )
+
+
+@dataclass
+class S3CompensationGuard:
+    """Tracks whether an uploaded S3 object may be safely deleted on abort.
+
+    Armed immediately after S3 upload so pre-publish failures or cancellations
+    still clean up orphaned objects. Disarmed before entering Redis publication
+    so an `asyncio.CancelledError` or unresolved publication outcome never
+    deletes a document whose message may already be queued in Redis.
+    """
+
+    execution_id: str
+    s3_key: str | None = None
+    should_compensate: bool = False
+
+    def arm(self, s3_key: str) -> None:
+        self.s3_key = s3_key
+        self.should_compensate = True
+
+    def disarm(self) -> None:
+        self.should_compensate = False
+
+    async def compensate_if_needed(self) -> None:
+        if self.should_compensate and self.s3_key is not None:
+            await compensate_s3_upload(self.s3_key, self.execution_id)
+
+
+async def schedule_workflow_execution(
+    db_session: AsyncSession,
+    *,
+    redis_producer: Any,
+    execution_id: str,
+    workflow_id: str,
+    organization_id: UUID,
+    workflow_version: int = 1,
+    before_publish: Callable[[Any, Any], Awaitable[str]] | None = None,
+    compensation_guard: S3CompensationGuard | None = None,
+) -> None:
+    """Publish a workflow execution message and reconcile failure states.
+
+    Re-arms `compensation_guard` only when non-publication is confirmed
+    (`ReservationLostError`, `IdempotencyReservationLostException`,
+    `PublishFailedError`, or an unexpected non-cancellation exception). When
+    interrupted by `asyncio.CancelledError` or `PublicationOutcomeUnknownError`,
+    the guard remains disarmed so an already-queued execution never loses its
+    S3 input file.
+    """
+    execution_message = WorkflowExecutionMessage(workflow_execution_id=execution_id)
+    if compensation_guard is not None:
+        compensation_guard.disarm()
+
+    try:
+        if before_publish is not None:
+            await before_publish(redis_producer, execution_message)
+        else:
+            await redis_producer.publish_message(execution_message)
+    except ReservationLostError, IdempotencyReservationLostException:
+        if compensation_guard is not None:
+            compensation_guard.should_compensate = True
+        await fail_abandoned_execution(
+            db_session,
+            execution_id=execution_id,
+            workflow_id=workflow_id,
+            organization_id=organization_id,
+            error_type=EXECUTION_RESERVATION_LOST_ERROR,
+            error_message=(
+                "The idempotency reservation was lost before this "
+                "execution was scheduled; nothing is pending. Retry the "
+                "request."
+            ),
+            workflow_version=workflow_version,
+        )
+        raise IdempotencyReservationLostException(execution_id=execution_id)
+    except PublicationOutcomeUnknownError as unknown_error:
+        # Only reached when the reply was lost AND the message is confirmed on
+        # the stream (or unresolved): the reservation reconciles the outcome
+        # before returning. Recording a failure here would invite a retry that
+        # publishes the same work twice.
+        logger.warning(
+            "Execution %s: publication reply lost (%s) but the message "
+            "is queued; accepted",
+            execution_id,
+            unknown_error.reason,
+        )
+    except PublishFailedError as publish_error:
+        if compensation_guard is not None:
+            compensation_guard.should_compensate = True
+        logger.error(
+            "Workflow execution %s: scheduling failed",
+            execution_id,
+            extra=scheduling_log_context(publish_error),
+        )
+        await fail_unscheduled_execution(
+            db_session,
+            execution_id=execution_id,
+            workflow_id=workflow_id,
+            organization_id=organization_id,
+            error=publish_error,
+            workflow_version=workflow_version,
+        )
+        raise scheduling_unavailable(execution_id) from publish_error
+    except asyncio.CancelledError:
+        logger.warning(
+            "Execution %s: scheduling cancelled during publication; "
+            "preserving S3 object because queue state is unconfirmed",
+            execution_id,
+        )
+        raise
+    except Exception:
+        if compensation_guard is not None:
+            compensation_guard.should_compensate = True
+        raise

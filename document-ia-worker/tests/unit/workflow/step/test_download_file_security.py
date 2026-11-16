@@ -960,3 +960,25 @@ def test_root_is_not_canonicalised_so_a_swap_cannot_redirect_it(tmp_path: Path):
 
     assert document.exists(), "cleanup followed a swapped root into a sibling"
     assert victim.exists()
+
+
+def test_open_confined_directory_raises_not_a_directory_on_regular_file(tmp_path: Path):
+    """A regular file must surface NotADirectoryError rather than PathTraversalException."""
+    from document_ia_infra.core.file.safe_path import (
+        open_confined_directory,
+        safe_cleanup_directory,
+    )
+
+    sandbox = tmp_path / "sandbox_regular_file"
+    sandbox.mkdir()
+    regular_file = sandbox / "not_a_dir.txt"
+    regular_file.write_text("content")
+
+    with pytest.raises(NotADirectoryError):
+        open_confined_directory(regular_file, sandbox)
+
+    with pytest.raises(NotADirectoryError):
+        open_confined_directory(regular_file, regular_file)
+
+    safe_cleanup_directory(regular_file, sandbox_root=sandbox)
+    assert not regular_file.exists()
