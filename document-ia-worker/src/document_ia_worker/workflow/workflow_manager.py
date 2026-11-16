@@ -1,5 +1,5 @@
-from document_ia_infra.s3.s3_manager import S3Manager
 import asyncio
+import contextlib
 import ctypes
 import gc
 import logging
@@ -37,6 +37,7 @@ from document_ia_infra.redis.progress_tracker import (
 from document_ia_infra.redis.publisher import PublishFailedError, Publisher
 from document_ia_infra.redis.redis_manager import RedisManager
 from document_ia_infra.redis.redis_settings import redis_settings
+from document_ia_infra.s3.s3_manager import S3Manager
 from document_ia_infra.service.event_store_service import EventStoreService
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -129,18 +130,13 @@ class WorkflowManager:
 
     def _reset_logging_context_vars(self) -> None:
         """Reset ContextVars to avoid leaking into subsequent tasks on the same thread."""
-        try:
+        # RuntimeError is raised if handle_finish_execution already reset the token.
+        with contextlib.suppress(ValueError, LookupError, RuntimeError):
             agg_buffer_var.reset(self._agg_token_buf)
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(ValueError, LookupError, RuntimeError):
             execution_id_var.reset(self._agg_token_exec)
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(ValueError, LookupError, RuntimeError):
             start_time_var.reset(self._agg_token_started_at)
-        except Exception:
-            pass
 
     async def _purge_s3_file_for_execution(
         self,
@@ -256,14 +252,32 @@ class WorkflowManager:
                     ):
                         need_to_notify_webhook = False
 
-                    try:
-                        await self._save_failure_event(session, e)
-                    except Exception as save_err:
+                    if self.event_dto is not None:
+                        try:
+                            await self._save_failure_event(session, e)
+                        except Exception as save_err:
+                            await session.rollback()
+                            tracker = get_current_progress_tracker()
+                            if tracker is not None and tracker.is_aborted:
+                                logger.warning(
+                                    "Workflow execution %s was aborted by watchdog during failure save; skipping S3 purge",
+                                    self.message.workflow_execution_id,
+                                )
+                                return
+                            logger.warning(
+                                "Could not save failure event for execution %s: %s",
+                                self.message.workflow_execution_id,
+                                type(save_err).__name__,
+                            )
+
+                    tracker = get_current_progress_tracker()
+                    if tracker is not None and tracker.is_aborted:
                         logger.warning(
-                            "Could not save failure event for execution %s: %s",
+                            "Workflow execution %s was aborted by watchdog; skipping S3 purge",
                             self.message.workflow_execution_id,
-                            type(save_err).__name__,
                         )
+                        return
+
                     if (
                         not WorkflowStepException.is_retryable_exception(e)
                         or self.is_last_retry
@@ -334,12 +348,17 @@ class WorkflowManager:
             try:
                 await local_database_manager.dispose_async()
             except Exception as e:
-                logger.error(f"Error while disposing local database manager: {e}")
+                logger.error(
+                    "Error while disposing local database manager: %s", type(e).__name__
+                )
             finally:
                 try:
                     await self._webhook_redis_manager.close()
                 except Exception as e:
-                    logger.error(f"Error while closing workflow Redis manager: {e}")
+                    logger.error(
+                        "Error while closing workflow Redis manager: %s",
+                        type(e).__name__,
+                    )
                 finally:
                     self.main_workflow_context = None
                     _release_worker_memory()
@@ -565,17 +584,30 @@ class WorkflowManager:
                 is_last_cleanup = False
             logger.info(f"Cleaning up workflow {self.message.workflow_execution_id}")
             # We clean up the data in the reverse order because the first step need to be the last
+            cleanup_all_succeeded = True
             for step in reversed(self.step_list):
                 try:
                     await step.cleanup(is_last_cleanup)
                 except Exception as cleanup_err:
+                    cleanup_all_succeeded = False
                     logger.warning(
                         "Error during step cleanup (%s) for execution %s: %s",
                         step.__class__.__name__,
                         self.message.workflow_execution_id,
                         type(cleanup_err).__name__,
                     )
-            if is_last_cleanup:
+            s3_step_failed_cleanup = any(
+                hasattr(step, "s3_cleanup_succeeded")
+                and getattr(step, "file_info", None) is not None
+                and not getattr(step, "s3_cleanup_succeeded")
+                for step in self.step_list
+            )
+            if (
+                is_last_cleanup
+                and cleanup_all_succeeded
+                and len(self.step_list) > 0
+                and not s3_step_failed_cleanup
+            ):
                 self._s3_cleaned_up = True
 
             self.workflow_context.clear()
@@ -708,12 +740,16 @@ class WorkflowManager:
                 await local_database_manager.dispose_async()
             except Exception as e:
                 logger.error(
-                    f"Error while disposing terminal-failure database manager: {e}"
+                    "Error while disposing terminal-failure database manager: %s",
+                    type(e).__name__,
                 )
             try:
                 await self._webhook_redis_manager.close()
             except Exception as e:
-                logger.error(f"Error while closing terminal-failure Redis manager: {e}")
+                logger.error(
+                    "Error while closing terminal-failure Redis manager: %s",
+                    type(e).__name__,
+                )
 
     @staticmethod
     def _is_terminal_event(event: EventDTO) -> bool:

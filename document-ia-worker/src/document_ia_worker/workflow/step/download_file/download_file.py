@@ -67,6 +67,7 @@ class DownloadFileStep(BaseFileManipulationStep[DownloadFileResult]):
         self.file_info = file_info
         self.file_url = file_url
         self._transport = transport
+        self.s3_cleanup_succeeded: bool = False
 
     def get_context_result_key(self) -> str:
         return DownloadFileResult.__name__
@@ -292,7 +293,25 @@ class DownloadFileStep(BaseFileManipulationStep[DownloadFileResult]):
             )
         except S3AuthentificationException as e:
             logger.error("S3 authentication failed during file download.")
-            raise RetryableException(e)
+            raise RetryableException(e) from None
+        except FileNotFoundError as e:
+            logger.error(
+                "S3 file not found or expired for execution %s",
+                self.execution_id,
+            )
+            raise DownloadFileStepException(
+                "S3 file not found or expired",
+                http_status_code=404,
+            ) from e
+        except Exception as e:
+            logger.error(
+                "Unexpected S3 download failure (%s) for execution %s",
+                type(e).__name__,
+                self.execution_id,
+            )
+            raise RetryableException(
+                RuntimeError(f"S3 file download failed ({type(e).__name__})")
+            ) from None
 
     async def cleanup(self, is_last_cleanup: bool = False) -> None:
         await super().cleanup(is_last_cleanup)
@@ -303,6 +322,7 @@ class DownloadFileStep(BaseFileManipulationStep[DownloadFileResult]):
                 s3_manager.delete_file,
                 self.file_info.s3_key.get_secret_value(),
             )
+            self.s3_cleanup_succeeded = deleted
             if deleted:
                 logger.info(
                     "S3 file deleted successfully for execution %s",

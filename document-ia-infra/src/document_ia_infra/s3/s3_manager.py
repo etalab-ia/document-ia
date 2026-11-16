@@ -1,8 +1,8 @@
 import logging
-import os
 from typing import Optional, Dict, Any, cast
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from mypy_boto3_s3.client import S3Client
 from mypy_boto3_s3.type_defs import ListBucketsOutputTypeDef, BucketTypeDef
@@ -19,8 +19,10 @@ logger = logging.getLogger(__name__)
 class S3Manager:
     def __init__(self):
         # Disable checksum because outscale do not support them
-        os.environ["AWS_REQUEST_CHECKSUM_CALCULATION"] = "WHEN_REQUIRED"
-        os.environ["AWS_RESPONSE_CHECKSUM_VALIDATION"] = "WHEN_REQUIRED"
+        config = Config(
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        )
         self.s3_client: S3Client = cast(
             S3Client,
             boto3.client(  # pyright: ignore [reportUnknownMemberType]
@@ -30,6 +32,7 @@ class S3Manager:
                 aws_secret_access_key=s3_settings.S3_SECRET_ACCESS_KEY.get_secret_value(),
                 region_name=s3_settings.S3_REGION_NAME,
                 use_ssl=s3_settings.S3_USE_SSL,
+                config=config,
             ),
         )
         self.bucket_name = s3_settings.S3_BUCKET_NAME
@@ -70,9 +73,13 @@ class S3Manager:
             logger.info("File deleted successfully from S3")
             return True
         except ClientError as e:
+            error_code = self.client_error_code(e)
+            if error_code in ("404", "NoSuchKey"):
+                logger.info("S3 file already absent (404/NoSuchKey)")
+                return True
             logger.error(
                 "Failed to delete file from S3: %s",
-                self._client_error_code(e) or type(e).__name__,
+                error_code or type(e).__name__,
             )
             return False
         except Exception as e:
@@ -92,8 +99,6 @@ class S3Manager:
         code = error_info_map.get("Code")
         return code if isinstance(code, str) else None
 
-    _client_error_code = client_error_code
-
     def download_file(self, s3_key: str, output_path: str):
         try:
             self.s3_client.download_file(
@@ -101,17 +106,22 @@ class S3Manager:
             )
             logger.info("File downloaded successfully from S3")
         except ClientError as e:
+            error_code = self.client_error_code(e)
             logger.error(
                 "Failed to download file from S3: %s",
-                self.client_error_code(e) or type(e).__name__,
+                error_code or type(e).__name__,
             )
-            raise S3AuthentificationException() from e
+            if error_code in ("404", "NoSuchKey"):
+                raise FileNotFoundError("S3 object not found or expired") from None
+            raise S3AuthentificationException() from None
         except Exception as e:
             logger.error(
                 "Unexpected error during file download: %s",
                 type(e).__name__,
             )
-            raise e
+            raise RuntimeError(
+                f"Unexpected error during S3 file download ({type(e).__name__})"
+            ) from None
 
     def get_file_info(self, s3_key: str) -> Optional[Dict[str, Any]]:
         try:
@@ -126,11 +136,12 @@ class S3Manager:
             }
 
         except ClientError as e:
-            if self._client_error_code(e) == "404":
+            error_code = self.client_error_code(e)
+            if error_code in ("404", "NoSuchKey"):
                 return None
             logger.error(
                 "Failed to get file info from S3: %s",
-                self._client_error_code(e) or type(e).__name__,
+                error_code or type(e).__name__,
             )
             return None
         except Exception as e:
@@ -151,7 +162,7 @@ class S3Manager:
             self.s3_client.head_bucket(Bucket=self.bucket_name)
             return True
         except ClientError as e:
-            error_code = self._client_error_code(e)
+            error_code = self.client_error_code(e)
             if error_code == "404":
                 logger.warning(f"S3 bucket '{self.bucket_name}' does not exist")
                 return False
@@ -175,11 +186,12 @@ class S3Manager:
                     list_bucket_names.append(bucket["Name"])
             return list_bucket_names
         except ClientError as e:
-            if self._client_error_code(e) == "404":
+            error_code = self.client_error_code(e)
+            if error_code == "404":
                 return list()
             logger.error(
                 "Failed to list buckets: %s",
-                self._client_error_code(e) or type(e).__name__,
+                error_code or type(e).__name__,
             )
             return list()
         except Exception as e:

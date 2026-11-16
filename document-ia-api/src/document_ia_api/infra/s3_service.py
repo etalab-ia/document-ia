@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import uuid
 from datetime import datetime
@@ -42,15 +43,15 @@ class S3Service:
             # Generate unique key for the file
             file_id = str(uuid.uuid4())
 
-            if filename is None:
-                final_filename = f"{file_id}.{content_type}"
-            else:
-                final_filename = filename
-
+            final_filename = filename or f"{file_id}.bin"
+            raw_ext = final_filename.rsplit(".", 1)[-1] if "." in final_filename else ""
             file_extension = (
-                final_filename.split(".")[-1] if "." in final_filename else ""
+                raw_ext if raw_ext and len(raw_ext) <= 10 and raw_ext.isalnum() else ""
             )
-            s3_key = f"uploads/{datetime.now().strftime('%Y/%m/%d')}/{file_id}.{file_extension}"
+            safe_ext = f".{file_extension}" if file_extension else ""
+            s3_key = (
+                f"uploads/{datetime.now().strftime('%Y/%m/%d')}/{file_id}{safe_ext}"
+            )
 
             # Prepare S3 metadata
             s3_metadata = {
@@ -65,18 +66,28 @@ class S3Service:
                 for key, value in metadata.items():
                     s3_metadata[f"custom-{key}"] = str(value)
 
-            # Upload file to S3 in worker thread
-            await asyncio.to_thread(
-                self.s3_manager.upload_file,
-                s3_key,
-                file_data,
-                content_type,
-                s3_metadata,
+            # Upload file to S3 in worker thread; shield so cancellation waits for
+            # the in-flight put_object thread and deletes the uploaded key if it finished.
+            upload_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.s3_manager.upload_file,
+                    s3_key,
+                    file_data,
+                    content_type,
+                    s3_metadata,
+                )
             )
             try:
-                presigned_url = self.s3_manager.get_presigned_url(s3_key)
-            except Exception:
-                await self.delete_file(s3_key)
+                await asyncio.shield(upload_task)
+                presigned_url = await asyncio.to_thread(
+                    self.s3_manager.get_presigned_url, s3_key
+                )
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    if not upload_task.done():
+                        await asyncio.shield(upload_task)
+                    if not upload_task.cancelled() and upload_task.exception() is None:
+                        await asyncio.shield(self.delete_file(s3_key))
                 raise
 
             result = {
@@ -108,7 +119,7 @@ class S3Service:
         return await asyncio.to_thread(self.s3_manager.delete_file, s3_key)
 
     async def get_file_info(self, s3_key: str) -> Optional[Dict[str, Any]]:
-        return self.s3_manager.get_file_info(s3_key)
+        return await asyncio.to_thread(self.s3_manager.get_file_info, s3_key)
 
     async def check_connectivity(self) -> S3ConnectivityStatus:
         """
@@ -130,38 +141,37 @@ class S3Service:
         try:
             # Test 1: Basic connection and credentials
             logger.info("Testing S3 connectivity...")
-            self.s3_manager.check_connectivity()
+            await asyncio.to_thread(self.s3_manager.check_connectivity)
             connectivity_status.connected = True
             connectivity_status.credentials_valid = True
             logger.info("S3 connection and credentials validated successfully")
 
         except NoCredentialsError as e:
-            error_msg = f"S3 credentials not configured properly: {e}"
+            error_msg = f"S3 credentials not configured properly ({type(e).__name__})"
             connectivity_status.errors.append(error_msg)
             logger.error(error_msg)
             return connectivity_status
 
         except ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code", {})
+            error_code = self.s3_manager.client_error_code(e) or type(e).__name__
             if error_code in ["InvalidAccessKeyId", "SignatureDoesNotMatch"]:
-                error_msg = f"S3 credentials invalid: {e}"
-                connectivity_status.errors.append(error_msg)
-                logger.error(error_msg)
-                return connectivity_status
+                error_msg = f"S3 credentials invalid ({error_code})"
             else:
-                error_msg = f"S3 connection failed: {e}"
-                connectivity_status.errors.append(error_msg)
-                logger.error(error_msg)
-                return connectivity_status
+                error_msg = f"S3 connection failed ({error_code})"
+            connectivity_status.errors.append(error_msg)
+            logger.error(error_msg)
+            return connectivity_status
 
         except Exception as e:
-            error_msg = f"Unexpected error during S3 connectivity check: {e}"
+            error_msg = (
+                f"Unexpected error during S3 connectivity check ({type(e).__name__})"
+            )
             connectivity_status.errors.append(error_msg)
             logger.error(error_msg)
             return connectivity_status
 
         # Test 2: Check if bucket exists
-        bucket_exists = self.s3_manager.check_bucket_exists()
+        bucket_exists = await asyncio.to_thread(self.s3_manager.check_bucket_exists)
         connectivity_status.bucket_exists = bucket_exists
 
         if bucket_exists:

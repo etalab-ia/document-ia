@@ -553,3 +553,103 @@ class TestWorkflowExecutionSchedulingFailure:
         _assert_scheduling_unavailable(response)
         close_execution.assert_awaited_once()
         mock_s3_delete.assert_awaited_once_with(raw_s3_key)
+
+    def test_v1_execute_compensates_s3_on_failure_between_upload_and_emit(
+        self, client_with_api_key_standard, standard_api_key_value
+    ):
+        raw_s3_key = "uploads/2026/11/11/sensitive_between_upload_and_emit.pdf"
+        with (
+            patch(
+                "document_ia_api.application.services.workflow_service.workflow_repository.get_workflow_by_id",
+                new=AsyncMock(return_value={"id": "document-classification-v1"}),
+            ),
+            patch(
+                "document_ia_api.application.services.workflow_service.s3_service.upload_file",
+                new=AsyncMock(
+                    return_value={
+                        "s3_key": raw_s3_key,
+                        "presigned_url": "https://s3.example.com/p",
+                    }
+                ),
+            ),
+            patch(
+                "document_ia_api.infra.s3_service.s3_service.delete_file",
+                new=AsyncMock(return_value=True),
+            ) as mock_s3_delete,
+            patch(
+                "document_ia_api.application.services.workflow_service.FileInfo",
+                side_effect=ValueError("Invalid FileInfo"),
+            ),
+            patch(
+                "document_ia_api.application.services.workflow_service.EventStoreService.emit_workflow_started",
+                new=AsyncMock(),
+            ) as mock_emit,
+        ):
+            response = client_with_api_key_standard.post(
+                "/api/v1/workflows/document-classification-v1/execute",
+                files={"file": ("test.pdf", _pdf_file(), "application/pdf")},
+                data={"metadata": json.dumps({"source": "test"})},
+                headers={"X-API-KEY": standard_api_key_value},
+            )
+
+        assert response.status_code == 500
+        mock_emit.assert_not_awaited()
+        mock_s3_delete.assert_awaited_once_with(raw_s3_key)
+
+    @pytest.mark.asyncio
+    async def test_s3_service_upload_compensates_on_cancellation(self):
+        import asyncio
+        import threading
+        from unittest.mock import MagicMock
+
+        from document_ia_api.infra.s3_service import S3Service
+
+        upload_started = threading.Event()
+        allow_upload_finish = threading.Event()
+        uploaded_keys: list[str] = []
+        deleted_keys: list[str] = []
+
+        def blocking_upload(
+            file_key: str,
+            _file_data: bytes,
+            _content_type: str,
+            _metadata: dict[str, str] | None = None,
+        ) -> None:
+            uploaded_keys.append(file_key)
+            upload_started.set()
+            assert allow_upload_finish.wait(timeout=5.0)
+
+        def fake_delete(s3_key: str) -> bool:
+            deleted_keys.append(s3_key)
+            return True
+
+        with patch("document_ia_infra.s3.s3_manager.boto3.client") as mock_boto:
+            mock_boto.return_value = MagicMock()
+            service = S3Service()
+
+        with (
+            patch.object(
+                service.s3_manager, "upload_file", side_effect=blocking_upload
+            ),
+            patch.object(service.s3_manager, "delete_file", side_effect=fake_delete),
+        ):
+            task = asyncio.create_task(
+                service.upload_file(
+                    file_data=_pdf_file(),
+                    filename="document.pdf",
+                    content_type="application/pdf",
+                )
+            )
+
+            while not upload_started.is_set():
+                await asyncio.sleep(0.005)
+
+            task.cancel()
+            await asyncio.sleep(0.01)
+            allow_upload_finish.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert len(uploaded_keys) == 1
+        assert deleted_keys == uploaded_keys

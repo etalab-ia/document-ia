@@ -90,115 +90,111 @@ class WorkflowV2Service:
 
         file_info: FileInfo | None = None
         s3_key_to_compensate: str | None = None
-        if file is not None:
-            detected_mime_type = validate_uploaded_file(file)
-            file_content = await self._read_file_content(file)
-            s3_upload_result = await self._upload_file_to_s3(
-                file_content=file_content,
-                filename=file.filename,
-                content_type=detected_mime_type,
-                metadata=metadata,
-            )
-            s3_key_to_compensate = s3_upload_result["s3_key"]
+        published = False
 
-            file_info = FileInfo(
-                filename=file.filename or "unknown",
-                s3_key=s3_upload_result["s3_key"],
-                size=len(file_content),
-                content_type=detected_mime_type,
-                uploaded_at=datetime.now().isoformat(),
-                presigned_url=s3_upload_result["presigned_url"],
-            )
-
-        event_store_service = EventStoreService(self.db_session)
         try:
-            await event_store_service.emit_workflow_started(
-                workflow_id=workflow_id,
-                execution_id=execution_id,
-                organization_id=organization_id,
-                file_info=file_info,
-                file_url=file_url,
-                metadata=metadata,
-                workflow_configuration=resolved_workflow,
-                workflow_version=2,
-            )
-        except Exception as emit_error:
-            logger.error(
-                "Workflow v2 execution %s: started event could not be persisted",
-                execution_id,
-            )
-            await compensate_s3_upload(s3_key_to_compensate, execution_id)
-            s3_key_to_compensate = None
-            raise scheduling_unavailable(execution_id) from emit_error
-        except BaseException:
-            await compensate_s3_upload(s3_key_to_compensate, execution_id)
-            raise
+            if file is not None:
+                detected_mime_type = validate_uploaded_file(file)
+                file_content = await self._read_file_content(file)
+                s3_upload_result = await self._upload_file_to_s3(
+                    file_content=file_content,
+                    filename=file.filename,
+                    content_type=detected_mime_type,
+                    metadata=metadata,
+                )
+                s3_key_to_compensate = s3_upload_result["s3_key"]
 
-        # Publication is fenced by reservation ownership in one Redis operation:
-        # a stale request must not publish a second execution. The started event
-        # is already committed by this point, so a lost reservation closes the
-        # execution explicitly rather than leaving a `STARTED` that never
-        # progresses.
-        try:
-            execution_message = WorkflowExecutionMessage(
-                workflow_execution_id=execution_id
-            )
-            if before_publish is not None:
-                await before_publish(self.redis_producer, execution_message)
-            else:
-                await self.redis_producer.publish_message(execution_message)
-        except ReservationLostError, IdempotencyReservationLostException:
-            await compensate_s3_upload(s3_key_to_compensate, execution_id)
-            s3_key_to_compensate = None
-            await fail_abandoned_execution(
-                self.db_session,
-                execution_id=execution_id,
-                workflow_id=workflow_id,
-                organization_id=organization_id,
-                error_type=EXECUTION_RESERVATION_LOST_ERROR,
-                error_message=(
-                    "The idempotency reservation was lost before this execution "
-                    "was scheduled; nothing is pending. Retry the request."
-                ),
-                workflow_version=2,
-            )
-            raise IdempotencyReservationLostException(execution_id=execution_id)
-        except PublicationOutcomeUnknownError as unknown_error:
-            # Only reached when the reply was lost AND the message is confirmed on
-            # the stream: `IdempotencyReservation.publish` reconciles the outcome
-            # before re-raising. Recording a failure here would invite a retry
-            # that publishes the same work twice.
-            logger.warning(
-                "Execution %s: publication reply lost (%s) but the message is "
-                "queued; accepted",
-                execution_id,
-                unknown_error.reason,
-            )
-        except PublishFailedError as publish_error:
-            # Le fichier et l'événement de démarrage existent déjà : l'exécution
-            # est clôturée explicitement plutôt qu'annoncée en `processing`
-            # sans traitement programmé (issue #120).
-            await compensate_s3_upload(s3_key_to_compensate, execution_id)
-            s3_key_to_compensate = None
-            logger.error(
-                "Workflow v2 execution %s: scheduling failed",
-                execution_id,
-                extra=scheduling_log_context(publish_error),
-            )
-            await fail_unscheduled_execution(
-                self.db_session,
-                execution_id=execution_id,
-                workflow_id=workflow_id,
-                organization_id=organization_id,
-                error=publish_error,
-                # Conserver la version du démarrage : sans elle, la consultation
-                # de l'exécution chercherait le workflow dans le dépôt v1.
-                workflow_version=2,
-            )
-            raise scheduling_unavailable(execution_id) from publish_error
-        except BaseException:
-            await compensate_s3_upload(s3_key_to_compensate, execution_id)
-            raise
+                file_info = FileInfo(
+                    filename=file.filename or "unknown",
+                    s3_key=s3_upload_result["s3_key"],
+                    size=len(file_content),
+                    content_type=detected_mime_type,
+                    uploaded_at=datetime.now().isoformat(),
+                    presigned_url=s3_upload_result["presigned_url"],
+                )
+
+            event_store_service = EventStoreService(self.db_session)
+            try:
+                await event_store_service.emit_workflow_started(
+                    workflow_id=workflow_id,
+                    execution_id=execution_id,
+                    organization_id=organization_id,
+                    file_info=file_info,
+                    file_url=file_url,
+                    metadata=metadata,
+                    workflow_configuration=resolved_workflow,
+                    workflow_version=2,
+                )
+            except Exception as emit_error:
+                logger.error(
+                    "Workflow v2 execution %s: started event could not be persisted",
+                    execution_id,
+                )
+                raise scheduling_unavailable(execution_id) from emit_error
+
+            # Publication is fenced by reservation ownership in one Redis operation:
+            # a stale request must not publish a second execution. The started event
+            # is already committed by this point, so a lost reservation closes the
+            # execution explicitly rather than leaving a `STARTED` that never
+            # progresses.
+            try:
+                execution_message = WorkflowExecutionMessage(
+                    workflow_execution_id=execution_id
+                )
+                if before_publish is not None:
+                    await before_publish(self.redis_producer, execution_message)
+                else:
+                    await self.redis_producer.publish_message(execution_message)
+            except ReservationLostError, IdempotencyReservationLostException:
+                await fail_abandoned_execution(
+                    self.db_session,
+                    execution_id=execution_id,
+                    workflow_id=workflow_id,
+                    organization_id=organization_id,
+                    error_type=EXECUTION_RESERVATION_LOST_ERROR,
+                    error_message=(
+                        "The idempotency reservation was lost before this execution "
+                        "was scheduled; nothing is pending. Retry the request."
+                    ),
+                    workflow_version=2,
+                )
+                raise IdempotencyReservationLostException(execution_id=execution_id)
+            except PublicationOutcomeUnknownError as unknown_error:
+                # Only reached when the reply was lost AND the message is confirmed on
+                # the stream: `IdempotencyReservation.publish` reconciles the outcome
+                # before re-raising. Recording a failure here would invite a retry
+                # that publishes the same work twice.
+                logger.warning(
+                    "Execution %s: publication reply lost (%s) but the message is "
+                    "queued; accepted",
+                    execution_id,
+                    unknown_error.reason,
+                )
+            except PublishFailedError as publish_error:
+                # Le fichier et l'événement de démarrage existent déjà : l'exécution
+                # est clôturée explicitement plutôt qu'annoncée en `processing`
+                # sans traitement programmé (issue #120).
+                logger.error(
+                    "Workflow v2 execution %s: scheduling failed",
+                    execution_id,
+                    extra=scheduling_log_context(publish_error),
+                )
+                await fail_unscheduled_execution(
+                    self.db_session,
+                    execution_id=execution_id,
+                    workflow_id=workflow_id,
+                    organization_id=organization_id,
+                    error=publish_error,
+                    # Conserver la version du démarrage : sans elle, la consultation
+                    # de l'exécution chercherait le workflow dans le dépôt v1.
+                    workflow_version=2,
+                )
+                raise scheduling_unavailable(execution_id) from publish_error
+
+            published = True
+        finally:
+            if not published and s3_key_to_compensate is not None:
+                await compensate_s3_upload(s3_key_to_compensate, execution_id)
 
         return WorkflowExecutionDataV2(
             execution_id=execution_id,
@@ -476,7 +472,7 @@ class WorkflowV2Service:
         try:
             return await file.read()
         except Exception as exc:
-            logger.error("Error reading file content: %s", exc)
+            logger.error("Error reading file content: %s", type(exc).__name__)
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -508,7 +504,7 @@ class WorkflowV2Service:
                 metadata=s3_metadata,
             )
         except Exception as exc:
-            logger.error("S3 upload failed: %s", exc)
+            logger.error("S3 upload failed: %s", type(exc).__name__)
             raise HTTPException(
                 status_code=500,
                 detail={

@@ -686,12 +686,14 @@ async def execute_workflow_v2(
                 )
             except Exception as release_exc:
                 logger.warning(
-                    "Failed to release idempotency key %s: %s", redis_key, release_exc
+                    "Failed to release idempotency key %s: %s",
+                    redis_key,
+                    type(release_exc).__name__,
                 )
         await db_session.rollback()
         if isinstance(exc, (HTTPException, RequestValidationError)):
             raise
-        logger.error("Failed to start workflow v2 execution: %s", exc)
+        logger.error("Failed to start workflow v2 execution: %s", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unexpected error while starting workflow execution",

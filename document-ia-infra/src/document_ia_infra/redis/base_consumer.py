@@ -1621,14 +1621,15 @@ class BaseConsumer(ABC, Generic[T]):
                 "Malformed retries field for reclaimed message %s. Moving to DLQ.",
                 msg_id,
             )
-            await self._retain_in_dlq_and_ack(
+            if await self._retain_in_dlq_and_ack(
                 redis_connection=redis_connection,
                 msg_id=msg_id,
                 fields=fields,
                 reason="decode_error",
                 error="Malformed retries field",
                 skip_retention_check=True,
-            )
+            ):
+                self._notify_terminal_failure(msg_id, fields, "decode_error")
             return
 
         attempts = retry_count + 1

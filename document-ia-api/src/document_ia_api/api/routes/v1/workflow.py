@@ -519,7 +519,9 @@ async def execute_workflow(
                 )
             except Exception as release_exc:
                 logger.warning(
-                    "Failed to release idempotency key %s: %s", redis_key, release_exc
+                    "Failed to release idempotency key %s: %s",
+                    redis_key,
+                    type(release_exc).__name__,
                 )
         # Rollback the database session on any error
         await db_session.rollback()

@@ -148,3 +148,39 @@ async def test_handle_s3_file_does_not_log_raw_s3_key(
     assert f"Downloading file from S3 for execution: {step.execution_id}" in caplog.text
     # Security requirement: raw s3_key must NEVER leak into logs
     assert raw_s3_key not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_handle_s3_file_missing_object_raises_non_retryable_without_s3_key(
+    mock_context: MainWorkflowContext,
+    sample_file_info: FileInfo,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from document_ia_infra.exception.retryable_exception import RetryableException
+    from document_ia_worker.workflow.step.download_file.download_file import (
+        DownloadFileStepException,
+    )
+
+    raw_s3_key = sample_file_info.s3_key.get_secret_value()
+    step = DownloadFileStep(
+        main_workflow_context=mock_context,
+        file_info=sample_file_info,
+    )
+
+    with patch(
+        "document_ia_worker.workflow.step.download_file.download_file.S3Manager"
+    ) as mock_s3_class:
+        mock_s3_manager = MagicMock()
+        mock_s3_manager.download_file.side_effect = FileNotFoundError(
+            "S3 object not found or expired"
+        )
+        mock_s3_class.return_value = mock_s3_manager
+
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(DownloadFileStepException) as exc_info:
+                await step._handle_s3_file(sample_file_info)
+
+    assert not isinstance(exc_info.value, RetryableException)
+    assert exc_info.value.http_status_code == 404
+    assert raw_s3_key not in str(exc_info.value)
+    assert raw_s3_key not in caplog.text
