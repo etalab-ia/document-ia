@@ -122,6 +122,8 @@ class ApiKeyService:
                 return api_key_dto
             else:
                 return None
+        except ValueError:
+            return None
         except Exception as e:
             logger.error("Error verifying API key: %s", type(e).__name__)
             return None

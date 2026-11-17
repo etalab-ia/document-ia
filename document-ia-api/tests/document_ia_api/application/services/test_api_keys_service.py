@@ -1,7 +1,8 @@
 import logging
 import uuid
-from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock
+from datetime import datetime, timezone
+from typing import cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -10,6 +11,8 @@ from document_ia_api.application.services.api_key.api_key_service import ApiKeyS
 from document_ia_api.core.config import api_key_settings
 from document_ia_infra.data.api_key.dto.api_key_dto import ApiKeyDTO
 from document_ia_infra.data.api_key.enum.api_key_status import ApiKeyStatus
+from document_ia_infra.data.organization.dto.organization_dto import OrganizationDTO
+from document_ia_infra.data.organization.enum.platform_role import PlatformRole
 
 _REAL_GET_FROM_PRESENTED_KEY = ApiKeyService.get_from_presented_key
 
@@ -300,3 +303,194 @@ async def test_legacy_v1_logs_warning_without_secret(
 
     assert result_v2 == v2_record
     assert not [rec for rec in caplog.records if rec.levelno == logging.WARNING]
+
+
+def test_reject_trailing_newline_and_non_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    api_key_helper = ApiKeyHelper()
+
+    v2_key, v2_prefix, _, v2_hash = api_key_helper.generate_new_api_key()
+    v2_record = _make_record(prefix=v2_prefix, key_hash=v2_hash)
+    v1_record = _make_record(prefix="WMBUIIAK", key_hash=LEGACY_V1_HASH)
+
+    for key_with_nl in (v2_key + "\n", LEGACY_V1_KEY + "\n", cast(str, None)):
+        with pytest.raises(ValueError):
+            api_key_helper.get_key_prefix(key_with_nl)
+        assert api_key_helper.verify_api_key(key_with_nl, v2_record) is False
+        assert api_key_helper.verify_api_key(key_with_nl, v1_record) is False
+
+
+def test_generate_new_api_key_rejects_invalid_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_key_helper = ApiKeyHelper()
+
+    for bad_env in ("local", "", "development"):
+        monkeypatch.setattr(api_key_settings, "APP_ENV", bad_env)
+        monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+        with pytest.raises(ValueError, match="Unsupported APP_ENV"):
+            api_key_helper.generate_new_api_key()
+
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    for bad_version in (0, 3):
+        monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", bad_version)
+        with pytest.raises(ValueError, match="Unsupported API_KEY_VERSION"):
+            api_key_helper.generate_new_api_key()
+
+
+def test_v2_rejects_checksum_and_body_tampering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    api_key_helper = ApiKeyHelper()
+
+    v2_key, prefix, chk, v2_hash = api_key_helper.generate_new_api_key()
+    v2_record = _make_record(prefix=prefix, key_hash=v2_hash)
+    _, env, version_str, _, body, _ = v2_key.split("_", 5)
+
+    # Tamper checksum
+    bad_chk = chk[:-1] + ("A" if chk[-1] != "A" else "B")
+    tampered_chk_key = f"dia_{env}_{version_str}_{prefix}_{body}_{bad_chk}"
+    assert api_key_helper.verify_api_key(tampered_chk_key, v2_record) is False
+    with pytest.raises(ValueError, match="Invalid API key checksum"):
+        api_key_helper.get_key_encoding(tampered_chk_key)
+
+    # Tamper body (after prefix)
+    bad_body = body[:-1] + ("A" if body[-1] != "A" else "B")
+    tampered_body_key = f"dia_{env}_{version_str}_{prefix}_{bad_body}_{chk}"
+    assert api_key_helper.verify_api_key(tampered_body_key, v2_record) is False
+    with pytest.raises(ValueError, match="Invalid API key checksum"):
+        api_key_helper.get_key_encoding(tampered_body_key)
+
+
+async def test_service_rejects_invalid_keys_before_db_and_without_error_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    monkeypatch.setattr(
+        ApiKeyService, "get_from_presented_key", _REAL_GET_FROM_PRESENTED_KEY
+    )
+
+    service = ApiKeyService(db_session=MagicMock())
+    get_by_prefix_mock = AsyncMock()
+    service.api_key_repository.get_by_prefix_with_relation = get_by_prefix_mock
+
+    v2_key, _, _, _ = service.api_key_helper.generate_new_api_key()
+    invalid_keys = [
+        v2_key.replace("dia_dev_2_", "dia_prod_2_", 1),
+        v2_key.replace("dia_dev_2_", "dia_dev_v2_", 1),
+        v2_key.replace("dia_dev_2_", "dia_dev_99_", 1),
+        v2_key + "\n",
+    ]
+
+    with caplog.at_level(logging.ERROR):
+        for bad_key in invalid_keys:
+            assert await service.get_from_presented_key(bad_key) is None
+
+        monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", False)
+        assert await service.get_from_presented_key(LEGACY_V1_KEY) is None
+
+    get_by_prefix_mock.assert_not_called()
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
+
+
+def test_http_auth_and_rate_limit_integration(
+    monkeypatch: pytest.MonkeyPatch,
+    client_with_api_key_standard,
+    mock_redis_service,
+) -> None:
+    from document_ia_api.api import auth as auth_mod
+    from document_ia_infra.data.database import database_manager
+
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    monkeypatch.setattr(
+        auth_mod.ApiKeyService,
+        "get_from_presented_key",
+        _REAL_GET_FROM_PRESENTED_KEY,
+    )
+
+    async def _fake_async_get_db():
+        yield MagicMock()
+
+    client_with_api_key_standard.app.dependency_overrides[
+        database_manager.async_get_db
+    ] = _fake_async_get_db
+
+    now = datetime.now(timezone.utc)
+    org = OrganizationDTO(
+        id=uuid.uuid4(),
+        contact_email="test@example.org",
+        name="Test Org",
+        platform_role=PlatformRole.STANDARD,
+        created_at=now,
+        updated_at=now,
+    )
+
+    helper = ApiKeyHelper()
+    v2_key, v2_prefix, _, v2_hash = helper.generate_new_api_key()
+    v2_record = ApiKeyDTO(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        organization=org,
+        key_hash=v2_hash,
+        prefix=v2_prefix,
+        status=ApiKeyStatus.ACTIVE,
+        created_at=now,
+        updated_at=now,
+    )
+    v1_record = ApiKeyDTO(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        organization=org,
+        key_hash=LEGACY_V1_HASH,
+        prefix="WMBUIIAK",
+        status=ApiKeyStatus.ACTIVE,
+        created_at=now,
+        updated_at=now,
+    )
+
+    with patch(
+        "document_ia_api.application.services.api_key.api_key_service.ApiKeyRepository"
+    ) as mock_repo_cls:
+        mock_repo = mock_repo_cls.return_value
+        mock_repo.get_by_prefix_with_relation = AsyncMock()
+
+        # 1. Mutated env / version -> 401 before DB & before Redis rate limit
+        for bad_key in (
+            v2_key.replace("dia_dev_2_", "dia_prod_2_", 1),
+            v2_key.replace("dia_dev_2_", "dia_dev_v2_", 1),
+            v2_key + "\n",
+        ):
+            resp = client_with_api_key_standard.get(
+                "/api/test", headers={"X-API-KEY": bad_key}
+            )
+            assert resp.status_code == 401
+
+        mock_repo.get_by_prefix_with_relation.assert_not_called()
+        mock_redis_service.check_rate_limit.assert_not_called()
+
+        # 2. Valid v1 key -> 200 and rate limit keyed by internal UUID v1_record.id
+        mock_repo.get_by_prefix_with_relation.return_value = v1_record
+        resp_v1 = client_with_api_key_standard.get(
+            "/api/test", headers={"X-API-KEY": LEGACY_V1_KEY}
+        )
+        assert resp_v1.status_code == 200
+        mock_redis_service.check_rate_limit.assert_called_once_with(v1_record.id)
+
+        # 3. Valid v2 key -> 200 and rate limit keyed by internal UUID v2_record.id
+        mock_redis_service.check_rate_limit.reset_mock()
+        mock_repo.get_by_prefix_with_relation.return_value = v2_record
+        resp_v2 = client_with_api_key_standard.get(
+            "/api/test", headers={"X-API-KEY": v2_key}
+        )
+        assert resp_v2.status_code == 200
+        mock_redis_service.check_rate_limit.assert_called_once_with(v2_record.id)

@@ -11,15 +11,17 @@ from document_ia_infra.data.api_key.dto.api_key_dto import ApiKeyDTO
 
 
 class ApiKeyHelper:
+    ALLOWED_ENVS = ("dev", "staging", "sandbox", "prod")
+
     def __init__(self) -> None:
         self.ph = PasswordHasher(time_cost=2, memory_cost=1024 * 64, parallelism=4)
         self.key_re = re.compile(
-            r"^dia_(dev|staging|sandbox|prod)_(\d+)_[A-Z2-7]{8}_[A-Z2-7]{40,64}_[A-Z2-7]{4}$"
+            r"^dia_(dev|staging|sandbox|prod)_(\d+)_[A-Z2-7]{8}_[A-Z2-7]{40,64}_[A-Z2-7]{4}\Z"
         )
 
     def _parse_and_validate(self, presented: str) -> tuple[str, int, str, str, str]:
         """Parse and validate structural, environment, version, and prefix invariants."""
-        if not self.key_re.match(presented):
+        if not isinstance(presented, str) or not self.key_re.fullmatch(presented):
             raise ValueError("Invalid API key format")
 
         _, env, version_str, prefix, body, chk = presented.split("_", 5)
@@ -62,6 +64,9 @@ class ApiKeyHelper:
     def generate_new_api_key(self) -> tuple[str, str, str, str]:
         """Generates a new API key."""
         env = api_key_settings.APP_ENV
+        if env not in self.ALLOWED_ENVS:
+            raise ValueError(f"Unsupported APP_ENV: {env}")
+
         version = api_key_settings.API_KEY_VERSION
         if version not in (1, 2):
             raise ValueError(f"Unsupported API_KEY_VERSION: {version}")
