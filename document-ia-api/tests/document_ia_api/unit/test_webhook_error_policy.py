@@ -1,5 +1,6 @@
 import logging
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -201,8 +202,10 @@ async def test_webhook_service_does_not_log_target_url_or_payload(monkeypatch, c
     org_id = uuid4()
     with caplog.at_level(logging.INFO):
         await service_module.WebhookNotificationService()._call_webhook_notification(
-            SimpleNamespace(url=url, headers={}, organization_id=org_id),
-            SimpleNamespace(execution_id="execution", organization_id=org_id),
+            cast(Any, SimpleNamespace(url=url, headers={}, organization_id=org_id)),
+            cast(
+                Any, SimpleNamespace(execution_id="execution", organization_id=org_id)
+            ),
         )
     assert "Webhook notification sent successfully with status 200" in caplog.text
     assert "token=secret" not in caplog.text and "SECRET-DOCUMENT" not in caplog.text

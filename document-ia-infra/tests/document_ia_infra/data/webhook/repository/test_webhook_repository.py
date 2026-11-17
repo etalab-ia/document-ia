@@ -3,8 +3,12 @@ import uuid
 import pytest
 
 from document_ia_infra.data.organization.enum.platform_role import PlatformRole
-from document_ia_infra.data.organization.repository.organization_repository import OrganizationRepository
-from document_ia_infra.data.webhook.repository.webhook_repository import WebHookRepository
+from document_ia_infra.data.organization.repository.organization_repository import (
+    OrganizationRepository,
+)
+from document_ia_infra.data.webhook.repository.webhook_repository import (
+    WebHookRepository,
+)
 
 
 @pytest.mark.asyncio
@@ -49,12 +53,16 @@ class TestWebHookRepository:
                 assert deleted is True
 
                 # Verify list is now empty
-                items_after = await webhook_repo.list_webhooks_by_organization(created_org_id)
+                items_after = await webhook_repo.list_webhooks_by_organization(
+                    created_org_id
+                )
                 assert all(x.id != created_webhook_id for x in items_after)
             finally:
                 # Cleanup organization best-effort in fresh session
                 if created_org_id is not None:
-                    async with isolated_database_manager.local_session() as clean_session:
+                    async with (
+                        isolated_database_manager.local_session() as clean_session
+                    ):
                         clean_org_repo = OrganizationRepository(clean_session)
                         try:
                             await clean_org_repo.delete(created_org_id)
@@ -68,7 +76,6 @@ class TestWebHookRepository:
             repo = WebHookRepository(session)
             result = await repo.delete(uuid.uuid4())
             assert result is False
-
 
     async def test_delete_scoped_to_organization_id(self, isolated_database_manager):
         async with isolated_database_manager.local_session() as session:
@@ -113,7 +120,9 @@ class TestWebHookRepository:
                 assert await webhook_repo.get_by_id(dto.id) is None
             finally:
                 for org_id in created_org_ids:
-                    async with isolated_database_manager.local_session() as clean_session:
+                    async with (
+                        isolated_database_manager.local_session() as clean_session
+                    ):
                         clean_org_repo = OrganizationRepository(clean_session)
                         try:
                             await clean_org_repo.delete(org_id)

@@ -45,4 +45,7 @@ class WebhookErrorPolicy:
                 delay = self.delay(attempt)
                 attempt += 1
                 await asyncio.sleep(delay)
-        # Non-HTTP failures propagate to the consumer and remain pending.
+            except Exception as exc:
+                if classify_failure(exc) == "permanent":
+                    return await retain(type(exc).__name__)
+                raise

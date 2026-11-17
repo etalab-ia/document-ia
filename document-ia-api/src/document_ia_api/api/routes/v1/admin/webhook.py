@@ -228,7 +228,7 @@ async def delete_webhook(
     webhook_id: UUID = Path(..., description="Webhook id (UUID)"),
     db_session: AsyncSession = Depends(database_manager.async_get_db),
 ) -> None:
-    logger.info(f"Deleting webhook {webhook_id} for organization {organization_id}")
+    logger.info("Deleting webhook %s for organization %s", webhook_id, organization_id)
     try:
         service = WebHookService(db_session)
         await service.delete(webhook_id, organization_id=organization_id)

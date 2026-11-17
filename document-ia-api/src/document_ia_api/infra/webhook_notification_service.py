@@ -3,6 +3,8 @@ import logging
 import time
 
 from collections.abc import Mapping
+from typing import Any, cast
+from uuid import UUID
 
 import httpx
 from sqlalchemy.exc import (
@@ -83,17 +85,47 @@ class WebhookNotificationService:
         return 500 <= status_code < 600
 
     @staticmethod
+    def _parse_org_uuid(raw_org_id: object) -> UUID | None:
+        if isinstance(raw_org_id, UUID):
+            return raw_org_id
+        if isinstance(raw_org_id, str):
+            stripped = raw_org_id.strip()
+            if not stripped:
+                return None
+            try:
+                return UUID(stripped)
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
     def _verify_organization_match(
+        cls,
         webhook_dto: WebHookDTO,
         event_dto: EventDTO,
     ) -> None:
-        webhook_org_id = getattr(webhook_dto, "organization_id", None)
-        event_org_id = getattr(event_dto, "organization_id", None)
-        webhook_org_str = (
-            str(webhook_org_id).strip() if webhook_org_id is not None else ""
+        webhook_org_uuid = cls._parse_org_uuid(
+            getattr(webhook_dto, "organization_id", None)
         )
-        event_org_str = str(event_org_id).strip() if event_org_id is not None else ""
-        if not webhook_org_str or not event_org_str or webhook_org_str != event_org_str:
+        event_org_uuid = cls._parse_org_uuid(
+            getattr(event_dto, "organization_id", None)
+        )
+        raw_event = getattr(event_dto, "event", None)
+        inner_org_mismatch = False
+        if isinstance(raw_event, Mapping):
+            raw_event_mapping = cast(Mapping[str, Any], raw_event)
+            inner_org_uuid = cls._parse_org_uuid(
+                raw_event_mapping.get("organization_id")
+            )
+            if inner_org_uuid is None or inner_org_uuid != event_org_uuid:
+                inner_org_mismatch = True
+
+        if (
+            webhook_org_uuid is None
+            or event_org_uuid is None
+            or webhook_org_uuid != event_org_uuid
+            or inner_org_mismatch
+        ):
             webhook_id = str(getattr(webhook_dto, "id", "") or "")
             execution_id = str(getattr(event_dto, "execution_id", "") or "")
             logger.error(
@@ -292,16 +324,17 @@ class WebhookNotificationService:
         webhook_id = str(getattr(webhook_dto, "id", "") or "")
         start_time = time.perf_counter()
 
+        payload = self._execution_service.get_event_model(
+            event_dto, execution_id, is_debug_mode=False
+        )
+        headers = self._build_headers(getattr(webhook_dto, "headers", {}))
+
         logger.info(
             "Sending webhook notification to host %s (webhook_id=%s, execution_id=%s)",
             host,
             webhook_id,
             execution_id,
         )
-        payload = self._execution_service.get_event_model(
-            event_dto, execution_id, is_debug_mode=False
-        )
-        headers = self._build_headers(getattr(webhook_dto, "headers", {}))
 
         client = self._get_http_client()
         response = await client.post(

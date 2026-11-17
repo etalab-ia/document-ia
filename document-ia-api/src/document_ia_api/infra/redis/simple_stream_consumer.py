@@ -512,6 +512,23 @@ class SimpleStreamConsumer(Generic[T]):
             )
             return
         try:
+            if await self._already_retained_in_dlq(redis, self._stream, entry_id):
+                logger.info(
+                    "Reclaimed entry stream=%s id=%s already retained in DLQ; "
+                    "retrying ACK only",
+                    self._stream,
+                    entry_id,
+                )
+                try:
+                    await self._delivery.ack(redis, entry_id)
+                except Exception as ack_err:
+                    logger.error(
+                        "ACK failed for reclaimed DLQ entry stream=%s id=%s: %s",
+                        self._stream,
+                        entry_id,
+                        type(ack_err).__name__,
+                    )
+                return
             if await self._already_requeued(redis, entry_id):
                 logger.info(
                     "Reclaimed entry stream=%s id=%s already requeued; "

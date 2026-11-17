@@ -22,9 +22,9 @@ Specifically, it documents:
 ## 2. Threat Model & Why Event Self-Consistency (#140) Is Not Enough
 
 ### 2.1 Gap Addressed by S9 (#160)
-Prior to S9, [`decode_event_dto`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-infra/src/document_ia_infra/data/event/schema/mappers/event_mapper.py#L30-L36) (#140) guaranteed that an `EventDTO` was internally consistent (envelope `organization_id` matching the inner JSON `event.organization_id`).
+Prior to S9, [`decode_event_dto`](../../document-ia-infra/src/document_ia_infra/data/event/schema/mappers/event_mapper.py#L30-L36) (#140) guaranteed that an `EventDTO` was internally consistent (envelope `organization_id` matching the inner JSON `event.organization_id`).
 
-However, [`WebhookNotificationService`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-api/src/document_ia_api/infra/webhook_notification_service.py) fetches the webhook and the execution's latest event independently from PostgreSQL using a Redis Stream [`WebHookMessage(webhook_id, workflow_execution_id)`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-infra/src/document_ia_infra/redis/model/webhook_message.py):
+However, [`WebhookNotificationService`](../src/document_ia_api/infra/webhook_notification_service.py) fetches the webhook and the execution's latest event independently from PostgreSQL using a Redis Stream [`WebHookMessage(webhook_id, workflow_execution_id)`](../../document-ia-infra/src/document_ia_infra/redis/model/webhook_message.py):
 - A valid `EventDTO` belonging to **Organization A** paired with a valid `WebHookDTO` belonging to **Organization B** (due to a corrupted message, stale reference, or Redis stream tampering) would pass #140 without error and exfiltrate Organization A's extracted document data to Organization B's endpoint.
 
 ### 2.2 Threat Matrix
@@ -77,8 +77,8 @@ sequenceDiagram
 
 ## 4. Error Classification & DLQ Behavior
 
-1. **Exception Hierarchy**: [`WebhookOrganizationMismatchException`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-infra/src/document_ia_infra/exception/security_exception.py) subclasses `SecurityException`.
-2. **Failure Classification**: [`classify_failure`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-infra/src/document_ia_infra/redis/failure_classification.py) maps any `SecurityException` to `"permanent"`.
+1. **Exception Hierarchy**: [`WebhookOrganizationMismatchException`](../../document-ia-infra/src/document_ia_infra/exception/security_exception.py) subclasses `SecurityException`.
+2. **Failure Classification**: [`classify_failure`](../../document-ia-infra/src/document_ia_infra/redis/failure_classification.py) maps any `SecurityException` to `"permanent"`.
 3. **Consumer Policies**:
    - **`AsyncIoConsumer` (`WorkerErrorPolicy`)**: Does not requeue (`WebhookOrganizationMismatchException` is not a `RetryableException`). Immediately retains the entry in `<stream>:dlq` with `reason="not_retryable_error"`, `error="WebhookOrganizationMismatchException"`, `failure_class="permanent"`, and acknowledges (`XACK`) the main stream entry.
    - **`SimpleStreamConsumer` (`WebhookErrorPolicy`)**: Catches `SecurityException` on the first attempt without backoff sleep and calls `retain("WebhookOrganizationMismatchException")`.
@@ -88,11 +88,18 @@ sequenceDiagram
 
 ## 5. Webhook Destination Policy (Decision D4)
 
-Unlike `file_url` (which is supplied by unauthenticated/end-user API callers and is strictly confined by [`SafeAsyncHTTPTransport`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-infra/src/document_ia_infra/core/network/safe_transport.py)), webhook registrations are **exclusively managed by `PlatformAdmin` operators** via [`admin/webhook.py`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-api/src/document_ia_api/api/routes/v1/admin/webhook.py).
+Unlike `file_url` (which is supplied by unauthenticated/end-user API callers and is strictly confined by [`SafeAsyncHTTPTransport`](../../document-ia-infra/src/document_ia_infra/core/network/safe_transport.py)), webhook registrations are **exclusively managed by `PlatformAdmin` operators** via [`admin/webhook.py`](../src/document_ia_api/api/routes/v1/admin/webhook.py).
 
 Per **Decision D4** (Issue #160):
 - **No additional IP/CIDR blocklist** is applied to outbound webhook HTTP requests at this stage, ensuring legitimate internal or partner network destinations remain operational without breaking changes.
 - Outbound webhook destination governance remains an administrative responsibility enforced at webhook registration time by `PlatformAdmin`.
+
+### 5.1 Open Items under Decision D4 (#151)
+
+The following items under Decision **D4** (Initiative #151) remain open outside the scope of #160:
+- **#161 (T1)**: 2D-Doc cryptographic trust store and unavailability states.
+- **#162 (T2)**: Barcode state exposure and signed-field reconciliation (separating extraction, classification, barcode presence, and authenticity proof).
+- **Future webhook destination network governance**: Should webhook registration ever be opened beyond the `PlatformAdmin` role, per-environment destination allowlists or DNS/IP filtering will need to be evaluated and enforced.
 
 ---
 
@@ -100,8 +107,8 @@ Per **Decision D4** (Issue #160):
 
 | Test Suite | Scope Covered |
 | :--- | :--- |
-| [`test_webhook_notification_service.py`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-api/tests/document_ia_api/unit/test_webhook_notification_service.py) | Organization mismatch in `handle_webhook_notification` and `_call_webhook_notification`, zero `get_event_model` / `post` calls, zero `asyncio.sleep`, non-sensitive logs, missing `organization_id`, valid same-org delivery unchanged. |
-| [`test_webhook_error_policy.py`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-api/tests/document_ia_api/unit/test_webhook_error_policy.py) | `WebhookErrorPolicy` immediate DLQ retention on `SecurityException` without retries. |
-| [`test_webhook_consumer.py`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-api/tests/document_ia_api/integration/test_webhook_consumer.py) | End-to-end Redis Stream DLQ routing (`failure_class="permanent"`, `pending == 0`) on initial delivery and PEL `XAUTOCLAIM` recovery. |
-| [`test_retention.py`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-infra/tests/document_ia_infra/redis/test_retention.py) | `classify_failure(WebhookOrganizationMismatchException()) == "permanent"`. |
-| [`test_webhooks.py`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-api/tests/document_ia_api/api/test_webhooks.py) & [`test_webhook_repository.py`](file:///Users/nsagon/Projects/beta/documentAI/document-ia/document-ia-infra/tests/document_ia_infra/data/webhook/repository/test_webhook_repository.py) | Organization-scoped `DELETE` returning `404` on cross-organization deletion attempts. |
+| [`test_webhook_notification_service.py`](../tests/document_ia_api/unit/test_webhook_notification_service.py) | Organization mismatch in `handle_webhook_notification` and `_call_webhook_notification`, zero `get_event_model` / `post` calls, zero `asyncio.sleep`, non-sensitive logs, missing `organization_id`, valid same-org delivery unchanged. |
+| [`test_webhook_error_policy.py`](../tests/document_ia_api/unit/test_webhook_error_policy.py) | `WebhookErrorPolicy` immediate DLQ retention on `SecurityException` without retries. |
+| [`test_webhook_consumer.py`](../tests/document_ia_api/integration/test_webhook_consumer.py) | End-to-end Redis Stream DLQ routing (`failure_class="permanent"`, `pending == 0`) on initial delivery and PEL `XAUTOCLAIM` recovery. |
+| [`test_retention.py`](../../document-ia-infra/tests/document_ia_infra/redis/test_retention.py) | `classify_failure(WebhookOrganizationMismatchException()) == "permanent"`. |
+| [`test_webhooks.py`](../tests/document_ia_api/api/test_webhooks.py) & [`test_webhook_repository.py`](../../document-ia-infra/tests/document_ia_infra/data/webhook/repository/test_webhook_repository.py) | Organization-scoped `DELETE` returning `404` on cross-organization deletion attempts. |
