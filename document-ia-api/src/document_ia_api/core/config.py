@@ -12,7 +12,9 @@ class ApiKeySettings(BaseDocumentIaSettings):
         default="default_pepper_chk_value", validation_alias="API_KEY_PEPPER_CHK"
     )
 
-    API_KEY_VERSION: int = Field(default=1, validation_alias="API_KEY_VERSION")
+    API_KEY_VERSION: int = Field(default=2, validation_alias="API_KEY_VERSION")
+
+    API_KEY_ALLOW_V1: bool = Field(default=True, validation_alias="API_KEY_ALLOW_V1")
 
     APP_ENV: str = Field(default="prod", validation_alias="APP_ENV")
 

@@ -52,7 +52,7 @@ class TestCreateAPIKey:
             with patch("document_ia_api.application.services.api_key.api_key_helper.ApiKeyHelper") as mock_helper_class:
                 mock_helper = mock_helper_class.return_value
                 mock_helper.generate_new_api_key.return_value = (
-                    "dia_dev_v1_TESTKEY1_ABCDEFGHIJKLMNOPQRSTUVWX1234567890YZ12_IFZS",
+                    "dia_dev_2_TESTKEY1_ABCDEFGHIJKLMNOPQRSTUVWX1234567890YZ12_IFZS",  # gitleaks:allow
                     "TESTKEY1",
                     "IFZS",
                     "argon2$dummy_hash"
@@ -71,7 +71,7 @@ class TestCreateAPIKey:
                 assert data["status"] == "Active"
                 assert "created_at" in data
                 assert "updated_at" in data
-                assert data["key"].startswith("dia_dev_1_")
+                assert data["key"].startswith("dia_dev_2_")
 
     def test_create_api_key_organization_not_found(
         self, client_with_api_key_admin, admin_api_key_value
@@ -88,7 +88,7 @@ class TestCreateAPIKey:
             with patch("document_ia_api.application.services.api_key.api_key_helper.ApiKeyHelper") as mock_helper_class:
                 mock_helper = mock_helper_class.return_value
                 mock_helper.generate_new_api_key.return_value = (
-                    "dia_dev_v1_TESTKEY1_ABCDEFGHIJKLMNOPQRSTUVWX1234567890YZ12_IFZS",
+                    "dia_dev_2_TESTKEY1_ABCDEFGHIJKLMNOPQRSTUVWX1234567890YZ12_IFZS",  # gitleaks:allow
                     "TESTKEY1",
                     "IFZS",
                     "argon2$dummy_hash"
