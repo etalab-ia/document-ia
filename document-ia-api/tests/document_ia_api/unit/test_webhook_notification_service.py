@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from time import monotonic
 from typing import Any
 from unittest.mock import AsyncMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -39,14 +39,18 @@ def mock_api_key_service_auth() -> None:
     """Unit tests do not exercise API authentication or PostgreSQL."""
 
 
+DEFAULT_TEST_ORG_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
 def _sample_webhook_dto(
     url: str = "https://example.test/webhook",
     headers: dict[str, str] | None = None,
+    organization_id: UUID | None = DEFAULT_TEST_ORG_ID,
 ) -> WebHookDTO:
     now = datetime.now(UTC)
     return WebHookDTO(
         id=uuid4(),
-        organization_id=uuid4(),
+        organization_id=organization_id,  # type: ignore[arg-type]
         url=url,
         headers=headers if headers is not None else {"X-Custom": "value"},
         created_at=now,
@@ -54,8 +58,10 @@ def _sample_webhook_dto(
     )
 
 
-def _sample_event_dto(execution_id: str) -> EventDTO:
-    organization_id = uuid4()
+def _sample_event_dto(
+    execution_id: str,
+    organization_id: UUID | None = DEFAULT_TEST_ORG_ID,
+) -> EventDTO:
     return EventDTO(
         id=uuid4(),
         workflow_id="wf-1",
@@ -517,3 +523,200 @@ async def test_api_lifespan_wires_webhook_consumer_and_cleans_up_resources(
     aclose_mock.assert_awaited_once()
     redis_close_mock.assert_awaited_once()
     db_dispose_mock.assert_awaited_once()
+
+
+
+@pytest.mark.asyncio
+async def test_call_webhook_notification_rejects_org_mismatch_before_payload_and_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from document_ia_infra.exception.security_exception import (
+        WebhookOrganizationMismatchException,
+    )
+
+    org_a = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    org_b = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    execution_id = str(uuid4())
+    webhook_dto = _sample_webhook_dto(organization_id=org_b)
+    # Case #140 insufficient: EventDTO is internally consistent with org_a,
+    # while WebHookDTO belongs to org_b.
+    event_dto = _sample_event_dto(execution_id, organization_id=org_a)
+
+    mock_client = AsyncMock()
+    mock_client.is_closed = False
+    service = WebhookNotificationService(http_client=mock_client)
+    get_event_model_mock = AsyncMock()
+    monkeypatch.setattr(service._execution_service, "get_event_model", get_event_model_mock)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+
+    with pytest.raises(WebhookOrganizationMismatchException):
+        await service._call_webhook_notification(webhook_dto, event_dto)
+
+    get_event_model_mock.assert_not_called()
+    mock_client.post.assert_not_called()
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.parametrize("bad_org", [None, "", "   "])
+def test_verify_organization_match_rejects_missing_or_empty_org_id(
+    bad_org: Any,
+) -> None:
+    from types import SimpleNamespace
+    from document_ia_infra.exception.security_exception import (
+        WebhookOrganizationMismatchException,
+    )
+
+    valid_org = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    execution_id = str(uuid4())
+    event_dto = _sample_event_dto(execution_id, organization_id=valid_org)
+    webhook_bad = SimpleNamespace(id=uuid4(), organization_id=bad_org)
+    with pytest.raises(WebhookOrganizationMismatchException):
+        WebhookNotificationService._verify_organization_match(
+            webhook_bad,  # type: ignore[arg-type]
+            event_dto,
+        )
+
+    webhook_ok = _sample_webhook_dto(organization_id=valid_org)
+    event_bad = SimpleNamespace(execution_id=execution_id, organization_id=bad_org)
+    with pytest.raises(WebhookOrganizationMismatchException):
+        WebhookNotificationService._verify_organization_match(
+            webhook_ok,
+            event_bad,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_handle_webhook_notification_rejects_org_mismatch_without_retry_or_sensitive_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    from document_ia_api.infra import webhook_notification_service as svc_mod
+    from document_ia_infra.exception.security_exception import (
+        WebhookOrganizationMismatchException,
+    )
+
+    org_a = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    org_b = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    execution_id = str(uuid4())
+    secret_url = "https://partner.example.test/hook?token=TOP_SECRET_TOKEN"
+    webhook_dto = _sample_webhook_dto(
+        url=secret_url,
+        headers={"Authorization": "Bearer SUPER_SECRET_HEADER"},
+        organization_id=org_b,
+    )
+    event_dto = _sample_event_dto(execution_id, organization_id=org_a)
+    event_dto.event["metadata"] = {"pii_secret": "SENSITIVE_DOC_CONTENT"}
+
+    @asynccontextmanager
+    async def fake_session():
+        yield object()
+
+    class FakeWebhookRepo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_by_id(self, _wid: Any) -> WebHookDTO:
+            return webhook_dto
+
+    class FakeEventRepo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_last_event_by_execution_id(self, _eid: str) -> EventDTO:
+            return event_dto
+
+    monkeypatch.setattr(svc_mod.database_manager, "local_session", fake_session)
+    monkeypatch.setattr(svc_mod, "WebHookRepository", FakeWebhookRepo)
+    monkeypatch.setattr(svc_mod, "EventRepository", FakeEventRepo)
+
+    mock_client = AsyncMock()
+    mock_client.is_closed = False
+    service = WebhookNotificationService(
+        http_client=mock_client,
+        retry_initial_delay_seconds=5.0,
+    )
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(WebhookOrganizationMismatchException):
+            await service.handle_webhook_notification(
+                WebHookMessage(
+                    workflow_execution_id=execution_id,
+                    webhook_id=webhook_dto.id,
+                )
+            )
+
+    mock_client.post.assert_not_called()
+    sleep_mock.assert_not_awaited()
+    assert "Permanent webhook refusal: organization mismatch" in caplog.text
+    assert str(webhook_dto.id) in caplog.text
+    assert execution_id in caplog.text
+    assert str(org_a) not in caplog.text
+    assert str(org_b) not in caplog.text
+    assert "TOP_SECRET_TOKEN" not in caplog.text
+    assert "SUPER_SECRET_HEADER" not in caplog.text
+    assert "SENSITIVE_DOC_CONTENT" not in caplog.text
+    assert "partner.example.test" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_deliver_webhook_with_retry_policy_re_raises_mismatch_without_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from document_ia_infra.exception.security_exception import (
+        WebhookOrganizationMismatchException,
+    )
+
+    org_a = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    org_b = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    webhook_dto = _sample_webhook_dto(organization_id=org_b)
+    event_dto = _sample_event_dto(str(uuid4()), organization_id=org_a)
+
+    mock_client = AsyncMock()
+    mock_client.is_closed = False
+    service = WebhookNotificationService(
+        http_client=mock_client,
+        retry_initial_delay_seconds=5.0,
+    )
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+
+    with pytest.raises(WebhookOrganizationMismatchException):
+        await service._deliver_webhook_with_retry_policy(
+            webhook_dto, event_dto, retry_count=0, is_last_retry=False
+        )
+
+    mock_client.post.assert_not_called()
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_webhook_error_policy_retains_security_exception_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from document_ia_api.infra.redis.webhook_error_policy import WebhookErrorPolicy
+    from document_ia_infra.exception.security_exception import (
+        WebhookOrganizationMismatchException,
+    )
+
+    policy = WebhookErrorPolicy(max_retries=3, initial_delay=5.0, multiplier=2.0)
+    retain_mock = AsyncMock(return_value=True)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+
+    calls = 0
+
+    async def handler() -> None:
+        nonlocal calls
+        calls += 1
+        raise WebhookOrganizationMismatchException()
+
+    result = await policy.handle(handler, retain_mock)
+
+    assert result is True
+    assert calls == 1
+    sleep_mock.assert_not_awaited()
+    retain_mock.assert_awaited_once_with("WebhookOrganizationMismatchException")

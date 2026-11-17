@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 
+from document_ia_infra.exception.security_exception import SecurityException
 from document_ia_infra.redis.failure_classification import classify_failure
 
 
@@ -33,6 +34,8 @@ class WebhookErrorPolicy:
             try:
                 await handler()
                 return True
+            except SecurityException as exc:
+                return await retain(type(exc).__name__)
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 if classify_failure(exc) != "temporary":

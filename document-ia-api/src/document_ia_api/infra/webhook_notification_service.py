@@ -28,6 +28,9 @@ from document_ia_infra.exception.entity_not_found_exception import (
     EntityNotFoundException,
 )
 from document_ia_infra.exception.retryable_exception import RetryableException
+from document_ia_infra.exception.security_exception import (
+    WebhookOrganizationMismatchException,
+)
 from document_ia_infra.redis.model.webhook_message import WebHookMessage
 
 logger = logging.getLogger(__name__)
@@ -78,6 +81,27 @@ class WebhookNotificationService:
         if status_code in RETRYABLE_HTTP_STATUSES:
             return True
         return 500 <= status_code < 600
+
+    @staticmethod
+    def _verify_organization_match(
+        webhook_dto: WebHookDTO,
+        event_dto: EventDTO,
+    ) -> None:
+        webhook_org_id = getattr(webhook_dto, "organization_id", None)
+        event_org_id = getattr(event_dto, "organization_id", None)
+        webhook_org_str = (
+            str(webhook_org_id).strip() if webhook_org_id is not None else ""
+        )
+        event_org_str = str(event_org_id).strip() if event_org_id is not None else ""
+        if not webhook_org_str or not event_org_str or webhook_org_str != event_org_str:
+            webhook_id = str(getattr(webhook_dto, "id", "") or "")
+            execution_id = str(getattr(event_dto, "execution_id", "") or "")
+            logger.error(
+                "Permanent webhook refusal: organization mismatch (webhook_id=%s, execution_id=%s)",
+                webhook_id,
+                execution_id,
+            )
+            raise WebhookOrganizationMismatchException()
 
     def compute_backoff_delay(self, retry_count: int) -> float:
         if self.retry_initial_delay_seconds <= 0:
@@ -168,6 +192,8 @@ class WebhookNotificationService:
             logger.error("Error handling webhook notification: %s", err)
             raise err
 
+        self._verify_organization_match(current_web_hook, event_dto)
+
         await self._deliver_webhook_with_retry_policy(
             current_web_hook,
             event_dto,
@@ -229,6 +255,8 @@ class WebhookNotificationService:
             raise RetryableException(
                 f"Webhook transport error: {type(transport_exc).__name__}"
             ) from transport_exc
+        except WebhookOrganizationMismatchException:
+            raise
         except Exception as exc:
             logger.error(
                 "Error handling webhook notification: %s (host=%s, webhook_id=%s, execution_id=%s)",
@@ -256,6 +284,8 @@ class WebhookNotificationService:
     async def _call_webhook_notification(
         self, webhook_dto: WebHookDTO, event_dto: EventDTO
     ) -> None:
+        self._verify_organization_match(webhook_dto, event_dto)
+
         url = getattr(webhook_dto, "url", None)
         host = extract_safe_host(url) if url else "unknown"
         execution_id: str = str(getattr(event_dto, "execution_id", ""))

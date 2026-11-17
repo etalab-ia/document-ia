@@ -48,3 +48,13 @@ class InvalidUUIDException(SecurityException, ValueError):
 
     def __init__(self, message: str = "Identifier is not a valid UUID.") -> None:
         super().__init__(message)
+
+
+class WebhookOrganizationMismatchException(SecurityException):
+    """Raised when a webhook's organization does not match the execution's organization."""
+
+    def __init__(
+        self,
+        message: str = "Webhook organization does not match execution organization.",
+    ) -> None:
+        super().__init__(message)
