@@ -164,12 +164,6 @@ def open_confined_directory(
                 f"Sandbox root {root_resolved} was swapped during open"
             )
 
-        root_held = _fd_path(current_fd)
-        if root_held is None:
-            raise PathTraversalException(
-                f"Cannot verify path confinement for sandbox root {root_resolved}"
-            )
-
         for part in rel_parts:
             try:
                 next_fd = os.open(part, open_flags, dir_fd=current_fd)
@@ -187,7 +181,11 @@ def open_confined_directory(
             raise PathTraversalException(
                 f"Cannot verify path confinement descriptor for {resolved}"
             )
-        if not held.is_relative_to(root_held):
+        # O_NOFOLLOW covers only the final path component. An ancestor replaced
+        # by a symlink changes the descriptor's real path, so comparing with the
+        # opened root would adopt the attacker's redirected location as the new
+        # boundary. The original lexical root remains the confinement boundary.
+        if not held.is_relative_to(root_resolved):
             raise PathTraversalException(
                 f"Sandbox directory {held} escapes sandbox {root_resolved}"
             )

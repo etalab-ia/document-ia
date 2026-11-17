@@ -692,6 +692,35 @@ def test_open_confined_directory_refuses_a_replaced_sandbox_root(tmp_path: Path)
         open_confined_directory(replaced_root / "sub", replaced_root)
 
 
+def test_sandbox_ancestor_symlink_cannot_redirect_open_or_cleanup(tmp_path: Path):
+    """A replaced ancestor must not move the accepted boundary outside the sandbox."""
+    from document_ia_infra.core.file.safe_path import (
+        open_confined_directory,
+        safe_cleanup_directory,
+    )
+    from document_ia_infra.exception.security_exception import PathTraversalException
+
+    parent = tmp_path / "parent"
+    sandbox = parent / "sandbox"
+    execution = sandbox / "execution"
+    execution.mkdir(parents=True)
+
+    outside_parent = tmp_path / "outside-parent"
+    outside_execution = outside_parent / "sandbox" / "execution"
+    outside_execution.mkdir(parents=True)
+    kept = outside_execution / "KEEP.txt"
+    kept.write_text("must survive")
+
+    parent.rename(tmp_path / "original-parent")
+    parent.symlink_to(outside_parent, target_is_directory=True)
+
+    safe_cleanup_directory(execution, sandbox_root=sandbox)
+    assert kept.exists(), "cleanup followed a redirected ancestor outside the sandbox"
+
+    with pytest.raises(PathTraversalException):
+        open_confined_directory(execution, sandbox)
+
+
 def test_open_confined_directory_fails_closed_when_fd_path_fails(tmp_path: Path):
     """If fd path cannot be inspected (e.g. F_GETPATH / proc unavailable), it must fail closed."""
     from document_ia_infra.core.file.safe_path import open_confined_directory
