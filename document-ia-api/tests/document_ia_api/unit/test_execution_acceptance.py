@@ -5,15 +5,21 @@ exécution acceptée en `processing`. Les services v1 et v2 doivent répondre `5
 avec `Retry-After` et clôturer l'exécution déjà persistée.
 """
 
-from unittest.mock import AsyncMock, MagicMock
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
 
+from document_ia_api.application.services.execution_acceptance import (
+    S3CompensationGuard,
+    schedule_workflow_execution,
+)
 from document_ia_api.application.services.workflow_service import WorkflowService
 from document_ia_api.application.services.workflow_v2_service import WorkflowV2Service
-from document_ia_infra.redis.publisher import PublishFailedError
+from document_ia_infra.redis.publisher import PublishFailedError, Publisher
+from document_ia_infra.redis.redis_settings import redis_settings
 
 pytestmark = pytest.mark.asyncio
 
@@ -263,3 +269,130 @@ async def test_v1_close_failure_does_not_mask_the_503(monkeypatch):
 
     assert exc_info.value.status_code == 503
     assert exc_info.value.detail["error"] == "execution_scheduling_unavailable"
+
+
+def _publisher_with_lost_reply(execution_id: str, queued: bool | None):
+    """Build a real Publisher whose Redis reply is lost after a possible commit."""
+    connection = AsyncMock()
+    stream_entries = []
+
+    async def publish_then_lose_reply(*args, **kwargs):
+        if queued is not False:
+            stream_entries.append(
+                (
+                    "1-0",
+                    {"data": json.dumps({"workflow_execution_id": execution_id})},
+                )
+            )
+        raise ConnectionError("Redis reply lost")
+
+    connection.eval.side_effect = publish_then_lose_reply
+    if queued is None:
+        connection.xrange.side_effect = ConnectionError("Redis still unreadable")
+    else:
+        connection.xrange.side_effect = lambda *args, **kwargs: list(stream_entries)
+
+    manager = AsyncMock()
+    manager.get_connection.return_value = connection
+    publisher = Publisher(
+        redis_settings.EVENT_STREAM_NAME,
+        current_redis_manager=manager,
+    )
+    return publisher, connection
+
+
+async def test_unfenced_lost_reply_reconciles_queued_message_and_preserves_s3():
+    execution_id = str(uuid4())
+    publisher, connection = _publisher_with_lost_reply(execution_id, queued=True)
+    guard = S3CompensationGuard(execution_id=execution_id)
+    guard.arm("uploads/queued-document.pdf")
+
+    with (
+        patch(
+            "document_ia_api.application.services.execution_acceptance.fail_unscheduled_execution",
+            new=AsyncMock(),
+        ) as fail_unscheduled,
+        patch(
+            "document_ia_api.application.services.execution_acceptance.compensate_s3_upload",
+            new=AsyncMock(),
+        ) as compensate,
+    ):
+        await schedule_workflow_execution(
+            AsyncMock(),
+            redis_producer=publisher,
+            execution_id=execution_id,
+            workflow_id=V1_WORKFLOW_ID,
+            organization_id=uuid4(),
+            compensation_guard=guard,
+        )
+        await guard.compensate_if_needed()
+
+    assert connection.xrange.await_count == 1
+    fail_unscheduled.assert_not_awaited()
+    compensate.assert_not_awaited()
+
+
+async def test_unfenced_lost_reply_deletes_s3_only_when_absence_is_confirmed():
+    execution_id = str(uuid4())
+    publisher, connection = _publisher_with_lost_reply(execution_id, queued=False)
+    guard = S3CompensationGuard(execution_id=execution_id)
+    guard.arm("uploads/unpublished-document.pdf")
+
+    with (
+        patch(
+            "document_ia_api.application.services.execution_acceptance.fail_unscheduled_execution",
+            new=AsyncMock(),
+        ) as fail_unscheduled,
+        patch(
+            "document_ia_api.application.services.execution_acceptance.compensate_s3_upload",
+            new=AsyncMock(),
+        ) as compensate,
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await schedule_workflow_execution(
+                AsyncMock(),
+                redis_producer=publisher,
+                execution_id=execution_id,
+                workflow_id=V1_WORKFLOW_ID,
+                organization_id=uuid4(),
+                compensation_guard=guard,
+            )
+        await guard.compensate_if_needed()
+
+    assert exc_info.value.status_code == 503
+    assert connection.xrange.await_count == 1
+    fail_unscheduled.assert_awaited_once()
+    compensate.assert_awaited_once_with(
+        "uploads/unpublished-document.pdf", execution_id
+    )
+
+
+async def test_unfenced_unresolved_outcome_preserves_s3_without_failure_event():
+    execution_id = str(uuid4())
+    publisher, connection = _publisher_with_lost_reply(execution_id, queued=None)
+    guard = S3CompensationGuard(execution_id=execution_id)
+    guard.arm("uploads/unresolved-document.pdf")
+
+    with (
+        patch(
+            "document_ia_api.application.services.execution_acceptance.fail_unscheduled_execution",
+            new=AsyncMock(),
+        ) as fail_unscheduled,
+        patch(
+            "document_ia_api.application.services.execution_acceptance.compensate_s3_upload",
+            new=AsyncMock(),
+        ) as compensate,
+    ):
+        await schedule_workflow_execution(
+            AsyncMock(),
+            redis_producer=publisher,
+            execution_id=execution_id,
+            workflow_id=V1_WORKFLOW_ID,
+            organization_id=uuid4(),
+            compensation_guard=guard,
+        )
+        await guard.compensate_if_needed()
+
+    assert connection.xrange.await_count == 1
+    fail_unscheduled.assert_not_awaited()
+    compensate.assert_not_awaited()

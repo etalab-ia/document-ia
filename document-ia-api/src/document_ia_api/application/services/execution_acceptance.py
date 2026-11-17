@@ -224,10 +224,10 @@ async def schedule_workflow_execution(
 
     Re-arms `compensation_guard` only when non-publication is confirmed
     (`ReservationLostError`, `IdempotencyReservationLostException`,
-    `PublishFailedError`, or an unexpected non-cancellation exception). When
-    interrupted by `asyncio.CancelledError` or `PublicationOutcomeUnknownError`,
-    the guard remains disarmed so an already-queued execution never loses its
-    S3 input file.
+    `PublishFailedError`, a reconciliation that finds no queued message, or an
+    unexpected non-cancellation exception). A lost publication reply is first
+    reconciled against the stream. Cancellation and unresolved outcomes leave
+    the guard disarmed so an already-queued execution never loses its S3 input.
     """
     execution_message = WorkflowExecutionMessage(workflow_execution_id=execution_id)
     if compensation_guard is not None:
@@ -256,16 +256,45 @@ async def schedule_workflow_execution(
         )
         raise IdempotencyReservationLostException(execution_id=execution_id)
     except PublicationOutcomeUnknownError as unknown_error:
-        # Only reached when the reply was lost AND the message is confirmed on
-        # the stream (or unresolved): the reservation reconciles the outcome
-        # before returning. Recording a failure here would invite a retry that
-        # publishes the same work twice.
-        logger.warning(
-            "Execution %s: publication reply lost (%s) but the message "
-            "is queued; accepted",
-            execution_id,
-            unknown_error.reason,
-        )
+        # A lost reply is not proof of failure: the admission script may have
+        # committed before the connection dropped. Reconcile both fenced and
+        # unfenced publication before recording a failure or deleting S3 input.
+        queued = await redis_producer.execution_is_queued(execution_id)
+        if queued is False:
+            publish_error = PublishFailedError(
+                unknown_error.stream_name,
+                "publication_not_queued",
+            )
+            if compensation_guard is not None:
+                compensation_guard.should_compensate = True
+            logger.error(
+                "Workflow execution %s: scheduling failed",
+                execution_id,
+                extra=scheduling_log_context(publish_error),
+            )
+            await fail_unscheduled_execution(
+                db_session,
+                execution_id=execution_id,
+                workflow_id=workflow_id,
+                organization_id=organization_id,
+                error=publish_error,
+                workflow_version=workflow_version,
+            )
+            raise scheduling_unavailable(execution_id) from unknown_error
+        if queued is None:
+            logger.warning(
+                "Execution %s: publication outcome remains unresolved (%s); "
+                "preserving S3 object because queue state is unconfirmed",
+                execution_id,
+                unknown_error.reason,
+            )
+        else:
+            logger.warning(
+                "Execution %s: publication reply lost (%s) but the message "
+                "is queued; accepted",
+                execution_id,
+                unknown_error.reason,
+            )
     except PublishFailedError as publish_error:
         if compensation_guard is not None:
             compensation_guard.should_compensate = True

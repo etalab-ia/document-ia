@@ -54,10 +54,10 @@ class ReservationLostError(Exception):
 class PublicationOutcomeUnknownError(PublishFailedError):
     """The publication may or may not have been applied.
 
-    Raised when the fenced script's reply is lost (timeout, dropped connection).
-    Redis may have committed the XADD and marked the reservation COMPLETED. The
-    caller must not report a scheduling failure: doing so invites a retry that
-    would publish the same work twice.
+    Raised when a publication reply is lost (timeout, dropped connection).
+    Redis may have committed the XADD; the fenced script may also have marked
+    the reservation COMPLETED. The caller must reconcile the outcome before
+    reporting a scheduling failure or deleting an uploaded input document.
     """
 
     def __init__(self, stream_name: str, reason: str) -> None:
@@ -82,6 +82,9 @@ class Publisher(Generic[T]):
             PublishFailedError: when no connection is available or Redis refuses
                 the write. The exception message never embeds the published
                 payload.
+            PublicationOutcomeUnknownError: when the reply is lost and Redis may
+                already have committed the write. The caller must reconcile the
+                execution id before treating publication as failed.
 
         New workflow messages allocate capacity atomically against both queues.
         Other publications can drain accepted work. Never trim unfinished work.
@@ -116,6 +119,24 @@ class Publisher(Generic[T]):
             logger.info(f"✅ Message published in Redis stream: {message_id}")
 
             return message_id
+        except RedisReplyError as e:
+            # Redis answered and rejected the write, so it definitively did not
+            # happen. Capacity and command failures stay confirmed failures.
+            logger.error(f"❌ Publication rejected by Redis: {e}")
+            raise PublishFailedError(self.stream_name, type(e).__name__) from e
+        except (
+            asyncio.TimeoutError,
+            ConnectionError,
+            RedisConnectionError,
+            RedisTimeoutError,
+        ) as e:
+            # The command may have committed before its reply was lost. Let the
+            # caller reconcile the execution id before reporting a failure or
+            # deleting an uploaded input document.
+            logger.error(f"❌ Publication outcome unknown: {e}")
+            raise PublicationOutcomeUnknownError(
+                self.stream_name, type(e).__name__
+            ) from e
         except Exception as e:
             logger.error(f"❌ Error publishing message in Redis stream: {e}")
             raise PublishFailedError(self.stream_name, type(e).__name__) from e
@@ -224,9 +245,9 @@ class Publisher(Generic[T]):
     async def execution_is_queued(self, execution_id: str) -> bool | None:
         """Report whether a message for `execution_id` is on this stream.
 
-        Resolves an unknown publication outcome: the fenced script's reply may be
-        lost after Redis committed, so presence on the stream is the evidence
-        that the work was actually scheduled.
+        Resolves an unknown publication outcome: the reply may be lost after
+        Redis committed, so presence on the stream is the evidence that the work
+        was actually scheduled.
 
         Paginates through the stream within the global publication timeout
         budget and a page ceiling. Returns None when the stream could not be
