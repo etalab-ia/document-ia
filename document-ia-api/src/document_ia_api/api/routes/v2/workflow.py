@@ -598,7 +598,7 @@ async def execute_workflow_v2(
     workflow_v2_service = WorkflowV2Service(db_session)
     redis_key: str | None = None
     pre_generated_execution_id: str | None = None
-    fingerprint: str = ""
+    fingerprint: str | None = None
 
     if idempotency_key is not None:
         fingerprint = await compute_request_fingerprint(
@@ -686,12 +686,14 @@ async def execute_workflow_v2(
                 )
             except Exception as release_exc:
                 logger.warning(
-                    "Failed to release idempotency key %s: %s", redis_key, release_exc
+                    "Failed to release idempotency key %s: %s",
+                    redis_key,
+                    type(release_exc).__name__,
                 )
         await db_session.rollback()
         if isinstance(exc, (HTTPException, RequestValidationError)):
             raise
-        logger.error("Failed to start workflow v2 execution: %s", exc)
+        logger.error("Failed to start workflow v2 execution: %s", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unexpected error while starting workflow execution",
@@ -705,6 +707,7 @@ async def execute_workflow_v2(
     if (
         redis_key is not None
         and pre_generated_execution_id is not None
+        and fingerprint is not None
         and not (reservation is not None and reservation.outcome_unresolved)
     ):
         await mark_completed_or_retain(

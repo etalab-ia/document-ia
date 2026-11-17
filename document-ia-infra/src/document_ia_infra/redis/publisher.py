@@ -23,6 +23,9 @@ from document_ia_infra.redis.idempotent_publish import IDEMPOTENT_PUBLISH_SCRIPT
 
 logger = logging.getLogger(__name__)
 
+_EXECUTION_LOOKUP_PAGE_SIZE = 1000
+_EXECUTION_LOOKUP_MAX_PAGES = 100
+
 T = TypeVar("T", bound=SerializableMessage)
 
 
@@ -51,10 +54,10 @@ class ReservationLostError(Exception):
 class PublicationOutcomeUnknownError(PublishFailedError):
     """The publication may or may not have been applied.
 
-    Raised when the fenced script's reply is lost (timeout, dropped connection).
-    Redis may have committed the XADD and marked the reservation COMPLETED. The
-    caller must not report a scheduling failure: doing so invites a retry that
-    would publish the same work twice.
+    Raised when a publication reply is lost (timeout, dropped connection).
+    Redis may have committed the XADD; the fenced script may also have marked
+    the reservation COMPLETED. The caller must reconcile the outcome before
+    reporting a scheduling failure or deleting an uploaded input document.
     """
 
     def __init__(self, stream_name: str, reason: str) -> None:
@@ -79,6 +82,9 @@ class Publisher(Generic[T]):
             PublishFailedError: when no connection is available or Redis refuses
                 the write. The exception message never embeds the published
                 payload.
+            PublicationOutcomeUnknownError: when the reply is lost and Redis may
+                already have committed the write. The caller must reconcile the
+                execution id before treating publication as failed.
 
         New workflow messages allocate capacity atomically against both queues.
         Other publications can drain accepted work. Never trim unfinished work.
@@ -113,6 +119,24 @@ class Publisher(Generic[T]):
             logger.info(f"✅ Message published in Redis stream: {message_id}")
 
             return message_id
+        except RedisReplyError as e:
+            # Redis answered and rejected the write, so it definitively did not
+            # happen. Capacity and command failures stay confirmed failures.
+            logger.error(f"❌ Publication rejected by Redis: {e}")
+            raise PublishFailedError(self.stream_name, type(e).__name__) from e
+        except (
+            asyncio.TimeoutError,
+            ConnectionError,
+            RedisConnectionError,
+            RedisTimeoutError,
+        ) as e:
+            # The command may have committed before its reply was lost. Let the
+            # caller reconcile the execution id before reporting a failure or
+            # deleting an uploaded input document.
+            logger.error(f"❌ Publication outcome unknown: {e}")
+            raise PublicationOutcomeUnknownError(
+                self.stream_name, type(e).__name__
+            ) from e
         except Exception as e:
             logger.error(f"❌ Error publishing message in Redis stream: {e}")
             raise PublishFailedError(self.stream_name, type(e).__name__) from e
@@ -221,12 +245,14 @@ class Publisher(Generic[T]):
     async def execution_is_queued(self, execution_id: str) -> bool | None:
         """Report whether a message for `execution_id` is on this stream.
 
-        Resolves an unknown publication outcome: the fenced script's reply may be
-        lost after Redis committed, so presence on the stream is the evidence
-        that the work was actually scheduled.
+        Resolves an unknown publication outcome: the reply may be lost after
+        Redis committed, so presence on the stream is the evidence that the work
+        was actually scheduled.
 
-        Returns None when the stream could not be read. That must not be
-        confused with absence: the outcome is still unresolved.
+        Paginates through the stream within the global publication timeout
+        budget and a page ceiling. Returns None when the stream could not be
+        read exhaustively (connection error, timeout, or truncated scan). That
+        must not be confused with absence: the outcome is still unresolved.
         """
         try:
             connection = await self.current_redis_manager.get_connection()
@@ -234,35 +260,73 @@ class Publisher(Generic[T]):
             return None
         if connection is None:
             return None
-        try:
-            # Bounded like the publication itself: a stalled Redis would
-            # otherwise hold the request, its pooled connection and the
-            # reservation renewal open on this read.
-            entries = await asyncio.wait_for(
-                cast(
-                    Awaitable[Any],
-                    connection.xrange(  # type: ignore[UnknownMemberType]
-                        self.stream_name, min="-", max="+", count=1000
-                    ),
-                ),
-                timeout=redis_settings.PUBLISH_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Unable to inspect stream %s to reconcile execution %s: %s; "
-                "outcome remains unresolved",
-                self.stream_name,
-                execution_id,
-                exc,
-            )
-            return None
-        for _entry_id, fields in entries:
-            raw = fields.get("data")
-            if not raw:
-                continue
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + redis_settings.PUBLISH_TIMEOUT_SECONDS
+        cursor = "-"
+        page_size = _EXECUTION_LOOKUP_PAGE_SIZE
+
+        for _ in range(_EXECUTION_LOOKUP_MAX_PAGES):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    "Timed out scanning stream %s to reconcile execution %s; "
+                    "outcome remains unresolved",
+                    self.stream_name,
+                    execution_id,
+                )
+                return None
+
             try:
-                if json.loads(raw).get("workflow_execution_id") == execution_id:
-                    return True
-            except ValueError, AttributeError:
-                continue
-        return False
+                # Bounded by the remaining publication budget: a stalled Redis
+                # would otherwise hold the request, its pooled connection and
+                # the reservation renewal open on this read.
+                entries = await asyncio.wait_for(
+                    cast(
+                        Awaitable[Any],
+                        connection.xrange(  # type: ignore[UnknownMemberType]
+                            self.stream_name, min=cursor, max="+", count=page_size
+                        ),
+                    ),
+                    timeout=remaining,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Unable to inspect stream %s to reconcile execution %s: %s; "
+                    "outcome remains unresolved",
+                    self.stream_name,
+                    execution_id,
+                    exc,
+                )
+                return None
+
+            if not entries:
+                return False
+
+            for _entry_id, fields in entries:
+                raw = fields.get("data") or fields.get(b"data")
+                if not raw:
+                    continue
+                try:
+                    if json.loads(raw).get("workflow_execution_id") == execution_id:
+                        return True
+                except ValueError, AttributeError:
+                    continue
+
+            if len(entries) < page_size:
+                return False
+
+            last_id = entries[-1][0]
+            last_id_str = (
+                last_id.decode("utf-8") if isinstance(last_id, bytes) else str(last_id)
+            )
+            cursor = f"({last_id_str}"
+
+        logger.warning(
+            "Exceeded max lookup pages (%d) scanning stream %s to reconcile "
+            "execution %s; outcome remains unresolved",
+            _EXECUTION_LOOKUP_MAX_PAGES,
+            self.stream_name,
+            execution_id,
+        )
+        return None

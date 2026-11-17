@@ -13,6 +13,7 @@ from document_ia_infra.exception.retryable_exception import RetryableException
 from document_ia_infra.s3.s3_manager import S3Manager
 from document_ia_worker.workflow.step.download_file.download_file import (
     DownloadFileStep,
+    DownloadFileStepException,
 )
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
@@ -136,8 +137,9 @@ class TestDownloadFileStepIntegration:
 
     @pytest.mark.skipif(not _ensure_s3_available(), reason="S3 not available")
     @pytest.mark.asyncio
-    async def test_download_file_step_missing_key_raises_retryable(self, tmp_path, main_workflow_context):
-
+    async def test_download_file_step_missing_key_raises_non_retryable_404(
+        self, tmp_path, main_workflow_context
+    ):
         # Nonexistent key
         key = f"integration/tests/{uuid4()}/missing.pdf"
 
@@ -150,11 +152,17 @@ class TestDownloadFileStepIntegration:
             presigned_url="",
         )
 
-        step = DownloadFileStep(main_workflow_context=main_workflow_context, file_info=file_info)
+        step = DownloadFileStep(
+            main_workflow_context=main_workflow_context, file_info=file_info
+        )
 
         # Preparation creates the temporary folder even if the download fails
-        with pytest.raises(RetryableException):
+        with pytest.raises(DownloadFileStepException) as exc_info:
             await step.execute()
+
+        assert not isinstance(exc_info.value, RetryableException)
+        assert exc_info.value.http_status_code == 404
+        assert key not in str(exc_info.value)
 
         tmp_dir = Path(step.tmp_folder_path)
         assert tmp_dir.exists(), "Temporary folder should exist after _prepare_step"

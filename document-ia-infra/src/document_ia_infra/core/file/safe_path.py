@@ -1,12 +1,17 @@
 """Filesystem confinement utilities for Document IA."""
 
 import errno
-import stat
 import logging
 import os
+import stat
 from pathlib import Path
 from typing import IO
 from uuid import UUID
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
 
 from document_ia_infra.exception.security_exception import (
     InvalidUUIDException,
@@ -37,6 +42,11 @@ class ConfinedDirectory:
         self._fd = fd
         self.path = path
 
+    @property
+    def fd(self) -> int:
+        """The underlying file descriptor."""
+        return self._fd
+
     def __enter__(self) -> "ConfinedDirectory":
         return self
 
@@ -54,9 +64,10 @@ class ConfinedDirectory:
             raise PathTraversalException(
                 f"Refusing nested or relative name inside sandbox: {name!r}"
             )
-        flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_CLOEXEC
+        flags: int = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_CLOEXEC
         if "b" not in mode:
-            flags |= os.O_BINARY if hasattr(os, "O_BINARY") else 0
+            o_binary: int = int(getattr(os, "O_BINARY", 0))
+            flags |= o_binary
         fd = os.open(name, flags, 0o600, dir_fd=self._fd)
         return os.fdopen(fd, mode)
 
@@ -85,6 +96,39 @@ class ConfinedDirectory:
             pass
 
 
+def _fd_path(fd: int) -> Path | None:
+    try:
+        if fcntl is not None and hasattr(fcntl, "F_GETPATH"):
+            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024)
+            return Path(raw.split(b"\x00", 1)[0].decode("utf-8"))
+        return Path(os.readlink(f"/proc/self/fd/{fd}"))
+    except OSError, ValueError:
+        return None
+
+
+def _is_symlink_open_error(
+    exc: OSError,
+    target: Path | str,
+    *,
+    dir_fd: int | None = None,
+) -> bool:
+    """Return True only when an O_DIRECTORY|O_NOFOLLOW open failed due to a symlink.
+
+    Regular files fail O_DIRECTORY with ENOTDIR (NotADirectoryError) and must
+    propagate as NotADirectoryError so callers such as safe_cleanup_directory()
+    can handle non-directory targets without misclassifying them as traversals.
+    """
+    if exc.errno == errno.ELOOP:
+        return True
+    if exc.errno != errno.ENOTDIR:
+        return False
+    try:
+        st = os.stat(target, dir_fd=dir_fd, follow_symlinks=False)
+        return stat.S_ISLNK(st.st_mode)
+    except OSError:
+        return False
+
+
 def open_confined_directory(
     directory_path: Path | str,
     sandbox_root: Path | str,
@@ -95,38 +139,60 @@ def open_confined_directory(
         PathTraversalException: if the directory escapes the sandbox, or if any
             component was replaced by a symlink.
     """
-    # The boundary is taken as given (it is built as `<base>/<execution_id>`, not
-    # derived from the filesystem) and is only normalised lexically. Resolving it
-    # would adopt whatever a symlink points at, which is exactly how a replaced
-    # execution directory escaped. The real guarantee is the O_NOFOLLOW open plus
-    # the descriptor check below.
     root_path = Path(sandbox_root)
+    if root_path.is_symlink():
+        raise PathTraversalException(f"Sandbox root {root_path} is a symlink")
     root_resolved = Path(os.path.normpath(root_path.absolute()))
     resolved = validate_safe_path(directory_path, root_resolved)
+    rel_parts = resolved.relative_to(root_resolved).parts
+
+    open_flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC
     try:
-        fd = os.open(
-            resolved,
-            os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC,
-        )
+        current_fd = os.open(root_resolved, open_flags)
     except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+        if _is_symlink_open_error(exc, root_resolved):
             raise PathTraversalException(
-                f"Sandbox directory {resolved} was replaced by a symlink"
+                f"Sandbox root {root_resolved} is a symlink"
             ) from exc
         raise
 
-    # Re-check confinement on the descriptor actually held, against the boundary
-    # captured before the open: a parent swapped in between then disagrees.
     try:
-        held = Path(os.readlink(f"/proc/self/fd/{fd}"))
-    except OSError:
-        held = resolved
-    if not held.is_relative_to(root_resolved):
-        os.close(fd)
-        raise PathTraversalException(
-            f"Sandbox directory {held} escapes sandbox {root_resolved}"
-        )
-    return ConfinedDirectory(fd, held)
+        root_stat = os.fstat(current_fd)
+        path_stat = os.stat(root_resolved, follow_symlinks=False)
+        if (root_stat.st_dev, root_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+            raise PathTraversalException(
+                f"Sandbox root {root_resolved} was swapped during open"
+            )
+
+        for part in rel_parts:
+            try:
+                next_fd = os.open(part, open_flags, dir_fd=current_fd)
+            except OSError as exc:
+                if _is_symlink_open_error(exc, part, dir_fd=current_fd):
+                    raise PathTraversalException(
+                        f"Sandbox directory component {part!r} in {resolved} was replaced by a symlink"
+                    ) from exc
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+
+        held = _fd_path(current_fd)
+        if held is None:
+            raise PathTraversalException(
+                f"Cannot verify path confinement descriptor for {resolved}"
+            )
+        # O_NOFOLLOW covers only the final path component. An ancestor replaced
+        # by a symlink changes the descriptor's real path, so comparing with the
+        # opened root would adopt the attacker's redirected location as the new
+        # boundary. The original lexical root remains the confinement boundary.
+        if not held.is_relative_to(root_resolved):
+            raise PathTraversalException(
+                f"Sandbox directory {held} escapes sandbox {root_resolved}"
+            )
+        return ConfinedDirectory(current_fd, held)
+    except BaseException:
+        os.close(current_fd)
+        raise
 
 
 def validate_execution_id(execution_id: str) -> UUID:
@@ -313,7 +379,7 @@ def safe_cleanup_directory(
 
     parent_fd = -1
     try:
-        _remove_tree_relative(confined._fd)
+        _remove_tree_relative(confined.fd)
         # Remove the directory itself through its parent, still no-follow.
         parent_fd = os.open(
             os.path.dirname(confined.path) or ".",

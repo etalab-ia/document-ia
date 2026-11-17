@@ -178,18 +178,17 @@ async def test_transport_bounds_dns_with_the_client_timeout():
     original = SafeAsyncHTTPTransport.handle_async_request
 
     async def capture(self, request):
-        seen_timeout.append(
-            (request.extensions.get("timeout") or {}).get("connect")
-        )
+        seen_timeout.append((request.extensions.get("timeout") or {}).get("connect"))
         return await original(self, request)
 
     transport = SafeAsyncHTTPTransport()
     async with httpx.AsyncClient(transport=transport) as client:
-        with patch(
-            "document_ia_infra.core.network.safe_transport.resolve_validated_ips",
-            new=hanging_resolution,
-        ), patch.object(
-            SafeAsyncHTTPTransport, "handle_async_request", capture
+        with (
+            patch(
+                "document_ia_infra.core.network.safe_transport.resolve_validated_ips",
+                new=hanging_resolution,
+            ),
+            patch.object(SafeAsyncHTTPTransport, "handle_async_request", capture),
         ):
             with pytest.raises(httpx.ConnectTimeout):
                 await client.get("https://slow.example.com/doc.pdf", timeout=0.2)
@@ -665,9 +664,7 @@ def test_cleanup_never_deletes_through_a_replaced_directory(tmp_path: Path):
     execution_dir = sandbox / "exec3"
     execution_dir.symlink_to(outside, target_is_directory=True)
 
-    safe_cleanup_directory(
-        execution_dir / "preprocess", sandbox_root=execution_dir
-    )
+    safe_cleanup_directory(execution_dir / "preprocess", sandbox_root=execution_dir)
 
     assert kept.exists(), "cleanup deleted a file outside the sandbox"
 
@@ -693,6 +690,52 @@ def test_open_confined_directory_refuses_a_replaced_sandbox_root(tmp_path: Path)
 
     with pytest.raises(PathTraversalException):
         open_confined_directory(replaced_root / "sub", replaced_root)
+
+
+def test_sandbox_ancestor_symlink_cannot_redirect_open_or_cleanup(tmp_path: Path):
+    """A replaced ancestor must not move the accepted boundary outside the sandbox."""
+    from document_ia_infra.core.file.safe_path import (
+        open_confined_directory,
+        safe_cleanup_directory,
+    )
+    from document_ia_infra.exception.security_exception import PathTraversalException
+
+    parent = tmp_path / "parent"
+    sandbox = parent / "sandbox"
+    execution = sandbox / "execution"
+    execution.mkdir(parents=True)
+
+    outside_parent = tmp_path / "outside-parent"
+    outside_execution = outside_parent / "sandbox" / "execution"
+    outside_execution.mkdir(parents=True)
+    kept = outside_execution / "KEEP.txt"
+    kept.write_text("must survive")
+
+    parent.rename(tmp_path / "original-parent")
+    parent.symlink_to(outside_parent, target_is_directory=True)
+
+    safe_cleanup_directory(execution, sandbox_root=sandbox)
+    assert kept.exists(), "cleanup followed a redirected ancestor outside the sandbox"
+
+    with pytest.raises(PathTraversalException):
+        open_confined_directory(execution, sandbox)
+
+
+def test_open_confined_directory_fails_closed_when_fd_path_fails(tmp_path: Path):
+    """If fd path cannot be inspected (e.g. F_GETPATH / proc unavailable), it must fail closed."""
+    from document_ia_infra.core.file.safe_path import open_confined_directory
+    from document_ia_infra.exception.security_exception import PathTraversalException
+
+    sandbox = tmp_path / "sandbox_fail_closed"
+    sandbox.mkdir()
+    sub = sandbox / "sub"
+    sub.mkdir()
+
+    with patch("document_ia_infra.core.file.safe_path._fd_path", return_value=None):
+        with pytest.raises(
+            PathTraversalException, match="Cannot verify path confinement"
+        ):
+            open_confined_directory(sub, sandbox)
 
 
 @pytest.mark.asyncio
@@ -946,3 +989,25 @@ def test_root_is_not_canonicalised_so_a_swap_cannot_redirect_it(tmp_path: Path):
 
     assert document.exists(), "cleanup followed a swapped root into a sibling"
     assert victim.exists()
+
+
+def test_open_confined_directory_raises_not_a_directory_on_regular_file(tmp_path: Path):
+    """A regular file must surface NotADirectoryError rather than PathTraversalException."""
+    from document_ia_infra.core.file.safe_path import (
+        open_confined_directory,
+        safe_cleanup_directory,
+    )
+
+    sandbox = tmp_path / "sandbox_regular_file"
+    sandbox.mkdir()
+    regular_file = sandbox / "not_a_dir.txt"
+    regular_file.write_text("content")
+
+    with pytest.raises(NotADirectoryError):
+        open_confined_directory(regular_file, sandbox)
+
+    with pytest.raises(NotADirectoryError):
+        open_confined_directory(regular_file, regular_file)
+
+    safe_cleanup_directory(regular_file, sandbox_root=sandbox)
+    assert not regular_file.exists()

@@ -141,6 +141,7 @@ class TestWorkflowManager:
     ):
         """Test avec une exception générique non gérée (TypeError par ex)."""
         manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        manager.event_dto = MagicMock()
 
         with (
             patch.object(
@@ -152,6 +153,9 @@ class TestWorkflowManager:
             patch.object(
                 manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
             ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
         ):
             with pytest.raises(TypeError, match="Generic Error"):
                 await manager.start()
@@ -162,6 +166,9 @@ class TestWorkflowManager:
 
             # Should save failure event
             mock_save_fail.assert_called_once()
+
+            # Terminal failure must purge S3
+            mock_purge_s3.assert_awaited_once()
 
             # Should handle finish execution with success=False
             mock_dependencies["handle_finish"].assert_called_once()
@@ -181,6 +188,7 @@ class TestWorkflowManager:
     ):
         """Test avec une WorkflowStepException (non retryable inner exception)."""
         manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        manager.event_dto = MagicMock()
 
         inner_error = ValueError("Bad value")
         step_error = WorkflowStepException("step_x", inner_error)
@@ -193,6 +201,9 @@ class TestWorkflowManager:
             patch.object(
                 manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
             ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
         ):
             # Should raise the inner exception
             with pytest.raises(ValueError, match="Bad value"):
@@ -206,6 +217,9 @@ class TestWorkflowManager:
                 mock_db_manager.return_value.local_session.return_value.__aenter__.return_value,
                 step_error,
             )
+
+            # Non-retryable failure must purge S3
+            mock_purge_s3.assert_awaited_once()
 
             # Handle finish log
             mock_dependencies["handle_finish"].assert_called_once()
@@ -223,6 +237,7 @@ class TestWorkflowManager:
         manager = WorkflowManager(
             mock_workflow_message, retry_count=0, is_last_retry=False
         )
+        manager.event_dto = MagicMock()
 
         inner_error = RetryableException("Try again")
         step_error = WorkflowStepException("step_y", inner_error)
@@ -235,6 +250,9 @@ class TestWorkflowManager:
             patch.object(
                 manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
             ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
         ):
             with pytest.raises(RetryableException, match="Try again"):
                 await manager.start()
@@ -243,6 +261,9 @@ class TestWorkflowManager:
             mock_notify.assert_not_called()
 
             mock_save_fail.assert_called_once()
+
+            # Intermediate retryable failure must NOT purge S3
+            mock_purge_s3.assert_not_awaited()
 
             # Handle finish log
             mock_dependencies["handle_finish"].assert_called_once()
@@ -258,6 +279,7 @@ class TestWorkflowManager:
         manager = WorkflowManager(
             mock_workflow_message, retry_count=3, is_last_retry=True
         )
+        manager.event_dto = MagicMock()
 
         inner_error = RetryableException("Give up")
         step_error = WorkflowStepException("step_z", inner_error)
@@ -270,6 +292,9 @@ class TestWorkflowManager:
             patch.object(
                 manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
             ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
         ):
             with pytest.raises(RetryableException, match="Give up"):
                 await manager.start()
@@ -278,6 +303,9 @@ class TestWorkflowManager:
             mock_notify.assert_called_once()
 
             mock_save_fail.assert_called_once()
+
+            # Last retry failure must purge S3
+            mock_purge_s3.assert_awaited_once()
 
             # Handle finish log
             mock_dependencies["handle_finish"].assert_called_once()
