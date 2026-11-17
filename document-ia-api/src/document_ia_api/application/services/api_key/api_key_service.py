@@ -112,9 +112,18 @@ class ApiKeyService:
                 return None
 
             if self.api_key_helper.verify_api_key(presented_key, api_key_dto):
+                if self.api_key_helper.is_legacy_v1_key(presented_key):
+                    logger.warning(
+                        "Authenticated with legacy v1 API key (id=%s, prefix=%s, organization_id=%s); schedule rotation to v2",
+                        api_key_dto.id,
+                        api_key_dto.prefix,
+                        api_key_dto.organization_id,
+                    )
                 return api_key_dto
             else:
                 return None
+        except ValueError:
+            return None
         except Exception as e:
             logger.error("Error verifying API key: %s", type(e).__name__)
             return None

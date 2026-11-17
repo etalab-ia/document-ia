@@ -5,6 +5,7 @@ Technical README for the API subproject: setup, configuration, build, and useful
 ## Documentation API
 
 - **API summary (entry point)**: [docs/API_SUMMARY.md](./docs/API_SUMMARY.md)
+- **Authentication & API keys**: [docs/AUTHENTICATION.md](./docs/AUTHENTICATION.md)
 - **Workflow Idempotency-Key**: [docs/WORKFLOW_IDEMPOTENCY_KEY.md](./docs/WORKFLOW_IDEMPOTENCY_KEY.md)
 - **Security (file confinement & anti-SSRF)**: [docs/SECURITY_FILE_NETWORK.md](./docs/SECURITY_FILE_NETWORK.md)
 
@@ -34,7 +35,8 @@ Main API variables:
 | `BASE_URL` | `""` | External API base URL |
 | `AUTO_MIGRATE` | `true` | Run Alembic migrations on startup |
 | `APP_ENV` | `prod` | Runtime environment (also affects API key format) |
-| `API_KEY_VERSION` | `1` | API key format version |
+| `API_KEY_VERSION` | `2` | API key format version (`1` legacy or `2` cryptographically bound) |
+| `API_KEY_ALLOW_V1` | `true` | Allow legacy `v1` keys during the 20-day rotation window |
 | `API_KEY_PEPPER_HASH` | `default_pepper_hash_value` | Pepper used to hash API keys |
 | `API_KEY_PEPPER_CHK` | `default_pepper_chk_value` | Pepper used for API key checksum |
 | `DOCUMENT_IA_API_KEY` | `""` | Initial `PlatformAdmin` organization API key (seeded during Alembic migration) |
