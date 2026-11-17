@@ -1011,3 +1011,89 @@ def test_open_confined_directory_raises_not_a_directory_on_regular_file(tmp_path
 
     safe_cleanup_directory(regular_file, sandbox_root=sandbox)
     assert not regular_file.exists()
+
+
+def test_open_confined_directory_blocks_toctou_root_swap_on_subdir(tmp_path: Path):
+    """If sandbox_root is swapped for a symlink to an outside directory containing
+
+    a matching subdirectory before opening the subdirectory, open_confined_directory
+    must reject it and raise PathTraversalException rather than resolving both sides.
+    """
+    import os
+    import shutil
+    from document_ia_infra.core.file.safe_path import (
+        PathTraversalException,
+        open_confined_directory,
+    )
+
+    base = tmp_path / "sandbox"
+    base.mkdir()
+    execution_dir = base / str(uuid4())
+    execution_dir.mkdir()
+    subdir = execution_dir / "preprocess"
+    subdir.mkdir()
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_subdir = outside_dir / "preprocess"
+    outside_subdir.mkdir()
+    secret = outside_subdir / "secret.txt"
+    secret.write_text("critical host data")
+
+    real_os_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and str(path) == str(execution_dir):
+            swapped = True
+            shutil.rmtree(execution_dir)
+            execution_dir.symlink_to(outside_dir, target_is_directory=True)
+        return real_os_open(path, flags, *args, **kwargs)
+
+    with patch("os.open", side_effect=swapping_open):
+        with pytest.raises(PathTraversalException):
+            open_confined_directory(subdir, sandbox_root=execution_dir)
+
+    assert secret.exists(), "outside secret must not be affected"
+    assert secret.read_text() == "critical host data"
+
+
+def test_safe_cleanup_directory_on_regular_file(tmp_path: Path):
+    """safe_cleanup_directory must unlink a confined regular file and return True."""
+    from document_ia_infra.core.file.safe_path import safe_cleanup_directory
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    regular_file = sandbox / "file.txt"
+    regular_file.write_text("hello", encoding="utf-8")
+
+    result = safe_cleanup_directory(regular_file, sandbox_root=sandbox)
+
+    assert result is True
+    assert not regular_file.exists()
+
+
+def test_cleanup_never_deletes_symlink_inside_replaced_sandbox_root(tmp_path: Path):
+    """If sandbox_root is replaced by a symlink to an outside directory containing a symlink,
+    safe_cleanup_directory must refuse and never delete the outside symlink.
+    """
+    from document_ia_infra.core.file.safe_path import safe_cleanup_directory
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target_file = outside / "secret.txt"
+    target_file.write_text("secret", encoding="utf-8")
+    outside_link = outside / "preprocess"
+    outside_link.symlink_to(target_file)
+
+    execution_dir = tmp_path / str(uuid4())
+    execution_dir.symlink_to(outside, target_is_directory=True)
+
+    result = safe_cleanup_directory(
+        execution_dir / "preprocess", sandbox_root=execution_dir
+    )
+
+    assert result is False
+    assert outside_link.is_symlink(), "Outside symlink must not be deleted"
+    assert target_file.exists()

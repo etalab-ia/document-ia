@@ -60,11 +60,15 @@ async def test_notify_watchdog_terminal_failure_skips_payload_less_message():
     assert _FakeManager.instances == []
 
 
-def _event(event_type: str, payload: dict[str, Any] | None = None) -> Any:
+def _event(
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+    execution_id: str | None = None,
+) -> Any:
     return SimpleNamespace(
         event_type=event_type,
         event={} if payload is None else payload,
-        execution_id=f"exec-{uuid4()}",
+        execution_id=execution_id if execution_id is not None else str(uuid4()),
         workflow_id=f"wf-{uuid4()}",
         organization_id=uuid4(),
     )
@@ -166,9 +170,12 @@ def _patch_workflow_resources(monkeypatch):
 async def test_terminal_failure_writes_and_releases_resources(
     _patch_workflow_resources,
 ):
-    _FakeEventStoreService.last_event = _event("WorkflowExecutionStarted")
+    valid_exec_id = str(uuid4())
+    _FakeEventStoreService.last_event = _event(
+        "WorkflowExecutionStarted", execution_id=valid_exec_id
+    )
     manager = WorkflowManager(
-        WorkflowExecutionMessage(workflow_execution_id="exec-1"),
+        WorkflowExecutionMessage(workflow_execution_id=valid_exec_id),
         2,
         is_last_retry=True,
     )
@@ -186,9 +193,12 @@ async def test_terminal_failure_releases_resources_on_terminal_shortcut(
     _patch_workflow_resources,
 ):
     """Sur une exécution déjà terminée, les ressources sont libérées sans rien écrire."""
-    _FakeEventStoreService.last_event = _event("WorkflowExecutionCompleted")
+    valid_exec_id = str(uuid4())
+    _FakeEventStoreService.last_event = _event(
+        "WorkflowExecutionCompleted", execution_id=valid_exec_id
+    )
     manager = WorkflowManager(
-        WorkflowExecutionMessage(workflow_execution_id="exec-1"),
+        WorkflowExecutionMessage(workflow_execution_id=valid_exec_id),
         2,
         is_last_retry=True,
     )
