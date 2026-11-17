@@ -10,7 +10,7 @@ pattern used by organization tests. These tests exercise:
 
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from document_ia_infra.data.webhook.dto.webhook_dto import WebHookDTO
 
@@ -125,6 +125,9 @@ class TestDeleteWebhook:
 
             assert resp.status_code == 204
             assert resp.text == ""
+            mock_repo.delete.assert_awaited_once_with(
+                webhook_id, organization_id=UUID(str(organization_id))
+            )
 
     def test_delete_webhook_not_found(self, client_with_api_key_admin, admin_api_key_value, organization_id):
         webhook_id = uuid4()
@@ -143,3 +146,26 @@ class TestDeleteWebhook:
             assert resp.status_code == 404
             data = resp.json()
             assert data["status"] == 404
+
+
+    def test_delete_webhook_cross_organization_returns_404(
+        self, client_with_api_key_admin, admin_api_key_value
+    ):
+        webhook_id = uuid4()
+        other_organization_id = uuid4()
+
+        with patch(
+            "document_ia_api.application.services.webhook.webhook_service.WebHookRepository"
+        ) as mock_repo_cls:
+            mock_repo = mock_repo_cls.return_value
+            mock_repo.delete = AsyncMock(return_value=False)
+
+            resp = client_with_api_key_admin.delete(
+                f"/api/v1/admin/organizations/{other_organization_id}/webhooks/{webhook_id}",
+                headers={"X-API-KEY": admin_api_key_value},
+            )
+
+            assert resp.status_code == 404
+            mock_repo.delete.assert_awaited_once_with(
+                webhook_id, organization_id=other_organization_id
+            )

@@ -231,7 +231,7 @@ async def delete_webhook(
     logger.info(f"Deleting webhook {webhook_id} for organization {organization_id}")
     try:
         service = WebHookService(db_session)
-        await service.delete(webhook_id)
+        await service.delete(webhook_id, organization_id=organization_id)
         return None
     except HttpEntityNotFoundException:
         raise

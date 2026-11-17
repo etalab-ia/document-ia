@@ -53,11 +53,12 @@ class WebHookRepository:
         entities = result.scalars().all()
         return [entity_to_dto(entity) for entity in entities]
 
-    async def delete(self, webhook_id: UUID) -> bool:
-        result = await self.session.execute(
-            delete(WebHookEntity)
-            .where(WebHookEntity.id == webhook_id)
-            .returning(WebHookEntity.id)
-        )
+    async def delete(
+        self, webhook_id: UUID, organization_id: UUID | None = None
+    ) -> bool:
+        stmt = delete(WebHookEntity).where(WebHookEntity.id == webhook_id)
+        if organization_id is not None:
+            stmt = stmt.where(WebHookEntity.organization_id == organization_id)
+        result = await self.session.execute(stmt.returning(WebHookEntity.id))
         deleted_ids = result.scalars().all()
         return len(deleted_ids) > 0
