@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import sys
 import tempfile
 import urllib.parse
@@ -44,6 +43,15 @@ YOLOWORLD_ARTIFACT: Final[ModelArtifactSpec] = ModelArtifactSpec(
     size_bytes=58_610_242,
 )
 
+CLIP_ARTIFACT: Final[ModelArtifactSpec] = ModelArtifactSpec(
+    key="clip",
+    name="ViT-B-32.pt",
+    url="https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt",
+    relative_path="clip/ViT-B-32.pt",
+    sha256="40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af",
+    size_bytes=353_976_522,
+)
+
 QRDET_ARTIFACT: Final[ModelArtifactSpec] = ModelArtifactSpec(
     key="qrdet",
     name="qrdet-s.pt",
@@ -64,6 +72,7 @@ TESSERACT_FRA_ARTIFACT: Final[ModelArtifactSpec] = ModelArtifactSpec(
 
 MODEL_ARTIFACTS: Final[tuple[ModelArtifactSpec, ...]] = (
     YOLOWORLD_ARTIFACT,
+    CLIP_ARTIFACT,
     QRDET_ARTIFACT,
     TESSERACT_FRA_ARTIFACT,
 )
@@ -79,11 +88,28 @@ _SYSTEM_TESSDATA_DIRS: Final[tuple[Path, ...]] = (
     Path("/usr/local/share/tessdata"),
 )
 
+_ALLOWED_DOWNLOAD_HOSTS: Final[frozenset[str]] = frozenset(
+    {
+        "github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "openaipublic.azureedge.net",
+    }
+)
+
 _CHUNK_SIZE: Final[int] = 1024 * 1024
 _DOWNLOAD_TIMEOUT_S: Final[int] = 120
 
 # Cache of verified files keyed by (resolved_path_str, st_mtime_ns, st_size, expected_sha256)
 _VERIFIED_FILES_CACHE: set[tuple[str, int, int, str]] = set()
+
+
+def get_default_models_dir() -> Path:
+    """Return the default models directory, respecting `MODELS_DIR` if set."""
+    env_dir = os.environ.get("MODELS_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    return DEFAULT_MODELS_DIR
 
 
 def clear_verification_cache() -> None:
@@ -94,9 +120,14 @@ def clear_verification_cache() -> None:
 def compute_file_sha256(path: Path) -> str:
     """Compute the lowercase hexadecimal SHA-256 digest of a file."""
     hasher = hashlib.sha256()
-    with path.open("rb") as fh:
-        while chunk := fh.read(_CHUNK_SIZE):
-            hasher.update(chunk)
+    try:
+        with path.open("rb") as fh:
+            while chunk := fh.read(_CHUNK_SIZE):
+                hasher.update(chunk)
+    except OSError as exc:
+        raise ModelArtifactIntegrityError(
+            f"Unable to read model artifact at '{path}': {exc}"
+        ) from exc
     return hasher.hexdigest().lower()
 
 
@@ -104,10 +135,12 @@ def verify_file_sha256(
     path: Path,
     expected_sha256: str,
     artifact_name: str,
+    expected_size_bytes: int | None = None,
 ) -> Path:
     """Verify that `path` exists, is a regular file, and matches `expected_sha256`.
 
-    Raises `ModelArtifactIntegrityError` if the file is missing or its digest does not match.
+    Raises `ModelArtifactIntegrityError` if the file is missing, its size differs,
+    or its digest does not match.
     """
     normalized_expected = expected_sha256.strip().lower()
     if not path.exists() or not path.is_file():
@@ -125,6 +158,12 @@ def verify_file_sha256(
         raise ModelArtifactIntegrityError(
             f"Unable to stat model artifact '{artifact_name}' at '{path}': {exc}"
         ) from exc
+
+    if expected_size_bytes is not None and stat_res.st_size != expected_size_bytes:
+        raise ModelArtifactIntegrityError(
+            f"Size check failed for model artifact '{artifact_name}' at '{path}': "
+            f"expected {expected_size_bytes} bytes, got {stat_res.st_size} bytes."
+        )
 
     cache_key = (
         str(resolved),
@@ -186,12 +225,32 @@ def resolve_and_verify_yoloworld_path(models_dir: Path | None = None) -> Path:
         if env_path:
             candidate = Path(env_path)
         else:
-            candidate = DEFAULT_MODELS_DIR / YOLOWORLD_ARTIFACT.relative_path
+            candidate = get_default_models_dir() / YOLOWORLD_ARTIFACT.relative_path
 
     return verify_file_sha256(
         candidate,
         YOLOWORLD_ARTIFACT.sha256,
         YOLOWORLD_ARTIFACT.name,
+        expected_size_bytes=YOLOWORLD_ARTIFACT.size_bytes,
+    )
+
+
+def resolve_and_verify_clip_path(models_dir: Path | None = None) -> Path:
+    """Resolve the CLIP ViT-B/32 weights file path and verify its SHA-256 before loading."""
+    if models_dir is not None:
+        candidate = models_dir / CLIP_ARTIFACT.relative_path
+    else:
+        env_path = os.environ.get("CLIP_WEIGHTS_PATH", "").strip()
+        if env_path:
+            candidate = Path(env_path)
+        else:
+            candidate = get_default_models_dir() / CLIP_ARTIFACT.relative_path
+
+    return verify_file_sha256(
+        candidate,
+        CLIP_ARTIFACT.sha256,
+        CLIP_ARTIFACT.name,
+        expected_size_bytes=CLIP_ARTIFACT.size_bytes,
     )
 
 
@@ -221,13 +280,14 @@ def resolve_and_verify_qrdet_dir(
         if env_dir:
             qrdet_dir = Path(env_dir)
         else:
-            qrdet_dir = DEFAULT_MODELS_DIR / "qrdet"
+            qrdet_dir = get_default_models_dir() / "qrdet"
 
     weights_path = qrdet_dir / QRDET_ARTIFACT.name
     verify_file_sha256(
         weights_path,
         QRDET_ARTIFACT.sha256,
         QRDET_ARTIFACT.name,
+        expected_size_bytes=QRDET_ARTIFACT.size_bytes,
     )
     _ensure_qrdet_release_marker(qrdet_dir, allow_write=False)
     return qrdet_dir
@@ -247,6 +307,7 @@ def resolve_and_verify_tesseract_lang_data(
             candidate,
             TESSERACT_FRA_ARTIFACT.sha256,
             TESSERACT_FRA_ARTIFACT.name,
+            expected_size_bytes=TESSERACT_FRA_ARTIFACT.size_bytes,
         )
 
     env_prefix = os.environ.get("TESSDATA_PREFIX", "").strip()
@@ -262,9 +323,10 @@ def resolve_and_verify_tesseract_lang_data(
             candidate,
             TESSERACT_FRA_ARTIFACT.sha256,
             TESSERACT_FRA_ARTIFACT.name,
+            expected_size_bytes=TESSERACT_FRA_ARTIFACT.size_bytes,
         )
 
-    bundled_tessdata_dir = DEFAULT_MODELS_DIR / "tessdata"
+    bundled_tessdata_dir = get_default_models_dir() / "tessdata"
     search_dirs: tuple[Path, ...] = (bundled_tessdata_dir, *_SYSTEM_TESSDATA_DIRS)
     for tessdata_dir in search_dirs:
         candidate = tessdata_dir / TESSERACT_FRA_ARTIFACT.name
@@ -273,6 +335,7 @@ def resolve_and_verify_tesseract_lang_data(
                 candidate,
                 TESSERACT_FRA_ARTIFACT.sha256,
                 TESSERACT_FRA_ARTIFACT.name,
+                expected_size_bytes=TESSERACT_FRA_ARTIFACT.size_bytes,
             )
 
     # None of the candidate directories contained fra.traineddata -> fail closed with clear message
@@ -280,40 +343,65 @@ def resolve_and_verify_tesseract_lang_data(
         bundled_tessdata_dir / TESSERACT_FRA_ARTIFACT.name,
         TESSERACT_FRA_ARTIFACT.sha256,
         TESSERACT_FRA_ARTIFACT.name,
+        expected_size_bytes=TESSERACT_FRA_ARTIFACT.size_bytes,
     )
 
 
-def verify_all_artifacts(models_dir: Path = DEFAULT_MODELS_DIR) -> dict[str, Path]:
-    """Verify all 3 pinned artifacts inside `models_dir` (plus QRDet release marker)."""
+def verify_all_artifacts(models_dir: Path | None = None) -> dict[str, Path]:
+    """Verify all 4 pinned artifacts inside `models_dir` (plus QRDet release marker)."""
+    resolved_models_dir = (
+        models_dir if models_dir is not None else get_default_models_dir()
+    )
     yolo_path = verify_file_sha256(
-        models_dir / YOLOWORLD_ARTIFACT.relative_path,
+        resolved_models_dir / YOLOWORLD_ARTIFACT.relative_path,
         YOLOWORLD_ARTIFACT.sha256,
         YOLOWORLD_ARTIFACT.name,
+        expected_size_bytes=YOLOWORLD_ARTIFACT.size_bytes,
+    )
+    clip_path = verify_file_sha256(
+        resolved_models_dir / CLIP_ARTIFACT.relative_path,
+        CLIP_ARTIFACT.sha256,
+        CLIP_ARTIFACT.name,
+        expected_size_bytes=CLIP_ARTIFACT.size_bytes,
     )
     qrdet_path = verify_file_sha256(
-        models_dir / QRDET_ARTIFACT.relative_path,
+        resolved_models_dir / QRDET_ARTIFACT.relative_path,
         QRDET_ARTIFACT.sha256,
         QRDET_ARTIFACT.name,
+        expected_size_bytes=QRDET_ARTIFACT.size_bytes,
     )
     _ensure_qrdet_release_marker(qrdet_path.parent, allow_write=False)
     tess_path = verify_file_sha256(
-        models_dir / TESSERACT_FRA_ARTIFACT.relative_path,
+        resolved_models_dir / TESSERACT_FRA_ARTIFACT.relative_path,
         TESSERACT_FRA_ARTIFACT.sha256,
         TESSERACT_FRA_ARTIFACT.name,
+        expected_size_bytes=TESSERACT_FRA_ARTIFACT.size_bytes,
     )
     return {
         YOLOWORLD_ARTIFACT.key: yolo_path,
+        CLIP_ARTIFACT.key: clip_path,
         QRDET_ARTIFACT.key: qrdet_path,
         TESSERACT_FRA_ARTIFACT.key: tess_path,
     }
 
 
-def _download_file(url: str, destination: Path) -> None:
+def _download_file(
+    url: str,
+    destination: Path,
+    *,
+    max_bytes: int | None = None,
+) -> None:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" or not parsed.netloc:
         raise ModelArtifactIntegrityError(
             f"Refusing to download model artifact from non-HTTPS URL: '{url}'"
         )
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in _ALLOWED_DOWNLOAD_HOSTS:
+        raise ModelArtifactIntegrityError(
+            f"Refusing to download model artifact from untrusted host '{hostname}': '{url}'"
+        )
+
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "document-ia-worker-artifact-verifier/1.0"},
@@ -322,25 +410,53 @@ def _download_file(url: str, destination: Path) -> None:
         urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_S) as response,
         destination.open("wb") as out_file,
     ):
-        shutil.copyfileobj(response, out_file, length=_CHUNK_SIZE)
+        content_length_header = response.headers.get("Content-Length")
+        if max_bytes is not None and content_length_header is not None:
+            try:
+                declared_size = int(content_length_header)
+            except ValueError:
+                declared_size = -1
+            if declared_size > max_bytes:
+                raise ModelArtifactIntegrityError(
+                    f"Declared Content-Length ({declared_size} bytes) for '{url}' "
+                    f"exceeds expected size limit ({max_bytes} bytes)."
+                )
+
+        total_bytes = 0
+        while chunk := response.read(_CHUNK_SIZE):
+            total_bytes += len(chunk)
+            if max_bytes is not None and total_bytes > max_bytes:
+                raise ModelArtifactIntegrityError(
+                    f"Downloaded payload from '{url}' exceeded expected size limit "
+                    f"({max_bytes} bytes)."
+                )
+            out_file.write(chunk)
 
 
 def download_and_verify_artifact(
     spec: ModelArtifactSpec,
-    models_dir: Path = DEFAULT_MODELS_DIR,
+    models_dir: Path | None = None,
 ) -> Path:
     """Ensure `spec` is present in `models_dir` and matches its pinned SHA-256.
 
-    If already present in cache with a valid SHA-256, reuses it.
+    If already present in cache with a valid SHA-256 and size, reuses it.
     If missing or corrupted, downloads to a temporary file, verifies the SHA-256
-    BEFORE moving into place, and never executes `torch.load`.
+    and size BEFORE moving into place, and never executes `torch.load`.
     """
-    target_path = models_dir / spec.relative_path
+    resolved_models_dir = (
+        models_dir if models_dir is not None else get_default_models_dir()
+    )
+    target_path = resolved_models_dir / spec.relative_path
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
     if target_path.is_file():
         try:
-            verify_file_sha256(target_path, spec.sha256, spec.name)
+            verify_file_sha256(
+                target_path,
+                spec.sha256,
+                spec.name,
+                expected_size_bytes=spec.size_bytes,
+            )
             logger.info(
                 "[model_artifacts] Cached artifact '%s' verified (%s)",
                 spec.name,
@@ -371,13 +487,19 @@ def download_and_verify_artifact(
             spec.name,
             spec.url,
         )
-        _download_file(spec.url, tmp_path)
+        _download_file(spec.url, tmp_path, max_bytes=spec.size_bytes)
         actual_sha256 = compute_file_sha256(tmp_path)
         expected_sha256 = spec.sha256.lower()
         if actual_sha256 != expected_sha256:
             raise ModelArtifactIntegrityError(
                 f"Downloaded artifact '{spec.name}' from '{spec.url}' failed SHA-256 verification: "
                 f"expected {expected_sha256}, got {actual_sha256}."
+            )
+        tmp_size = tmp_path.stat().st_size
+        if tmp_size != spec.size_bytes:
+            raise ModelArtifactIntegrityError(
+                f"Downloaded artifact '{spec.name}' from '{spec.url}' failed size verification: "
+                f"expected {spec.size_bytes} bytes, got {tmp_size} bytes."
             )
         tmp_path.chmod(0o644)
         tmp_path.replace(target_path)
@@ -386,23 +508,37 @@ def download_and_verify_artifact(
         raise
 
     clear_verification_cache()
-    return verify_file_sha256(target_path, spec.sha256, spec.name)
+    return verify_file_sha256(
+        target_path,
+        spec.sha256,
+        spec.name,
+        expected_size_bytes=spec.size_bytes,
+    )
 
 
-def download_and_verify_all(models_dir: Path = DEFAULT_MODELS_DIR) -> dict[str, Path]:
-    """Download (if missing or invalid) and verify all 3 pinned model artifacts."""
+def download_and_verify_all(models_dir: Path | None = None) -> dict[str, Path]:
+    """Download (if missing or invalid) and verify all 4 pinned model artifacts."""
+    resolved_models_dir = (
+        models_dir if models_dir is not None else get_default_models_dir()
+    )
     verified: dict[str, Path] = {}
     for spec in MODEL_ARTIFACTS:
-        verified[spec.key] = download_and_verify_artifact(spec, models_dir=models_dir)
-    _ensure_qrdet_release_marker(models_dir / "qrdet", allow_write=True)
+        verified[spec.key] = download_and_verify_artifact(
+            spec,
+            models_dir=resolved_models_dir,
+        )
+    _ensure_qrdet_release_marker(resolved_models_dir / "qrdet", allow_write=True)
     return verified
 
 
 def build_artifacts_inventory(
-    models_dir: Path = DEFAULT_MODELS_DIR,
+    models_dir: Path | None = None,
 ) -> dict[str, object]:
     """Verify all artifacts in `models_dir` and return a structured inventory dictionary."""
-    paths = verify_all_artifacts(models_dir=models_dir)
+    resolved_models_dir = (
+        models_dir if models_dir is not None else get_default_models_dir()
+    )
+    paths = verify_all_artifacts(models_dir=resolved_models_dir)
     items: list[dict[str, object]] = []
     for spec in MODEL_ARTIFACTS:
         artifact_path = paths[spec.key]
@@ -420,7 +556,7 @@ def build_artifacts_inventory(
             }
         )
     return {
-        "models_dir": str(models_dir),
+        "models_dir": str(resolved_models_dir),
         "qrdet_release_url": QRDET_RELEASE_URL,
         "artifacts": items,
     }
@@ -450,8 +586,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--models-dir",
         type=Path,
-        default=DEFAULT_MODELS_DIR,
-        help=f"Root directory for bundled models (default: {DEFAULT_MODELS_DIR}).",
+        default=None,
+        help="Root directory for bundled models (defaults to MODELS_DIR or worker .models/).",
     )
     return parser
 
@@ -463,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
-    models_dir: Path = args.models_dir.resolve()
+    models_dir: Path = (args.models_dir or get_default_models_dir()).resolve()
 
     try:
         if args.download_and_verify:

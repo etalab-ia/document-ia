@@ -49,7 +49,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-clip = { git = "https://github.com/ultralytics/CLIP.git" }
+clip = { git = "https://github.com/ultralytics/CLIP.git", rev = "c4b6ea0932a2c0f39a0fa528af5ec4982ff15cab" }
 
 [tool.uv.sources.document-ia-infra]
 workspace = true

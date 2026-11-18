@@ -58,7 +58,7 @@ _consumer: ThreadConsumer[WorkflowExecutionMessage] | None = None
 
 def _prewarm_models() -> None:
     logger.info(
-        "[boot] Verifying and pre-warming AI/OCR models (Tesseract, YOLO-World, QRDet)..."
+        "[boot] Verifying and pre-warming AI/OCR models (Tesseract, YOLO-World, CLIP, QRDet)..."
     )
     try:
         from document_ia_worker.core.model_artifacts import (
@@ -72,14 +72,24 @@ def _prewarm_models() -> None:
         raise
 
     try:
+        from document_ia_worker.core.model_artifacts import (
+            resolve_and_verify_clip_path,
+        )
         from document_ia_worker.core.preprocessing.yoloworld_crop import (
+            ensure_yoloworld_classes,
             get_yoloworld_model,
         )
 
-        get_yoloworld_model()
-        logger.info("[boot]   ✅ YOLO-World model verified and pre-loaded into RAM")
+        clip_path = resolve_and_verify_clip_path()
+        logger.info("[boot]   ✅ CLIP ViT-B/32 weights verified at %s", clip_path)
+        yolo_model = get_yoloworld_model()
+        if hasattr(yolo_model, "set_classes"):
+            ensure_yoloworld_classes(yolo_model, "book")
+        logger.info(
+            "[boot]   ✅ YOLO-World & CLIP models verified and pre-loaded into RAM"
+        )
     except Exception as e:
-        logger.critical("[boot]   ❌ Could not pre-load YOLO-World model: %s", e)
+        logger.critical("[boot]   ❌ Could not pre-load YOLO-World/CLIP model: %s", e)
         raise
 
     try:
@@ -141,16 +151,11 @@ def _register_signal_handlers(
 
     for s in sigs:
         try:
-            loop.add_signal_handler(s, stop_event.set)
-            registered_loop_sigs.append(s)
-        except NotImplementedError:
             try:
+                loop.add_signal_handler(s, stop_event.set)
+                registered_loop_sigs.append(s)
+            except NotImplementedError:
                 signal.signal(s, _fallback_handler)
-            except ValueError, RuntimeError:
-                logger.warning(
-                    "Impossible d'enregistrer le handler pour le signal %s (environnement non supporté)",
-                    s,
-                )
         except ValueError, RuntimeError:
             logger.warning(
                 "Impossible d'enregistrer le handler pour le signal %s (environnement non supporté)",

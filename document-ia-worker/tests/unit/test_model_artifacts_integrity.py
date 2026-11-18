@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import re
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -9,7 +11,10 @@ import pytest
 
 from document_ia_worker.core import model_artifacts
 from document_ia_worker.core.model_artifacts import (
+    CLIP_ARTIFACT,
+    QRDET_ARTIFACT,
     QRDET_RELEASE_URL,
+    TESSERACT_FRA_ARTIFACT,
     YOLOWORLD_ARTIFACT,
     ModelArtifactIntegrityError,
     ModelArtifactSpec,
@@ -17,7 +22,9 @@ from document_ia_worker.core.model_artifacts import (
     compute_file_sha256,
     download_and_verify_all,
     download_and_verify_artifact,
+    resolve_and_verify_clip_path,
     resolve_and_verify_qrdet_dir,
+    verify_all_artifacts,
     verify_file_sha256,
 )
 from document_ia_worker.core.preprocessing import yoloworld_crop
@@ -62,12 +69,22 @@ def test_verify_file_sha256_nominal_and_cache_hit(
     monkeypatch.setattr(model_artifacts, "compute_file_sha256", CountingCompute)
 
     # First call computes SHA-256 from disk
-    verified_1 = verify_file_sha256(artifact_file, expected_hash, "model.pt")
+    verified_1 = verify_file_sha256(
+        artifact_file,
+        expected_hash,
+        "model.pt",
+        expected_size_bytes=len(payload),
+    )
     assert verified_1 == artifact_file
     assert hash_calls == 1
 
     # Second call with unchanged mtime and size hits the in-memory cache
-    verified_2 = verify_file_sha256(artifact_file, expected_hash, "model.pt")
+    verified_2 = verify_file_sha256(
+        artifact_file,
+        expected_hash,
+        "model.pt",
+        expected_size_bytes=len(payload),
+    )
     assert verified_2 == artifact_file
     assert hash_calls == 1
 
@@ -83,6 +100,37 @@ def test_verify_file_sha256_rejects_missing_or_corrupted_file(tmp_path: Path) ->
         ModelArtifactIntegrityError, match="SHA-256 integrity check failed"
     ):
         verify_file_sha256(corrupted, YOLOWORLD_ARTIFACT.sha256, "yolov8m-world.pt")
+
+
+def test_verify_file_sha256_wraps_oserror_and_validates_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"abc123"
+    artifact_file = tmp_path / "model.pt"
+    expected_hash = _write_bytes_with_hash(artifact_file, payload)
+
+    with pytest.raises(ModelArtifactIntegrityError, match="Size check failed"):
+        verify_file_sha256(
+            artifact_file,
+            expected_hash,
+            "model.pt",
+            expected_size_bytes=len(payload) + 10,
+        )
+
+    def raise_permission_error(self: Path, *_args: Any, **_kwargs: Any) -> Any:
+        raise PermissionError("read denied")
+
+    monkeypatch.setattr(Path, "open", raise_permission_error)
+    with pytest.raises(
+        ModelArtifactIntegrityError, match="Unable to read model artifact"
+    ):
+        verify_file_sha256(
+            artifact_file,
+            expected_hash,
+            "model.pt",
+            expected_size_bytes=len(payload),
+        )
 
 
 def test_yoloworld_loader_rejects_tampered_or_missing_weights_before_ultralytics(
@@ -104,9 +152,7 @@ def test_yoloworld_loader_rejects_tampered_or_missing_weights_before_ultralytics
 
     monkeypatch.setattr("ultralytics.YOLOWorld", ForbiddenYOLOWorld)
 
-    with pytest.raises(
-        ModelArtifactIntegrityError, match="SHA-256 integrity check failed"
-    ):
+    with pytest.raises(ModelArtifactIntegrityError, match="Size check failed"):
         yoloworld_crop.get_yoloworld_model()
 
     assert ultralytics_called is False
@@ -117,6 +163,36 @@ def test_yoloworld_loader_rejects_tampered_or_missing_weights_before_ultralytics
         yoloworld_crop.get_yoloworld_model()
 
     assert ultralytics_called is False
+
+
+def test_clip_resolver_respects_env_and_rejects_tampered_weights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clip_bytes = b"valid-clip-weights"
+    fake_clip_spec = ModelArtifactSpec(
+        key="clip",
+        name="ViT-B-32.pt",
+        url=CLIP_ARTIFACT.url,
+        relative_path="clip/ViT-B-32.pt",
+        sha256=hashlib.sha256(fake_clip_bytes).hexdigest(),
+        size_bytes=len(fake_clip_bytes),
+    )
+    monkeypatch.setattr(model_artifacts, "CLIP_ARTIFACT", fake_clip_spec)
+
+    clip_path = tmp_path / "custom" / "ViT-B-32.pt"
+    clip_path.parent.mkdir(parents=True)
+    clip_path.write_bytes(fake_clip_bytes)
+    monkeypatch.setenv("CLIP_WEIGHTS_PATH", str(clip_path))
+    assert resolve_and_verify_clip_path() == clip_path
+
+    # Tampered byte with same size fails SHA-256 check
+    clip_path.write_bytes(b"X" + fake_clip_bytes[1:])
+    clear_verification_cache()
+    with pytest.raises(
+        ModelArtifactIntegrityError, match="SHA-256 integrity check failed"
+    ):
+        resolve_and_verify_clip_path()
 
 
 def test_qrdet_loader_rejects_tampered_or_missing_weights_before_qrdetector(
@@ -142,9 +218,7 @@ def test_qrdet_loader_rejects_tampered_or_missing_weights_before_qrdetector(
 
     monkeypatch.setattr(extract_barcode_2ddoc_data, "QRDetector", forbidden_qrdetector)
 
-    with pytest.raises(
-        ModelArtifactIntegrityError, match="SHA-256 integrity check failed"
-    ):
+    with pytest.raises(ModelArtifactIntegrityError, match="Size check failed"):
         extract_barcode_2ddoc_data._get_qrdet_detector()
 
     assert qrdetector_called is False
@@ -189,9 +263,7 @@ async def test_ocr_step_rejects_tampered_tesseract_fra_traineddata_before_ocr(
         }
     )
 
-    with pytest.raises(
-        ModelArtifactIntegrityError, match="SHA-256 integrity check failed"
-    ):
+    with pytest.raises(ModelArtifactIntegrityError, match="Size check failed"):
         await step.execute()
 
     assert ocr_called is False
@@ -202,6 +274,7 @@ def test_download_and_verify_replaces_corrupted_cache_and_writes_release_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_yolo_bytes = b"valid-yolo-bytes"
+    fake_clip_bytes = b"valid-clip-bytes"
     fake_qrdet_bytes = b"valid-qrdet-bytes"
     fake_tess_bytes = b"valid-tess-bytes"
 
@@ -213,6 +286,14 @@ def test_download_and_verify_replaces_corrupted_cache_and_writes_release_marker(
             relative_path="yolov8m-world.pt",
             sha256=hashlib.sha256(fake_yolo_bytes).hexdigest(),
             size_bytes=len(fake_yolo_bytes),
+        ),
+        ModelArtifactSpec(
+            key="clip",
+            name="ViT-B-32.pt",
+            url="https://example.invalid/ViT-B-32.pt",
+            relative_path="clip/ViT-B-32.pt",
+            sha256=hashlib.sha256(fake_clip_bytes).hexdigest(),
+            size_bytes=len(fake_clip_bytes),
         ),
         ModelArtifactSpec(
             key="qrdet",
@@ -232,8 +313,9 @@ def test_download_and_verify_replaces_corrupted_cache_and_writes_release_marker(
         ),
     )
     monkeypatch.setattr(model_artifacts, "YOLOWORLD_ARTIFACT", fake_specs[0])
-    monkeypatch.setattr(model_artifacts, "QRDET_ARTIFACT", fake_specs[1])
-    monkeypatch.setattr(model_artifacts, "TESSERACT_FRA_ARTIFACT", fake_specs[2])
+    monkeypatch.setattr(model_artifacts, "CLIP_ARTIFACT", fake_specs[1])
+    monkeypatch.setattr(model_artifacts, "QRDET_ARTIFACT", fake_specs[2])
+    monkeypatch.setattr(model_artifacts, "TESSERACT_FRA_ARTIFACT", fake_specs[3])
     monkeypatch.setattr(model_artifacts, "MODEL_ARTIFACTS", fake_specs)
 
     # Pre-populate a corrupted cached file for yolov8m-world.pt
@@ -242,22 +324,38 @@ def test_download_and_verify_replaces_corrupted_cache_and_writes_release_marker(
 
     url_payloads = {
         fake_specs[0].url: fake_yolo_bytes,
-        fake_specs[1].url: fake_qrdet_bytes,
-        fake_specs[2].url: fake_tess_bytes,
+        fake_specs[1].url: fake_clip_bytes,
+        fake_specs[2].url: fake_qrdet_bytes,
+        fake_specs[3].url: fake_tess_bytes,
     }
 
-    def fake_download(url: str, destination: Path) -> None:
+    def fake_download(
+        url: str,
+        destination: Path,
+        *,
+        max_bytes: int | None = None,  # noqa: ARG001
+    ) -> None:
         destination.write_bytes(url_payloads[url])
 
     monkeypatch.setattr(model_artifacts, "_download_file", fake_download)
 
     verified = download_and_verify_all(models_dir=tmp_path)
     assert verified["yoloworld"].read_bytes() == fake_yolo_bytes
+    assert verified["clip"].read_bytes() == fake_clip_bytes
     assert verified["qrdet"].read_bytes() == fake_qrdet_bytes
     assert verified["tesseract_fra"].read_bytes() == fake_tess_bytes
     assert (tmp_path / "qrdet" / "current_release.txt").read_text(
         encoding="utf-8"
     ) == QRDET_RELEASE_URL
+
+    # MODELS_DIR environment variable is respected by verify_all_artifacts()
+    monkeypatch.setenv("MODELS_DIR", str(tmp_path))
+    assert set(verify_all_artifacts().keys()) == {
+        "yoloworld",
+        "clip",
+        "qrdet",
+        "tesseract_fra",
+    }
 
     # CLI --verify and --print-inventory succeed with exit code 0
     assert model_artifacts.main(["--verify", "--models-dir", str(tmp_path)]) == 0
@@ -286,7 +384,12 @@ def test_download_and_verify_cleans_up_temp_file_on_bad_downloaded_hash(
         size_bytes=YOLOWORLD_ARTIFACT.size_bytes,
     )
 
-    def fake_bad_download(_url: str, destination: Path) -> None:
+    def fake_bad_download(
+        _url: str,
+        destination: Path,
+        *,
+        max_bytes: int | None = None,  # noqa: ARG001
+    ) -> None:
         destination.write_bytes(b"upstream-tampered-bytes")
 
     monkeypatch.setattr(model_artifacts, "_download_file", fake_bad_download)
@@ -365,3 +468,92 @@ def test_download_file_rejects_non_https_scheme(tmp_path: Path) -> None:
         model_artifacts._download_file("http://example.invalid/model.pt", destination)
 
     assert not destination.exists()
+
+
+def test_download_file_rejects_untrusted_host_and_oversized_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "model.pt"
+
+    with pytest.raises(ModelArtifactIntegrityError, match="untrusted host"):
+        model_artifacts._download_file(
+            "https://untrusted.example.invalid/model.pt",
+            destination,
+        )
+    assert not destination.exists()
+
+    class FakeResponse(io.BytesIO):
+        def __init__(self, data: bytes, content_length: str | None = None) -> None:
+            super().__init__(data)
+            self.headers: dict[str, str] = {}
+            if content_length is not None:
+                self.headers["Content-Length"] = content_length
+
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            self.close()
+
+    # Rejects when Content-Length exceeds max_bytes
+    monkeypatch.setattr(
+        model_artifacts.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: FakeResponse(b"hello", content_length="100"),
+    )
+    with pytest.raises(ModelArtifactIntegrityError, match="Content-Length"):
+        model_artifacts._download_file(
+            YOLOWORLD_ARTIFACT.url,
+            destination,
+            max_bytes=10,
+        )
+
+    # Rejects when streamed body exceeds max_bytes without Content-Length
+    monkeypatch.setattr(
+        model_artifacts.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: FakeResponse(b"0123456789ABCDEF"),
+    )
+    with pytest.raises(ModelArtifactIntegrityError, match="exceeded expected size"):
+        model_artifacts._download_file(
+            YOLOWORLD_ARTIFACT.url,
+            destination,
+            max_bytes=8,
+        )
+
+
+def test_flake_nix_artifacts_match_python_manifest() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    flake_path = repo_root / "flake.nix"
+    flake_text = flake_path.read_text(encoding="utf-8")
+
+    def _extract_fetchurl(binding_name: str) -> tuple[str, str]:
+        pattern = re.compile(
+            rf"{re.escape(binding_name)}\s*=\s*pkgs\.fetchurl\s*\{{(.*?)\}};",
+            re.DOTALL,
+        )
+        match = pattern.search(flake_text)
+        assert match is not None, (
+            f"Missing pkgs.fetchurl block '{binding_name}' in flake.nix"
+        )
+        block = match.group(1)
+        url_match = re.search(r'url\s*=\s*"([^"]+)";', block)
+        sha_match = re.search(r'sha256\s*=\s*"([^"]+)";', block)
+        assert url_match is not None and sha_match is not None, (
+            f"Incomplete fetchurl block '{binding_name}' in flake.nix"
+        )
+        return url_match.group(1), sha_match.group(1)
+
+    expected_bindings = (
+        ("yoloworldWeights", YOLOWORLD_ARTIFACT),
+        ("clipWeights", CLIP_ARTIFACT),
+        ("qrdetWeights", QRDET_ARTIFACT),
+        ("tesseractFraTraineddata", TESSERACT_FRA_ARTIFACT),
+    )
+    for binding_name, spec in expected_bindings:
+        nix_url, nix_sha256 = _extract_fetchurl(binding_name)
+        assert nix_url == spec.url
+        assert nix_sha256 == spec.sha256
+
+    assert QRDET_RELEASE_URL in flake_text

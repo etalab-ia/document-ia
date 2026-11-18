@@ -1,16 +1,23 @@
 import math
+import os
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, cast
 
 from PIL import Image
 
-from document_ia_worker.core.model_artifacts import resolve_and_verify_yoloworld_path
+from document_ia_worker.core.model_artifacts import (
+    resolve_and_verify_clip_path,
+    resolve_and_verify_yoloworld_path,
+)
 
+os.environ.setdefault("YOLO_OFFLINE", "true")
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
 YOLO_WORLD_MODEL = "yolov8m-world.pt"
-_YOLO_LOCK = threading.Lock()
+_YOLO_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -23,16 +30,48 @@ class DetectionBox:
 
 
 _MODEL_CACHE: Any = None
+_LAST_MODEL_INSTANCE: Any = None
+_LAST_CLASS_NAME: str | None = None
 
 
-def get_yoloworld_model() -> Any:
-    global _MODEL_CACHE
+def _get_yoloworld_model_unlocked() -> Any:
+    global _MODEL_CACHE, _LAST_MODEL_INSTANCE, _LAST_CLASS_NAME
     if _MODEL_CACHE is None:
         from ultralytics import YOLOWorld  # pyright: ignore [reportPrivateImportUsage]
 
         verified_path = resolve_and_verify_yoloworld_path()
         _MODEL_CACHE = YOLOWorld(str(verified_path))  # pyright: ignore [reportConstantRedefinition]
+        _LAST_MODEL_INSTANCE = None  # pyright: ignore[reportConstantRedefinition]
+        _LAST_CLASS_NAME = None  # pyright: ignore[reportConstantRedefinition]
     return _MODEL_CACHE
+
+
+def get_yoloworld_model() -> Any:
+    with _YOLO_LOCK:
+        return _get_yoloworld_model_unlocked()
+
+
+def _configure_ultralytics_offline_weights_dir(verified_clip_path: Path) -> Path:
+    weights_dir = verified_clip_path.parent.parent
+    import ultralytics.nn.text_model as text_model_mod
+    import ultralytics.utils as ultralytics_utils
+
+    ultralytics_utils.SETTINGS["weights_dir"] = str(weights_dir)
+    ultralytics_utils.WEIGHTS_DIR = weights_dir
+    setattr(text_model_mod, "WEIGHTS_DIR", weights_dir)
+    return weights_dir
+
+
+def ensure_yoloworld_classes(yolo_model: Any, class_name: str) -> None:
+    """Verify CLIP weights, force offline weights_dir, and update classes only when changed."""
+    global _LAST_MODEL_INSTANCE, _LAST_CLASS_NAME
+    with _YOLO_LOCK:
+        verified_clip_path = resolve_and_verify_clip_path()
+        _configure_ultralytics_offline_weights_dir(verified_clip_path)
+        if _LAST_MODEL_INSTANCE is not yolo_model or _LAST_CLASS_NAME != class_name:
+            yolo_model.set_classes([class_name])
+            _LAST_MODEL_INSTANCE = yolo_model  # pyright: ignore[reportConstantRedefinition]
+            _LAST_CLASS_NAME = class_name  # pyright: ignore[reportConstantRedefinition]
 
 
 def detect_boxes(
@@ -52,7 +91,7 @@ def detect_boxes(
 
     with _YOLO_LOCK:
         yolo_model = get_yoloworld_model()
-        yolo_model.set_classes([class_name])
+        ensure_yoloworld_classes(yolo_model, class_name)
         results = yolo_model.predict(image, **predict_kwargs)
 
     if not results:

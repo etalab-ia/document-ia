@@ -25,6 +25,20 @@ document-ia-worker/.models
 **/.env
 **/.env.*
 !**/.env.example
+**/secrets.toml
+document-ia-evals/.streamlit/*
+!document-ia-evals/.streamlit/config.toml
+
+# Local runtime data, logs & caches
+**/logs
+**/*.log
+document-ia-evals/data/*
+!document-ia-evals/data/.gitkeep
+document-ia-evals/src/document_ia_evals/static/review-pdfs
+document-ia-worker/weights
+.idea
+.vscode
+.DS_Store
 
 # Documentation & tests (not needed in runtime images)
 docs

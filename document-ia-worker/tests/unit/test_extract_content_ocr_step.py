@@ -6,9 +6,13 @@ import numpy as np
 import pytest
 from pytesseract import get_tesseract_version
 
+import os
+
 from document_ia_worker.core.model_artifacts import (
+    _SYSTEM_TESSDATA_DIRS,
     TESSERACT_FRA_ARTIFACT,
     compute_file_sha256,
+    get_default_models_dir,
     resolve_and_verify_tesseract_lang_data,
 )
 from document_ia_worker.workflow.step.extract_content_ocr.extract_content_ocr import (
@@ -33,11 +37,14 @@ def _tesseract_available() -> bool:
 def _french_traineddata_available() -> bool:
     if not _tesseract_available():
         return False
-    try:
-        path = resolve_and_verify_tesseract_lang_data("fra")
-        return path is not None and path.is_file()
-    except Exception:
-        return False
+    env_prefix = os.environ.get("TESSDATA_PREFIX", "").strip()
+    if env_prefix:
+        prefix_path = Path(env_prefix)
+        return (prefix_path / TESSERACT_FRA_ARTIFACT.name).is_file() or (
+            prefix_path / "tessdata" / TESSERACT_FRA_ARTIFACT.name
+        ).is_file()
+    search_dirs = (get_default_models_dir() / "tessdata", *_SYSTEM_TESSDATA_DIRS)
+    return any((d / TESSERACT_FRA_ARTIFACT.name).is_file() for d in search_dirs)
 
 
 def _make_text_image(path: Path, text: str) -> Path:

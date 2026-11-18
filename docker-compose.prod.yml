@@ -57,22 +57,10 @@ services:
     container_name: document-ia-prod-init-s3-bucket
     restart: "no"
     environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_SSL_MODE: disable
-      POSTGRESQL_URL: ""
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
-      REDIS_DB: "0"
-      REDIS_PASSWORD: ""
-      REDIS_URL: ""
       S3_ENDPOINT_URL: http://minio:9000
       S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}  # ggignore
       S3_BUCKET_NAME: ${S3_BUCKET_NAME:-document-ia}
-      S3_REGION_NAME: ${S3_REGION_NAME:-us-east-1}
-      S3_USE_SSL: "false"
-      LOKI_LOGGING_ENABLED: "false"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -198,6 +186,160 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  evals:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: document-ia-evals/Dockerfile
+    container_name: document-ia-prod-evals
+    restart: unless-stopped
+    ports:
+      - "${EVALS_PORT:-8501}:8501"
+    environment:
+      APP_ENV: ${APP_ENV:-prod}
+      DOCUMENT_IA_API_KEY: ${DOCUMENT_IA_API_KEY:?DOCUMENT_IA_API_KEY must be set in environment or root .env}
+      POSTGRES_DB: ${POSTGRES_DB:-document_ia}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}  # ggignore
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_SSL_MODE: disable
+      POSTGRESQL_URL: ""
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_PASSWORD: ""
+      REDIS_URL: ""
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}  # ggignore
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-document-ia}
+      S3_REGION_NAME: ${S3_REGION_NAME:-us-east-1}
+      S3_USE_SSL: "false"
+      LOKI_LOGGING_ENABLED: "false"
+      PROCONNECT_CLIENT_ID: ${PROCONNECT_CLIENT_ID:-local-evals-client}
+      PROCONNECT_CLIENT_SECRET: ${PROCONNECT_CLIENT_SECRET:-local-evals-secret}  # ggignore
+    networks:
+      - document-ia-prod-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      init-s3-bucket:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  remove-ppi:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: document-ia-worker/Dockerfile
+      target: remove_ppi
+    container_name: document-ia-prod-remove-ppi
+    restart: "no"
+    environment:
+      APP_ENV: ${APP_ENV:-prod}
+      POSTGRES_DB: ${POSTGRES_DB:-document_ia}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}  # ggignore
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_SSL_MODE: disable
+      POSTGRESQL_URL: ""
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_PASSWORD: ""
+      REDIS_URL: ""
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}  # ggignore
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-document-ia}
+      S3_REGION_NAME: ${S3_REGION_NAME:-us-east-1}
+      S3_USE_SSL: "false"
+      LOKI_LOGGING_ENABLED: "false"
+    networks:
+      - document-ia-prod-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      init-s3-bucket:
+        condition: service_completed_successfully
+
+  replicate-analytics:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: document-ia-worker/Dockerfile
+      target: replicate_analytics
+    container_name: document-ia-prod-replicate-analytics
+    restart: "no"
+    environment:
+      APP_ENV: ${APP_ENV:-prod}
+      POSTGRES_DB: ${POSTGRES_DB:-document_ia}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}  # ggignore
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_SSL_MODE: disable
+      POSTGRESQL_URL: ""
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_PASSWORD: ""
+      REDIS_URL: ""
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}  # ggignore
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-document-ia}
+      S3_REGION_NAME: ${S3_REGION_NAME:-us-east-1}
+      S3_USE_SSL: "false"
+      LOKI_LOGGING_ENABLED: "false"
+    networks:
+      - document-ia-prod-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      init-s3-bucket:
+        condition: service_completed_successfully
+
+  auto-scaler:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: document-ia-auto-scaler/Dockerfile
+    container_name: document-ia-prod-auto-scaler
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-prod}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_PASSWORD: ""
+      REDIS_URL: ""
+      LOKI_LOGGING_ENABLED: "false"
+    networks:
+      - document-ia-prod-network
+    depends_on:
+      redis:
+        condition: service_healthy
 
 volumes:
   postgres_prod_data:

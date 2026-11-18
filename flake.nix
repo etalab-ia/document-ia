@@ -26,6 +26,12 @@
             sha256 = "8ede3cfa80c243608a9ef14d54f55030efc9d7a8635af245fc6d67efdf294aaa";
           };
 
+          clipWeights = pkgs.fetchurl {
+            name = "ViT-B-32.pt";
+            url = "https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt";
+            sha256 = "40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af";
+          };
+
           qrdetWeights = pkgs.fetchurl {
             name = "qrdet-s.pt";
             url = "https://github.com/Eric-Canas/qrdet/releases/download/v2.0_release/qrdet-s.pt";
@@ -39,18 +45,16 @@
           };
 
           modelArtifacts = pkgs.runCommand "document-ia-model-artifacts" { } ''
-            mkdir -p "$out/qrdet" "$out/tessdata"
-            cp "${yoloworldWeights}" "$out/yolov8m-world.pt"
-            cp "${qrdetWeights}" "$out/qrdet/qrdet-s.pt"
+            mkdir -p "$out/clip" "$out/qrdet" "$out/tessdata"
+            ln -s "${yoloworldWeights}" "$out/yolov8m-world.pt"
+            ln -s "${clipWeights}" "$out/clip/ViT-B-32.pt"
+            ln -s "${qrdetWeights}" "$out/qrdet/qrdet-s.pt"
             printf '%s' "https://github.com/Eric-Canas/qrdet/releases/download/v2.0_release" > "$out/qrdet/current_release.txt"
-            cp "${tesseractFraTraineddata}" "$out/tessdata/fra.traineddata"
-            chmod -R u+rwX,go+rX "$out"
+            ln -s "${tesseractFraTraineddata}" "$out/tessdata/fra.traineddata"
           '';
 
           commonPackages = [
             pkgs.python314
-            pkgs.uv
-            pkgs.git
             pkgs.bashInteractive
             pkgs.coreutils
             pkgs.findutils
@@ -72,6 +76,18 @@
         in
         {
           model-artifacts = modelArtifacts;
+
+          build-tools = pkgs.buildEnv {
+            name = "document-ia-build-tools";
+            paths = [
+              pkgs.python314
+              pkgs.uv
+              pkgs.git
+              pkgs.cacert
+              pkgs.coreutils
+            ];
+            pathsToLink = [ "/bin" "/etc" ];
+          };
 
           runtime-api = mkRuntimeEnv "document-ia-runtime-api" [
             pkgs.file

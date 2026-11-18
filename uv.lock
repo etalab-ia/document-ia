@@ -464,7 +464,7 @@ wheels = [
 [[package]]
 name = "clip"
 version = "1.0"
-source = { git = "https://github.com/ultralytics/CLIP.git#c4b6ea0932a2c0f39a0fa528af5ec4982ff15cab" }
+source = { git = "https://github.com/ultralytics/CLIP.git?rev=c4b6ea0932a2c0f39a0fa528af5ec4982ff15cab#c4b6ea0932a2c0f39a0fa528af5ec4982ff15cab" }
 dependencies = [
     { name = "ftfy" },
     { name = "regex" },
@@ -793,7 +793,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = "==1.20.1" },
-    { name = "authlib", specifier = ">=1.3.2" },
+    { name = "authlib", specifier = "==1.9.5" },
     { name = "boto3", specifier = "==1.43.126" },
     { name = "botocore", specifier = "==1.43.126" },
     { name = "deepdiff", specifier = "==9.1.0" },
@@ -961,7 +961,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "2ddoc-parser", git = "https://github.com/betagouv/2ddoc-parser.git?tag=v1.0.6" },
-    { name = "clip", git = "https://github.com/ultralytics/CLIP.git" },
+    { name = "clip", git = "https://github.com/ultralytics/CLIP.git?rev=c4b6ea0932a2c0f39a0fa528af5ec4982ff15cab" },
     { name = "document-ia-infra", editable = "document-ia-infra" },
     { name = "document-ia-schemas", editable = "document-ia-schemas" },
     { name = "greenlet", specifier = "==3.5.6" },
