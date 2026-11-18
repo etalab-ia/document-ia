@@ -143,7 +143,7 @@ docker build -f document-ia-auto-scaler/Dockerfile -t document-ia-auto-scaler:lo
 
 ### Continuous Delivery Workflow (`.github/workflows/document-ia-cd.yml`)
 
-On every `pull_request` (matching watched build/artifact paths) and `workflow_dispatch` (verification-only mode, never publishing to GHCR), and on `push` of a `v*` tag whose commit belongs to `main` (publish mode):
+Triggered only on manual dispatch (`workflow_dispatch`, verification-only mode, never publishing to GHCR) and on `push` of a `v*` tag whose commit belongs to `main` (publish mode) — **not** on `pull_request` events or general branch commits:
 1. Enforces branch ancestry on `v*` tag pushes via `git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main` and `git merge-base --is-ancestor "${GITHUB_SHA}" origin/main`, failing closed if the tagged commit is not on `main`.
 2. Builds all 6 multi-stage Nix-backed container images locally.
 3. Verifies container hardening across all 6 images (`nix`, `uv`, and `git` are absent; `/app` and `.models/` are read-only for UID `10001`).

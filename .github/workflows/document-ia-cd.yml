@@ -1,15 +1,6 @@
 name: document-ia Deployment Artifacts CD (Nix + GHCR)
 
 on:
-  pull_request:
-    paths:
-      - "flake.nix"
-      - "flake.lock"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".dockerignore"
-      - "document-ia-*/**"
-      - ".github/workflows/document-ia-cd.yml"
   push:
     tags:
       - "v*"
@@ -19,7 +10,7 @@ permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
