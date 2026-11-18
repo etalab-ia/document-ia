@@ -247,8 +247,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-    # Seules les deux empreintes historiques connues sont ignorées ; toute
-    # nouvelle détection échoue la CI. La rotation des secrets reste requise.
+    # Seules les trois empreintes historiques connues de .gitleaks-baseline.json
+    # sont ignorées ; toute modification de la baseline ou nouvelle détection
+    # fait échouer la CI. La sonde synthétique vérifie en outre la détection active.
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -266,6 +267,10 @@ jobs:
       - name: Gitleaks
         run: |
           gitleaks git --config .gitleaks.toml --baseline-path .gitleaks-baseline.json --verbose --redact .
+
+      - name: Vérifier la baseline et la détection d'un secret synthétique
+        run: |
+          bash scripts/verify_gitleaks_synthetic.sh
 
   pyright:
     name: Pyright (${{ matrix.name }})

@@ -1,12 +1,14 @@
-# OSV-Scanner vérifie les dépendances contre la base de vulnérabilités OSV.
-# - Les pull requests échouent uniquement sur les vulnérabilités introduites
-#   par le changement.
-# - Les scans hebdomadaires et sur branche publient l'inventaire complet dans
-#   Code Scanning sans bloquer.
+# Contrôle opposable des vulnérabilités de dépendances (Politique D7 - Issue #167).
 #
-# Ce workflow remplace l'installation manuelle d'osv-scanner par curl et
-# couvre désormais les sept fichiers uv.lock du dépôt, et non le seul fichier
-# à la racine.
+# Ce workflow est bloquant sur tous les événements (pull_request, merge_group,
+# push sur main/develop, schedule hebdomadaire et workflow_dispatch) :
+# 1. Toute nouvelle vulnérabilité non acceptée dans `uv.lock` bloque la CI.
+# 2. Toute exception dans `.osv-scanner.toml` doit être justifiée, attribuée
+#    (`[Owner: @...]`), datée et expirable (`ignoreUntil` <= 30 jours).
+# 3. Toute exception expirée ou mal formée bloque immédiatement la CI.
+# 4. Le rapport consolidé distingue explicitement les vulnérabilités distinctes
+#    (dédupliquées par graphe d'alias CVE/GHSA/PYSEC) des occurrences de paquets
+#    dans `uv.lock` et des résultats bruts OSV.
 name: OSV-Scanner
 
 on:
@@ -16,35 +18,100 @@ on:
   merge_group:
   schedule:
     - cron: "12 12 * * 1"
+  workflow_dispatch:
 
 permissions: {}
 
-jobs:
-  scan-scheduled:
-    name: OSV-Scanner (inventaire complet)
-    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
-    permissions:
-      contents: read
-      security-events: write
-      actions: read
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
-    with:
-      # Les vulnérabilités existantes alimentent Code Scanning ; le scan de PR
-      # reste la barrière bloquante pour celles qui sont nouvellement
-      # introduites.
-      fail-on-vuln: false
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-  scan-pr:
-    name: OSV-Scanner (nouvelles vulnérabilités)
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+jobs:
+  osv-scan:
+    name: OSV-Scanner & Politique D7
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       security-events: write
       actions: read
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
-    with:
-      fail-on-vuln: true
-      # Les PR issues d'un fork disposent d'un GITHUB_TOKEN en lecture seule,
-      # donc l'envoi du SARIF échouerait en 403 quel que soit le résultat du
-      # scan. Leurs trouvailles restent visibles dans les journaux du job.
-      upload-sarif: ${{ github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Exécuter OSV-Scanner sur uv.lock
+        id: scan
+        continue-on-error: true
+        uses: google/osv-scanner-action/osv-scanner-action@0a65f82af05cd58cf587827b0bb0489548c18346 # v2.7.0
+        with:
+          scan-args: |-
+            --output=osv-results.json
+            --format=json
+            --config=.osv-scanner.toml
+            --lockfile=uv.lock
+
+      - name: Vérifier la génération du rapport JSON OSV
+        id: check-scan-output
+        if: ${{ steps.scan.outcome == 'failure' }}
+        run: |
+          if [ ! -s osv-results.json ]; then
+            echo "::error::OSV-Scanner a échoué sans produire de fichier osv-results.json exploitable."
+            exit 1
+          fi
+
+      - name: Générer le rapport SARIF (OSV Reporter)
+        id: reporter
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: google/osv-scanner-action/osv-reporter-action@0a65f82af05cd58cf587827b0bb0489548c18346 # v2.7.0
+        with:
+          scan-args: |-
+            --output=osv-results.sarif
+            --new=osv-results.json
+            --gh-annotations=false
+            --fail-on-vuln=true
+
+      - name: Évaluer la politique D7 et publier le résumé Markdown
+        id: policy
+        if: ${{ !cancelled() }}
+        run: |
+          status=0
+          python3 scripts/check_vulnerability_policy.py \
+            --config .osv-scanner.toml \
+            --osv-json osv-results.json \
+            --summary-output vulnerability-summary.md || status=$?
+          if [ -f vulnerability-summary.md ]; then
+            cat vulnerability-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
+
+      - name: Archiver le rapport de vulnérabilités (JSON, Markdown, SARIF)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: osv-vulnerability-report
+          path: |
+            vulnerability-summary.md
+            osv-results.json
+            osv-results.sarif
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Publier le rapport SARIF dans GitHub Code Scanning
+        if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        with:
+          sarif_file: osv-results.sarif
+          category: osv-scanner
+
+      - name: Appliquer le verdict bloquant (OSV-Scanner & Politique D7)
+        if: ${{ !cancelled() }}
+        run: |
+          if [ "${{ steps.policy.outcome }}" != "success" ] || \
+             [ "${{ steps.reporter.outcome }}" != "success" ] || \
+             [ "${{ steps.scan.outcome }}" != "success" ]; then
+            echo "::error::Échec du contrôle opposable des vulnérabilités (scan=${{ steps.scan.outcome }}, reporter=${{ steps.reporter.outcome }}, policy=${{ steps.policy.outcome }}). Consultez le résumé du job."
+            exit 1
+          fi
