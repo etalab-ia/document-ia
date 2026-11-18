@@ -915,7 +915,6 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pymupdf" },
-    { name = "pyright" },
     { name = "pytesseract" },
     { name = "python-dotenv" },
     { name = "python-magic" },
@@ -930,6 +929,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "pre-commit" },
+    { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -951,7 +951,6 @@ requires-dist = [
     { name = "pydantic", specifier = "==2.14.3" },
     { name = "pydantic-settings", specifier = "==2.16.2" },
     { name = "pymupdf", specifier = "==2.1" },
-    { name = "pyright", specifier = "==1.1.414" },
     { name = "pytesseract", specifier = "==0.3.13" },
     { name = "python-dotenv", specifier = "==1.2.4" },
     { name = "python-magic", specifier = "==0.4.27" },
@@ -966,6 +965,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "pre-commit", specifier = "==4.7.0" },
+    { name = "pyright", specifier = "==1.1.414" },
     { name = "pytest", specifier = "==9.2.0" },
     { name = "pytest-asyncio", specifier = "==1.4.1.post1" },
     { name = "ruff", specifier = "==0.17.4" },

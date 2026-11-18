@@ -1,11 +1,12 @@
 import math
-import os
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional, cast
 
 from PIL import Image
+
+from document_ia_worker.core.model_artifacts import resolve_and_verify_yoloworld_path
 
 
 YOLO_WORLD_MODEL = "yolov8m-world.pt"
@@ -29,8 +30,8 @@ def get_yoloworld_model() -> Any:
     if _MODEL_CACHE is None:
         from ultralytics import YOLOWorld  # pyright: ignore [reportPrivateImportUsage]
 
-        model_path = os.environ.get("YOLOWORLD_PATH", YOLO_WORLD_MODEL)
-        _MODEL_CACHE = YOLOWorld(model_path)  # pyright: ignore [reportConstantRedefinition]
+        verified_path = resolve_and_verify_yoloworld_path()
+        _MODEL_CACHE = YOLOWorld(str(verified_path))  # pyright: ignore [reportConstantRedefinition]
     return _MODEL_CACHE
 
 

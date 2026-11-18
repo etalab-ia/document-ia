@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from PIL import Image
@@ -95,6 +96,11 @@ def test_confidence_threshold_is_applied(monkeypatch):
 def test_model_path_uses_yoloworld_environment_variable(monkeypatch):
     monkeypatch.setenv("YOLOWORLD_PATH", "/tmp/custom-yoloworld.pt")
     monkeypatch.setattr(crop_mod, "_MODEL_CACHE", None)
+    monkeypatch.setattr(
+        crop_mod,
+        "resolve_and_verify_yoloworld_path",
+        lambda: Path(os.environ["YOLOWORLD_PATH"]),
+    )
 
     class FakeYOLOWorld:
         def __init__(self, path):
@@ -106,6 +112,7 @@ def test_model_path_uses_yoloworld_environment_variable(monkeypatch):
     )
 
     assert isinstance(crop_mod.get_yoloworld_model(), FakeYOLOWorld)
+
 
 def test_invalid_box_falls_back_to_original_image():
     image = Image.new("RGB", (100, 80), "white")

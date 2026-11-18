@@ -19,6 +19,10 @@ from qrdet import QRDetector
 from document_ia_infra.data.event.schema.barcode import BarcodePosition
 from document_ia_infra.redis.progress_tracker import get_current_progress_tracker
 from document_ia_worker.core.barcode_settings import barcode_settings
+from document_ia_worker.core.model_artifacts import (
+    ModelArtifactIntegrityError,
+    resolve_and_verify_qrdet_dir,
+)
 from document_ia_worker.workflow.main_workflow_context import StepMetadata
 from document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode import (
     _BARCODE_LOCK,
@@ -255,20 +259,17 @@ def _read_barcodes_compat(
     )
 
 
-# This method initialize and load the model for QR code detection using QRDet, YOLO model.
-# If the weights of the models are not already downloaded, it will download them from the official repository.
-# And store it inside default lib cache directory`.
+# This method initializes and loads the QRDet model after strictly verifying the SHA-256 of qrdet-s.pt
+# and current_release.txt. Implicit runtime downloads from the internet are forbidden.
 def _get_qrdet_detector() -> QRDetector:
     global _qrdet_detector
     if _qrdet_detector is None:
         model_size = barcode_settings.QRDET_MODEL_SIZE
-        weights_folder = barcode_settings.QRDET_WEIGHTS_DIR
-        if weights_folder:
-            _qrdet_detector = QRDetector(
-                model_size=model_size, weights_folder=weights_folder
-            )
-        else:
-            _qrdet_detector = QRDetector(model_size=model_size)
+        verified_dir = resolve_and_verify_qrdet_dir(model_size=model_size)
+        _qrdet_detector = QRDetector(
+            model_size=model_size,
+            weights_folder=str(verified_dir),
+        )
     return _qrdet_detector
 
 
@@ -412,6 +413,8 @@ class ExtractBarcode2DDocData(BaseExtractBarcode2DDoc):
                                 list[QRDetDetection],
                                 detector.detect(image=img, is_bgr=True),
                             )
+                        except ModelArtifactIntegrityError:
+                            raise
                         except Exception as exc:
                             logger.warning(f"QRDet detection failed: {exc}")
                             detections = []

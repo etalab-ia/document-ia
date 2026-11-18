@@ -10,28 +10,19 @@ export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
 export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
 export OPENCV_FOR_THREADS_NUM=${OPENCV_FOR_THREADS_NUM:-1}
 
-
-# The model downloaded during post_compile is bundled in the slug.
+# The models downloaded and verified during build are bundled in .models/
 APP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL_BUNDLED_PATH="$APP_ROOT/.models/yolov8m-world.pt"
-export TESSDATA_PREFIX="$APP_ROOT/.models/tessdata"
-TESSDATA_DIR="$TESSDATA_PREFIX"
+MODELS_DIR="${MODELS_DIR:-$APP_ROOT/.models}"
 
-if [ ! -f "$MODEL_BUNDLED_PATH" ]; then
-  echo "[boot] YOLO-World model is missing: $MODEL_BUNDLED_PATH" >&2
-  exit 1
-fi
-export YOLOWORLD_PATH="$MODEL_BUNDLED_PATH"
-echo "[boot] YOLO-World model available at $YOLOWORLD_PATH"
+export YOLOWORLD_PATH="${YOLOWORLD_PATH:-$MODELS_DIR/yolov8m-world.pt}"
+export QRDET_WEIGHTS_DIR="${QRDET_WEIGHTS_DIR:-$MODELS_DIR/qrdet}"
+export TESSDATA_PREFIX="${TESSDATA_PREFIX:-$MODELS_DIR/tessdata}"
 
-export QRDET_WEIGHTS_DIR="$APP_ROOT/.models/qrdet"
-if [ -d "$QRDET_WEIGHTS_DIR" ]; then
-  echo "[boot] QRDet model directory available at $QRDET_WEIGHTS_DIR"
-fi
+echo "[boot] Verifying SHA-256 integrity of bundled model artifacts in $MODELS_DIR..."
+PYTHONPATH="$APP_ROOT/src:${PYTHONPATH:-}" python -m document_ia_worker.core.model_artifacts \
+  --verify \
+  --models-dir "$MODELS_DIR"
 
-if [ ! -f "$TESSDATA_DIR/fra.traineddata" ]; then
-  echo "[boot] French Tesseract data is missing: $TESSDATA_DIR/fra.traineddata" >&2
-  exit 1
-fi
+echo "[boot] Model artifacts verified (YOLOWORLD_PATH=$YOLOWORLD_PATH, QRDET_WEIGHTS_DIR=$QRDET_WEIGHTS_DIR, TESSDATA_PREFIX=$TESSDATA_PREFIX)"
 
 exec python -u src/document_ia_worker/main.py
