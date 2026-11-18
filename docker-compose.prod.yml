@@ -18,6 +18,25 @@ services:
       retries: 10
       start_period: 10s
 
+  postgres-evals:
+    image: postgres:17-alpine
+    container_name: document-ia-prod-postgres-evals
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${EVALS_POSTGRES_DB:-experiments_db}
+      POSTGRES_USER: ${EVALS_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${EVALS_POSTGRES_PASSWORD:-postgres}  # ggignore
+    volumes:
+      - postgres_evals_data:/var/lib/postgresql/data
+    networks:
+      - document-ia-prod-network
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${EVALS_POSTGRES_USER:-postgres}", "-d", "${EVALS_POSTGRES_DB:-experiments_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   redis:
     image: redis:8-alpine
     container_name: document-ia-prod-redis
@@ -188,7 +207,6 @@ services:
       start_period: 30s
 
   evals:
-    profiles: ["full"]
     build:
       context: .
       dockerfile: document-ia-evals/Dockerfile
@@ -198,11 +216,12 @@ services:
       - "${EVALS_PORT:-8501}:8501"
     environment:
       APP_ENV: ${APP_ENV:-prod}
+      DOCUMENT_IA_BASE_URL: ${DOCUMENT_IA_BASE_URL:-http://api:8000/}
       DOCUMENT_IA_API_KEY: ${DOCUMENT_IA_API_KEY:?DOCUMENT_IA_API_KEY must be set in environment or root .env}
-      POSTGRES_DB: ${POSTGRES_DB:-document_ia}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}  # ggignore
-      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${EVALS_POSTGRES_DB:-experiments_db}
+      POSTGRES_USER: ${EVALS_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${EVALS_POSTGRES_PASSWORD:-postgres}  # ggignore
+      POSTGRES_HOST: postgres-evals
       POSTGRES_PORT: "5432"
       POSTGRES_SSL_MODE: disable
       POSTGRESQL_URL: ""
@@ -211,24 +230,26 @@ services:
       REDIS_DB: "0"
       REDIS_PASSWORD: ""
       REDIS_URL: ""
-      S3_ENDPOINT_URL: http://minio:9000
-      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}  # ggignore
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}  # ggignore
       S3_BUCKET_NAME: ${S3_BUCKET_NAME:-document-ia}
-      S3_REGION_NAME: ${S3_REGION_NAME:-us-east-1}
-      S3_USE_SSL: "false"
+      S3_REGION: ${S3_REGION_NAME:-us-east-1}
       LOKI_LOGGING_ENABLED: "false"
+      AUTH_BYPASS_LOCAL: ${AUTH_BYPASS_LOCAL:-false}
       PROCONNECT_CLIENT_ID: ${PROCONNECT_CLIENT_ID:-local-evals-client}
       PROCONNECT_CLIENT_SECRET: ${PROCONNECT_CLIENT_SECRET:-local-evals-secret}  # ggignore
     networks:
       - document-ia-prod-network
     depends_on:
-      postgres:
+      postgres-evals:
         condition: service_healthy
       redis:
         condition: service_healthy
       init-s3-bucket:
         condition: service_completed_successfully
+      api:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -242,107 +263,9 @@ services:
       retries: 6
       start_period: 30s
 
-  remove-ppi:
-    profiles: ["full"]
-    build:
-      context: .
-      dockerfile: document-ia-worker/Dockerfile
-      target: remove_ppi
-    container_name: document-ia-prod-remove-ppi
-    restart: "no"
-    environment:
-      APP_ENV: ${APP_ENV:-prod}
-      POSTGRES_DB: ${POSTGRES_DB:-document_ia}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}  # ggignore
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_SSL_MODE: disable
-      POSTGRESQL_URL: ""
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
-      REDIS_DB: "0"
-      REDIS_PASSWORD: ""
-      REDIS_URL: ""
-      S3_ENDPOINT_URL: http://minio:9000
-      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}  # ggignore
-      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-document-ia}
-      S3_REGION_NAME: ${S3_REGION_NAME:-us-east-1}
-      S3_USE_SSL: "false"
-      LOKI_LOGGING_ENABLED: "false"
-    networks:
-      - document-ia-prod-network
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      init-s3-bucket:
-        condition: service_completed_successfully
-
-  replicate-analytics:
-    profiles: ["full"]
-    build:
-      context: .
-      dockerfile: document-ia-worker/Dockerfile
-      target: replicate_analytics
-    container_name: document-ia-prod-replicate-analytics
-    restart: "no"
-    environment:
-      APP_ENV: ${APP_ENV:-prod}
-      POSTGRES_DB: ${POSTGRES_DB:-document_ia}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}  # ggignore
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_SSL_MODE: disable
-      POSTGRESQL_URL: ""
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
-      REDIS_DB: "0"
-      REDIS_PASSWORD: ""
-      REDIS_URL: ""
-      S3_ENDPOINT_URL: http://minio:9000
-      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}  # ggignore
-      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-document-ia}
-      S3_REGION_NAME: ${S3_REGION_NAME:-us-east-1}
-      S3_USE_SSL: "false"
-      LOKI_LOGGING_ENABLED: "false"
-    networks:
-      - document-ia-prod-network
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      init-s3-bucket:
-        condition: service_completed_successfully
-
-  auto-scaler:
-    profiles: ["full"]
-    build:
-      context: .
-      dockerfile: document-ia-auto-scaler/Dockerfile
-    container_name: document-ia-prod-auto-scaler
-    restart: unless-stopped
-    environment:
-      APP_ENV: ${APP_ENV:-prod}
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
-      REDIS_DB: "0"
-      REDIS_PASSWORD: ""
-      REDIS_URL: ""
-      LOKI_LOGGING_ENABLED: "false"
-    networks:
-      - document-ia-prod-network
-    depends_on:
-      redis:
-        condition: service_healthy
-
 volumes:
   postgres_prod_data:
+  postgres_evals_data:
   redis_prod_data:
   minio_prod_data:
 
