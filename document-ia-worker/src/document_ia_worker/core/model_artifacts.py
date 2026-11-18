@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -228,7 +229,7 @@ def resolve_and_verify_qrdet_dir(
         QRDET_ARTIFACT.sha256,
         QRDET_ARTIFACT.name,
     )
-    _ensure_qrdet_release_marker(qrdet_dir, allow_write=True)
+    _ensure_qrdet_release_marker(qrdet_dir, allow_write=False)
     return qrdet_dir
 
 
@@ -308,6 +309,11 @@ def verify_all_artifacts(models_dir: Path = DEFAULT_MODELS_DIR) -> dict[str, Pat
 
 
 def _download_file(url: str, destination: Path) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ModelArtifactIntegrityError(
+            f"Refusing to download model artifact from non-HTTPS URL: '{url}'"
+        )
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "document-ia-worker-artifact-verifier/1.0"},

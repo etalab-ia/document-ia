@@ -205,9 +205,15 @@ jobs:
                 -e POSTGRES_DB -e POSTGRES_HOST -e POSTGRES_USER -e POSTGRES_PASSWORD -e POSTGRES_PORT \
                 -e REDIS_HOST -e REDIS_PORT -e REDIS_DB -e S3_ENDPOINT_URL -e S3_ACCESS_KEY_ID -e S3_SECRET_ACCESS_KEY \
                 -e S3_BUCKET_NAME -e S3_REGION_NAME -e LOKI_LOGGING_ENABLED \
+                -e PROCONNECT_CLIENT_ID=smoke-client -e PROCONNECT_CLIENT_SECRET=smoke-secret \
                 --entrypoint python "$TAG" -c "
           import streamlit
-          import document_ia_evals
+          from pathlib import Path
+          from document_ia_evals.utils.auth_secrets import generate_secrets_toml
+          from document_ia_evals.services import administration_service
+          out = generate_secrets_toml(Path('/tmp/smoke-secrets.toml'))
+          assert out is not None and out.is_file()
+          assert administration_service is not None
           print('Evals smoke test OK, streamlit=', streamlit.__version__)
           "
               ;;
@@ -239,7 +245,15 @@ jobs:
             MODELS_JSON="null"
           fi
 
-          ARTIFACT="${ARTIFACT}"           ROLE="${{ matrix.role }}"           IMAGE_ID="${IMAGE_ID}"           PYTHON_VERSION="${PYTHON_VERSION}"           NIX_CLOSURES="${NIX_CLOSURES}"           FLAKE_LOCK_SHA256="${FLAKE_LOCK_SHA256}"           UV_LOCK_SHA256="${UV_LOCK_SHA256}"           MODELS_JSON="${MODELS_JSON}"           python3 - <<'PY' > "dist/inventory/${ARTIFACT}-inventory.json"
+          ARTIFACT="${ARTIFACT}" \
+            ROLE="${{ matrix.role }}" \
+            IMAGE_ID="${IMAGE_ID}" \
+            PYTHON_VERSION="${PYTHON_VERSION}" \
+            NIX_CLOSURES="${NIX_CLOSURES}" \
+            FLAKE_LOCK_SHA256="${FLAKE_LOCK_SHA256}" \
+            UV_LOCK_SHA256="${UV_LOCK_SHA256}" \
+            MODELS_JSON="${MODELS_JSON}" \
+            python3 - <<'PY' > "dist/inventory/${ARTIFACT}-inventory.json"
           import json
           import os
           inventory = {
@@ -277,7 +291,7 @@ jobs:
 
       - name: Log in to GitHub Container Registry (GHCR)
         if: ${{ steps.meta.outputs.should_push == 'true' }}
-        uses: docker/login-action@9780b0c442fbb1117ed29e0ef21e18412f756747 # v3.3.0
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f756747 # v3.3.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}

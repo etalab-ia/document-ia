@@ -85,6 +85,11 @@
             ]
             ++ lib.optionals pkgs.stdenv.isLinux [
               pkgs.libGL
+              pkgs.libxcb
+              pkgs.xorg.libX11
+              pkgs.xorg.libXext
+              pkgs.xorg.libSM
+              pkgs.xorg.libICE
             ]
           );
 

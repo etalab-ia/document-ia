@@ -312,3 +312,56 @@ def test_prewarm_models_is_fail_closed_on_integrity_error(
 
     with pytest.raises(ModelArtifactIntegrityError, match="tampered fra.traineddata"):
         worker_main._prewarm_models()
+
+
+def test_qrdet_loader_rejects_missing_or_tampered_release_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_qrdet_bytes = b"valid-qrdet-weights"
+    fake_spec = ModelArtifactSpec(
+        key="qrdet",
+        name="qrdet-s.pt",
+        url="https://example.invalid/qrdet-s.pt",
+        relative_path="qrdet/qrdet-s.pt",
+        sha256=hashlib.sha256(fake_qrdet_bytes).hexdigest(),
+        size_bytes=len(fake_qrdet_bytes),
+    )
+    monkeypatch.setattr(model_artifacts, "QRDET_ARTIFACT", fake_spec)
+
+    qrdet_dir = tmp_path / "qrdet"
+    qrdet_dir.mkdir(parents=True)
+    (qrdet_dir / "qrdet-s.pt").write_bytes(fake_qrdet_bytes)
+
+    # Missing current_release.txt must fail closed without writing to disk
+    marker_path = qrdet_dir / "current_release.txt"
+    with pytest.raises(
+        ModelArtifactIntegrityError, match="Invalid or missing QRDet release marker"
+    ):
+        resolve_and_verify_qrdet_dir(models_dir=tmp_path)
+    assert not marker_path.exists()
+
+    # Tampered current_release.txt must also fail closed without overwriting
+    tampered_url = "https://attacker.invalid/qrdet/releases/download/v2.0_release"
+    marker_path.write_text(tampered_url, encoding="utf-8")
+    with pytest.raises(
+        ModelArtifactIntegrityError, match="Invalid or missing QRDet release marker"
+    ):
+        resolve_and_verify_qrdet_dir(models_dir=tmp_path)
+    assert marker_path.read_text(encoding="utf-8") == tampered_url
+
+    # Exact pinned marker passes
+    marker_path.write_text(QRDET_RELEASE_URL, encoding="utf-8")
+    assert resolve_and_verify_qrdet_dir(models_dir=tmp_path) == qrdet_dir
+
+
+def test_download_file_rejects_non_https_scheme(tmp_path: Path) -> None:
+    destination = tmp_path / "model.pt"
+
+    with pytest.raises(ModelArtifactIntegrityError, match="non-HTTPS URL"):
+        model_artifacts._download_file("file:///etc/passwd", destination)
+
+    with pytest.raises(ModelArtifactIntegrityError, match="non-HTTPS URL"):
+        model_artifacts._download_file("http://example.invalid/model.pt", destination)
+
+    assert not destination.exists()

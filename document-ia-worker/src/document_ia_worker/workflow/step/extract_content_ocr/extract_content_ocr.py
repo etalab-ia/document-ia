@@ -1,4 +1,5 @@
 import logging
+import shlex
 from typing import Any, Optional
 
 import cv2
@@ -45,9 +46,7 @@ class ExtractContentOcrStep(BaseStep[OcrResult]):
         verified_lang_data = resolve_and_verify_tesseract_lang_data(self.tesseract_lang)
         base_config = f"--psm {self.tesseract_psm} --oem {self.tesseract_oem}"
         if verified_lang_data is not None:
-            self.tesseract_config = (
-                f'{base_config} --tessdata-dir "{verified_lang_data.parent}"'
-            )
+            self.tesseract_config = f"{base_config} --tessdata-dir {shlex.quote(str(verified_lang_data.parent))}"
         else:
             self.tesseract_config = base_config
 

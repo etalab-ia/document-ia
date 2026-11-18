@@ -28,6 +28,10 @@ dependencies = [
     "torchvision == 0.29.2; sys_platform == 'darwin'",
     "qrdet == 2.5",
     "clip",
+    "ultralytics == 8.4.91",
+    "pillow == 13.0.0",
+    "numpy == 2.5.1",
+    "sqlalchemy == 2.1.8",
 ]
 
 [build-system]
