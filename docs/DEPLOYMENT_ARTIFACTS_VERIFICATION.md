@@ -118,7 +118,7 @@ To eliminate unpinned OS package installation (`apt-get`), strip build tools fro
 
 1. **Pinned Builder Stage**: `FROM nixos/nix:2.28.5@sha256:e2bff159b88c242722022a273d3832a4392f01dba35b796204d852b89042526e AS builder` builds the role's `runtime-*` environment (without `uv` or `git`) and `build-tools` separately. Python dependencies are cached in two layers (`uv sync --locked --no-dev --no-install-workspace` on manifests, then `uv sync --locked --no-dev --no-editable` on source code).
 2. **Minimal `FROM scratch` Runtime Stage**: Only the strict Nix runtime closure (`nix-store -qR /nix-env`) and `/app` are copied into `FROM scratch`. Neither `nix`, `uv`, nor `git` is present in any production image, and model weights in `worker` are never duplicated in `/nix/store`.
-3. **Least-Privilege Permissions**: `/app`, `.venv`, and `.models/` are owned by `root:root` (`0:0`) with read-only permissions for execution UID `10001:10001` (`chmod -R a-w,a+rX` on `.models/`). Only `/tmp`, `/home/appuser` (and `/app/document-ia-evals/.streamlit` for runtime `secrets.toml` generation) are writable by `appuser`.
+3. **Least-Privilege Permissions**: `/app`, `.venv`, and `.models/` are owned by `root:root` (`0:0`) with read-only permissions for execution UID `10001:10001` (`chmod -R a-w,a+rX` on `.models/`). Only `/tmp`, `/home/appuser`, `/app/document-ia-evals/.streamlit` (for runtime `secrets.toml` generation), and `/app/document-ia-evals/src/document_ia_evals/static/review-pdfs` (for the PDF preview cache) are writable by `appuser`; all application source files remain read-only.
 
 | GHCR Image Repository | Dockerfile | Target | Role / Entrypoint |
 | :--- | :--- | :--- | :--- |
@@ -148,7 +148,7 @@ Triggered only on manual dispatch (`workflow_dispatch`, verification-only mode, 
 2. Builds all 6 multi-stage Nix-backed container images locally.
 3. Verifies container hardening across all 6 images (`nix`, `uv`, and `git` are absent; `/app` and `.models/` are read-only for UID `10001`).
 4. Runs a **negative integrity test** (`--network none`) on `document-ia-worker` proving that flipping 1 byte in `yolov8m-world.pt` or `clip/ViT-B-32.pt` causes `model_artifacts --verify`, `get_yoloworld_model()`, and `detect_boxes()` to fail closed before `torch.load` / `clip.load`.
-5. Runs **offline smoke tests** (`--network none`) on all 6 images (including `_prewarm_models()` and `detect_boxes()` in the worker image).
+5. Runs **offline smoke tests** (`--network none`) on all 6 images (including `_prewarm_models()` and `detect_boxes()` in the worker image, and an actual PDF-preview write/read-back as UID `10001` in the evals image while verifying that application source remains read-only).
 6. When `should_push == 'true'`, logs in to GHCR (`docker/login-action` pinned by 40-char SHA) and pushes the already-verified local images to `ghcr.io/etalab-ia/*` (`<tag>`, `sha-<12>`, `latest`).
 7. Generates and uploads a **verifiable JSON & Markdown component inventory** recording the image SHA-256 digest, `repo_digest` and `published_tags` (on release pushes), Nix store runtime path, `flake.lock` SHA-256, `uv.lock` SHA-256, and all 4 verified model hashes.
 

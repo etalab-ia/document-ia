@@ -242,6 +242,7 @@ jobs:
           import importlib.util
           import streamlit
           from pathlib import Path
+          from document_ia_evals.pages import review_prediction_errors as preview
           from document_ia_evals.utils.auth_secrets import generate_secrets_toml
           from document_ia_evals.services import administration_service
           assert not Path('/app/document-ia-evals/.streamlit/secrets.toml').exists()
@@ -249,7 +250,19 @@ jobs:
           assert out is not None and out.is_file()
           assert importlib.util.find_spec('document_ia_evals.app') is not None
           assert administration_service is not None
-          print('Evals smoke test OK, streamlit=', streamlit.__version__)
+          preview.load_pdf_bytes = lambda _: b'%PDF-1.4\n'
+          preview_url = preview.save_pdf_locally('https://example.test/preview.pdf')
+          preview_dir = Path(preview.__file__).resolve().parent.parent / 'static' / 'review-pdfs'
+          preview_path = preview_dir / preview_url.rsplit('/', 1)[-1]
+          assert preview_path.read_bytes() == b'%PDF-1.4\n'
+          assert preview_path.stat().st_uid == 10001
+          try:
+              (Path(preview.__file__).parent / '.write-test').touch()
+          except PermissionError:
+              pass
+          else:
+              raise AssertionError('Application source directory must remain read-only')
+          print('Evals smoke test OK, streamlit=', streamlit.__version__, 'PDF preview storage writable')
           "
               ;;
             auto-scaler)

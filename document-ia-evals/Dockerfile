@@ -53,9 +53,9 @@ RUN mkdir -p /runtime-root/nix/store /runtime-root/bin /runtime-root/usr/bin /ru
  && chmod 1777 /runtime-root/tmp \
  && chown -R 0:0 /app \
  && chmod -R u=rwX,go=rX /app \
- && mkdir -p /app/document-ia-evals/.streamlit \
- && chown 10001:10001 /app/document-ia-evals/.streamlit \
- && chmod 0755 /app/document-ia-evals/.streamlit
+ && mkdir -p /app/document-ia-evals/.streamlit /app/document-ia-evals/src/document_ia_evals/static/review-pdfs \
+ && chown 10001:10001 /app/document-ia-evals/.streamlit /app/document-ia-evals/src/document_ia_evals/static/review-pdfs \
+ && chmod 0755 /app/document-ia-evals/.streamlit /app/document-ia-evals/src/document_ia_evals/static/review-pdfs
 
 FROM scratch
 
