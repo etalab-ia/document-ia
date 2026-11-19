@@ -63,6 +63,7 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
 git -C "${TMP_DIR}" init -q
+git -C "${TMP_DIR}" config core.hooksPath /dev/null
 git -C "${TMP_DIR}" config user.name "Security Probe"
 git -C "${TMP_DIR}" config user.email "security-probe@document-ia.local"
 git -C "${TMP_DIR}" config commit.gpgsign false
@@ -116,8 +117,18 @@ import sys
 
 report_path = Path(sys.argv[1])
 expected_rule = sys.argv[2]
+if not report_path.is_file():
+    print(
+        f"erreur: rapport Gitleaks introuvable ({report_path}) — échec probable de configuration.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 findings = json.loads(report_path.read_text(encoding="utf-8"))
-rules = {item.get("RuleID") for item in findings if isinstance(item, dict)}
+rules = {
+    rule_id
+    for item in findings
+    if isinstance(item, dict) and isinstance((rule_id := item.get("RuleID")), str)
+}
 if expected_rule not in rules:
     print(
         f"erreur: la règle attendue '{expected_rule}' n'apparaît pas dans le rapport Gitleaks (règles: {sorted(rules)}).",
@@ -159,8 +170,18 @@ import sys
 
 report_path = Path(sys.argv[1])
 expected_rule = sys.argv[2]
+if not report_path.is_file():
+    print(
+        f"erreur: rapport Gitleaks introuvable ({report_path}) — échec probable de configuration.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 findings = json.loads(report_path.read_text(encoding="utf-8"))
-rules = {item.get("RuleID") for item in findings if isinstance(item, dict)}
+rules = {
+    rule_id
+    for item in findings
+    if isinstance(item, dict) and isinstance((rule_id := item.get("RuleID")), str)
+}
 if expected_rule not in rules:
     print(
         f"erreur: la règle attendue '{expected_rule}' n'apparaît pas dans le rapport Gitleaks (règles: {sorted(rules)}).",
