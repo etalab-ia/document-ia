@@ -27,8 +27,11 @@ dependencies = [
     "torchvision == 0.29.2+cpu; sys_platform == 'linux'",
     "torchvision == 0.29.2; sys_platform == 'darwin'",
     "qrdet == 2.5",
-    "pyright == 1.1.414",
     "clip",
+    "ultralytics == 8.4.91",
+    "pillow == 13.0.0",
+    "numpy == 2.5.1",
+    "sqlalchemy == 2.1.8",
 ]
 
 [build-system]
@@ -42,10 +45,11 @@ dev = [
     "pytest-asyncio == 1.4.1.post1",
     "pre-commit == 4.7.0",
     "uvicorn == 0.54.0",
+    "pyright == 1.1.414",
 ]
 
 [tool.uv.sources]
-clip = { git = "https://github.com/ultralytics/CLIP.git" }
+clip = { git = "https://github.com/ultralytics/CLIP.git", rev = "c4b6ea0932a2c0f39a0fa528af5ec4982ff15cab" }
 
 [tool.uv.sources.document-ia-infra]
 workspace = true

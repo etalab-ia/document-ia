@@ -362,6 +362,9 @@ async def test_extract_barcode_2ddoc_large_image_downscaled_and_positions_rescal
     detected_pos = DummyPosition((100, 200), (200, 200), (200, 300), (100, 300))
     detected_barcode = DummyBarcode("TEST_CODE", "QRCode", detected_pos)
 
+    mock_detector = MagicMock()
+    mock_detector.detect.return_value = []
+
     mock_pil = MagicMock()
     mock_pil.size = (2400, 4800)
     mock_pil.__enter__.return_value = mock_pil
@@ -369,6 +372,10 @@ async def test_extract_barcode_2ddoc_large_image_downscaled_and_positions_rescal
     with (
         patch("PIL.Image.open", return_value=mock_pil),
         patch("cv2.imread", return_value=raw_img),
+        patch(
+            "document_ia_worker.workflow.step.extract_barcode_data.extract_barcode_2ddoc_data._get_qrdet_detector",
+            return_value=mock_detector,
+        ),
         patch(
             "document_ia_worker.workflow.step.extract_barcode_data.extract_barcode_2ddoc_data._read_barcodes_compat",
             return_value=[detected_barcode],

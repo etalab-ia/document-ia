@@ -57,16 +57,40 @@ _consumer: ThreadConsumer[WorkflowExecutionMessage] | None = None
 
 
 def _prewarm_models() -> None:
-    logger.info("[boot] Pre-warming AI models (YOLO-World & QRDet)...")
+    logger.info(
+        "[boot] Verifying and pre-warming AI/OCR models (Tesseract, YOLO-World, CLIP, QRDet)..."
+    )
     try:
+        from document_ia_worker.core.model_artifacts import (
+            resolve_and_verify_tesseract_lang_data,
+        )
+
+        tess_path = resolve_and_verify_tesseract_lang_data("fra")
+        logger.info("[boot]   ✅ Tesseract French model verified at %s", tess_path)
+    except Exception as e:
+        logger.critical("[boot]   ❌ Could not verify Tesseract French model: %s", e)
+        raise
+
+    try:
+        from document_ia_worker.core.model_artifacts import (
+            resolve_and_verify_clip_path,
+        )
         from document_ia_worker.core.preprocessing.yoloworld_crop import (
+            ensure_yoloworld_classes,
             get_yoloworld_model,
         )
 
-        get_yoloworld_model()
-        logger.info("[boot]   ✅ YOLO-World model pre-loaded into RAM")
+        clip_path = resolve_and_verify_clip_path()
+        logger.info("[boot]   ✅ CLIP ViT-B/32 weights verified at %s", clip_path)
+        yolo_model = get_yoloworld_model()
+        if hasattr(yolo_model, "set_classes"):
+            ensure_yoloworld_classes(yolo_model, "book")
+        logger.info(
+            "[boot]   ✅ YOLO-World & CLIP models verified and pre-loaded into RAM"
+        )
     except Exception as e:
-        logger.warning("[boot]   ⚠️ Could not pre-load YOLO-World model: %s", e)
+        logger.critical("[boot]   ❌ Could not pre-load YOLO-World/CLIP model: %s", e)
+        raise
 
     try:
         from document_ia_worker.workflow.step.extract_barcode_data.extract_barcode_2ddoc_data import (
@@ -74,9 +98,10 @@ def _prewarm_models() -> None:
         )
 
         _get_qrdet_detector()
-        logger.info("[boot]   ✅ QRDet model pre-loaded into RAM")
+        logger.info("[boot]   ✅ QRDet model verified and pre-loaded into RAM")
     except Exception as e:
-        logger.warning("[boot]   ⚠️ Could not pre-load QRDet model: %s", e)
+        logger.critical("[boot]   ❌ Could not pre-load QRDet model: %s", e)
+        raise
 
 
 async def run_consumer(stop_event: asyncio.Event | None = None) -> None:
@@ -126,16 +151,11 @@ def _register_signal_handlers(
 
     for s in sigs:
         try:
-            loop.add_signal_handler(s, stop_event.set)
-            registered_loop_sigs.append(s)
-        except NotImplementedError:
             try:
+                loop.add_signal_handler(s, stop_event.set)
+                registered_loop_sigs.append(s)
+            except NotImplementedError:
                 signal.signal(s, _fallback_handler)
-            except ValueError, RuntimeError:
-                logger.warning(
-                    "Impossible d'enregistrer le handler pour le signal %s (environnement non supporté)",
-                    s,
-                )
         except ValueError, RuntimeError:
             logger.warning(
                 "Impossible d'enregistrer le handler pour le signal %s (environnement non supporté)",

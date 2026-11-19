@@ -1,0 +1,374 @@
+name: document-ia Deployment Artifacts CD (Nix + GHCR)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  REGISTRY_NAMESPACE: etalab-ia
+
+jobs:
+  build-verify-and-publish:
+    name: Build, Verify & Inventory (${{ matrix.artifact }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: document-ia-api
+            dockerfile: document-ia-api/Dockerfile
+            target: ""
+            role: api
+          - artifact: document-ia-worker
+            dockerfile: document-ia-worker/Dockerfile
+            target: worker
+            role: worker
+          - artifact: document-ia-remove-ppi
+            dockerfile: document-ia-worker/Dockerfile
+            target: remove_ppi
+            role: remove-ppi
+          - artifact: document-ia-replicate-analytics
+            dockerfile: document-ia-worker/Dockerfile
+            target: replicate_analytics
+            role: replicate-analytics
+          - artifact: document-ia-evals
+            dockerfile: document-ia-evals/Dockerfile
+            target: ""
+            role: evals
+          - artifact: document-ia-auto-scaler
+            dockerfile: document-ia-auto-scaler/Dockerfile
+            target: ""
+            role: auto-scaler
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && '0' || '1' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          IMAGE_REPO="${REGISTRY}/${REGISTRY_NAMESPACE}/${{ matrix.artifact }}"
+          LOCAL_TAG="${{ matrix.artifact }}:${GITHUB_SHA}"
+          echo "image_repo=${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
+          echo "local_tag=${LOCAL_TAG}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == refs/tags/v* ]]; then
+            git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+            if git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+              REF_NAME="${GITHUB_REF_NAME}"
+              echo "should_push=true" >> "$GITHUB_OUTPUT"
+              echo "tags=${IMAGE_REPO}:${REF_NAME},${IMAGE_REPO}:sha-${GITHUB_SHA::12},${IMAGE_REPO}:latest" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Refusing to publish tag ${GITHUB_REF_NAME} (${GITHUB_SHA}): commit is not on main."
+              exit 1
+            fi
+          else
+            echo "should_push=false" >> "$GITHUB_OUTPUT"
+            echo "tags=${LOCAL_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Nix-based container image (${{ matrix.artifact }})
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          load: true
+          tags: ${{ steps.meta.outputs.local_tag }}
+          cache-from: type=gha,scope=nix-docker-${{ matrix.artifact }}
+          cache-to: type=gha,mode=max,scope=nix-docker-${{ matrix.artifact }}
+
+      - name: Verify Container Hardening (No build tools & read-only app/models)
+        run: |
+          docker run --rm --entrypoint bash "${{ steps.meta.outputs.local_tag }}" -euo pipefail -c '
+            if command -v nix >/dev/null 2>&1 || command -v uv >/dev/null 2>&1 || command -v git >/dev/null 2>&1; then
+              echo "ERROR: Build tools (nix/uv/git) found in runtime image!" >&2
+              exit 1
+            fi
+            if touch /app/.write-test 2>/dev/null; then
+              echo "ERROR: /app must be read-only for appuser!" >&2
+              exit 1
+            fi
+            if [[ -d /app/document-ia-worker/.models ]]; then
+              if touch /app/document-ia-worker/.models/.write-test 2>/dev/null; then
+                echo "ERROR: .models/ must be read-only for appuser!" >&2
+                exit 1
+              fi
+            fi
+            echo "Container hardening verified: no nix/uv/git and read-only /app."
+          '
+
+      - name: Negative Integrity Test (Tampered model weights must fail closed)
+        if: ${{ matrix.role == 'worker' }}
+        run: |
+          docker run --rm --network none --entrypoint bash "${{ steps.meta.outputs.local_tag }}" -euo pipefail -c '
+            cp -R /app/document-ia-worker/.models /tmp/tampered-models
+            chmod -R u+w /tmp/tampered-models
+            python -c "
+          from pathlib import Path
+          for rel in (\"yolov8m-world.pt\", \"clip/ViT-B-32.pt\"):
+              p = Path(\"/tmp/tampered-models\") / rel
+              data = bytearray(p.read_bytes())
+              data[0] ^= 0xFF
+              p.write_bytes(bytes(data))
+          "
+            if python -m document_ia_worker.core.model_artifacts --verify --models-dir /tmp/tampered-models; then
+              echo "ERROR: Tampered models unexpectedly passed --verify!" >&2
+              exit 1
+            fi
+            if YOLOWORLD_PATH=/tmp/tampered-models/yolov8m-world.pt python -c "from document_ia_worker.core.preprocessing.yoloworld_crop import get_yoloworld_model; get_yoloworld_model()"; then
+              echo "ERROR: Tampered yolov8m-world.pt was loaded by get_yoloworld_model()!" >&2
+              exit 1
+            fi
+            if CLIP_WEIGHTS_PATH=/tmp/tampered-models/clip/ViT-B-32.pt python -c "from PIL import Image; from document_ia_worker.core.preprocessing.yoloworld_crop import detect_boxes; detect_boxes(Image.new(\"RGB\", (64, 64), \"white\"), class_name=\"book\", confidence_threshold=0.25)"; then
+              echo "ERROR: Tampered ViT-B-32.pt was loaded by detect_boxes()!" >&2
+              exit 1
+            fi
+            echo "Negative integrity check passed: tampered YOLO-World and CLIP weights rejected before torch.load."
+          '
+
+      - name: Smoke Test (${{ matrix.artifact }})
+        env:
+          API_KEY: smoke-test-api-key
+          POSTGRES_DB: document_ia_smoke
+          POSTGRES_HOST: localhost
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: smoke-password
+          POSTGRES_PORT: "5432"
+          REDIS_HOST: localhost
+          REDIS_PORT: "6379"
+          REDIS_DB: "0"
+          S3_ENDPOINT_URL: http://localhost:9000
+          S3_ACCESS_KEY_ID: minioadmin
+          S3_SECRET_ACCESS_KEY: minioadmin
+          S3_BUCKET_NAME: document-ia-smoke
+          S3_REGION_NAME: us-east-1
+          LOKI_LOGGING_ENABLED: "false"
+        run: |
+          ROLE="${{ matrix.role }}"
+          TAG="${{ steps.meta.outputs.local_tag }}"
+          WEBHOOK_SECRET_ENCRYPTION_KEY="$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+          export WEBHOOK_SECRET_ENCRYPTION_KEY
+
+          case "$ROLE" in
+            api)
+              docker run --rm --network none \
+                -e API_KEY -e POSTGRES_DB -e POSTGRES_HOST -e POSTGRES_USER -e POSTGRES_PASSWORD -e POSTGRES_PORT \
+                -e REDIS_HOST -e REDIS_PORT -e REDIS_DB -e S3_ENDPOINT_URL -e S3_ACCESS_KEY_ID -e S3_SECRET_ACCESS_KEY \
+                -e S3_BUCKET_NAME -e S3_REGION_NAME -e WEBHOOK_SECRET_ENCRYPTION_KEY -e LOKI_LOGGING_ENABLED \
+                --entrypoint python "$TAG" -c "
+          import magic
+          import gunicorn
+          import uvicorn
+          from document_ia_api.main import app
+          assert app.title is not None
+          print('API smoke test OK:', app.title)
+          "
+              ;;
+            worker)
+              docker run --rm --network none \
+                -e POSTGRES_DB -e POSTGRES_HOST -e POSTGRES_USER -e POSTGRES_PASSWORD -e POSTGRES_PORT \
+                -e REDIS_HOST -e REDIS_PORT -e REDIS_DB -e S3_ENDPOINT_URL -e S3_ACCESS_KEY_ID -e S3_SECRET_ACCESS_KEY \
+                -e S3_BUCKET_NAME -e S3_REGION_NAME -e LOKI_LOGGING_ENABLED \
+                --entrypoint python "$TAG" -c "
+          from PIL import Image
+          from document_ia_worker.core.model_artifacts import verify_all_artifacts
+          from document_ia_worker.core.preprocessing.yoloworld_crop import detect_boxes
+          from document_ia_worker.main import _prewarm_models
+
+          verified = verify_all_artifacts()
+          assert set(verified.keys()) == {'yoloworld', 'clip', 'qrdet', 'tesseract_fra'}
+          _prewarm_models()
+          boxes = detect_boxes(
+              Image.new('RGB', (128, 128), 'white'),
+              class_name='book',
+              confidence_threshold=0.25,
+          )
+          assert isinstance(boxes, list)
+          print('Worker offline smoke test & 4-model pre-warming OK')
+          "
+              ;;
+            remove-ppi)
+              docker run --rm --network none \
+                -e POSTGRES_DB -e POSTGRES_HOST -e POSTGRES_USER -e POSTGRES_PASSWORD -e POSTGRES_PORT \
+                -e REDIS_HOST -e REDIS_PORT -e REDIS_DB -e S3_ENDPOINT_URL -e S3_ACCESS_KEY_ID -e S3_SECRET_ACCESS_KEY \
+                -e S3_BUCKET_NAME -e S3_REGION_NAME -e LOKI_LOGGING_ENABLED \
+                --entrypoint python "$TAG" -c "
+          from pathlib import Path
+          from document_ia_task_scheduler.task.remove_ppi.job import RemovePPI
+          assert not Path('/app/document-ia-worker/.models/yolov8m-world.pt').exists()
+          assert RemovePPI is not None
+          print('RemovePPI scheduler image smoke test OK')
+          "
+              ;;
+            replicate-analytics)
+              docker run --rm --network none \
+                -e POSTGRES_DB -e POSTGRES_HOST -e POSTGRES_USER -e POSTGRES_PASSWORD -e POSTGRES_PORT \
+                -e REDIS_HOST -e REDIS_PORT -e REDIS_DB -e S3_ENDPOINT_URL -e S3_ACCESS_KEY_ID -e S3_SECRET_ACCESS_KEY \
+                -e S3_BUCKET_NAME -e S3_REGION_NAME -e LOKI_LOGGING_ENABLED \
+                --entrypoint python "$TAG" -c "
+          from pathlib import Path
+          from document_ia_task_scheduler.task.replicate_analytics.job import ReplicateAnalytics
+          assert not Path('/app/document-ia-worker/.models/yolov8m-world.pt').exists()
+          assert ReplicateAnalytics is not None
+          print('ReplicateAnalytics scheduler image smoke test OK')
+          "
+              ;;
+            evals)
+              docker run --rm --network none \
+                -e POSTGRES_DB -e POSTGRES_HOST -e POSTGRES_USER -e POSTGRES_PASSWORD -e POSTGRES_PORT \
+                -e REDIS_HOST -e REDIS_PORT -e REDIS_DB -e S3_ENDPOINT_URL -e S3_ACCESS_KEY_ID -e S3_SECRET_ACCESS_KEY \
+                -e S3_BUCKET_NAME -e S3_REGION_NAME -e LOKI_LOGGING_ENABLED \
+                -e PROCONNECT_CLIENT_ID=smoke-client -e PROCONNECT_CLIENT_SECRET=smoke-secret \
+                --entrypoint python "$TAG" -c "
+          import importlib.util
+          import streamlit
+          from pathlib import Path
+          from document_ia_evals.pages import review_prediction_errors as preview
+          from document_ia_evals.utils.auth_secrets import generate_secrets_toml
+          from document_ia_evals.services import administration_service
+          assert not Path('/app/document-ia-evals/.streamlit/secrets.toml').exists()
+          out = generate_secrets_toml(Path('/app/document-ia-evals/.streamlit/secrets.toml'))
+          assert out is not None and out.is_file()
+          assert importlib.util.find_spec('document_ia_evals.app') is not None
+          assert administration_service is not None
+          preview.load_pdf_bytes = lambda _: b'%PDF-1.4\n'
+          preview_url = preview.save_pdf_locally('https://example.test/preview.pdf')
+          preview_dir = Path(preview.__file__).resolve().parent.parent / 'static' / 'review-pdfs'
+          preview_path = preview_dir / preview_url.rsplit('/', 1)[-1]
+          assert preview_path.read_bytes() == b'%PDF-1.4\n'
+          assert preview_path.stat().st_uid == 10001
+          try:
+              (Path(preview.__file__).parent / '.write-test').touch()
+          except PermissionError:
+              pass
+          else:
+              raise AssertionError('Application source directory must remain read-only')
+          print('Evals smoke test OK, streamlit=', streamlit.__version__, 'PDF preview storage writable')
+          "
+              ;;
+            auto-scaler)
+              docker run --rm --network none \
+                -e REDIS_HOST -e REDIS_PORT -e REDIS_DB -e LOKI_LOGGING_ENABLED \
+                --entrypoint python "$TAG" -c "
+          import document_ia_auto_scaler.main as scaler_main
+          assert scaler_main is not None
+          print('Auto-scaler smoke test OK')
+          "
+              ;;
+          esac
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        if: ${{ steps.meta.outputs.should_push == 'true' }}
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push verified image to GHCR (${{ matrix.artifact }})
+        if: ${{ steps.meta.outputs.should_push == 'true' }}
+        id: push_image
+        run: |
+          IFS=',' read -ra TAGS <<< "${{ steps.meta.outputs.tags }}"
+          for tag in "${TAGS[@]}"; do
+            docker tag "${{ steps.meta.outputs.local_tag }}" "$tag"
+            docker push "$tag"
+          done
+          REPO_DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${TAGS[0]}" || true)"
+          echo "repo_digest=${REPO_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "published_tags=${{ steps.meta.outputs.tags }}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Verifiable Component Inventory & SHA-256 Manifest
+        run: |
+          mkdir -p dist/inventory
+          TAG="${{ steps.meta.outputs.local_tag }}"
+          ARTIFACT="${{ matrix.artifact }}"
+          IMAGE_ID="$(docker image inspect --format='{{.Id}}' "$TAG")"
+          FLAKE_LOCK_SHA256="$(sha256sum flake.lock | awk '{print $1}')"
+          UV_LOCK_SHA256="$(sha256sum uv.lock | awk '{print $1}')"
+          PYTHON_VERSION="$(docker run --rm --entrypoint python "$TAG" --version)"
+          NIX_CLOSURES="$(docker run --rm --entrypoint bash "$TAG" -c 'readlink -f /nix-env')"
+
+          if [[ "${{ matrix.role }}" == "worker" ]]; then
+            MODELS_JSON="$(docker run --rm --entrypoint python "$TAG" -m document_ia_worker.core.model_artifacts --print-inventory)"
+          else
+            MODELS_JSON="null"
+          fi
+
+          ARTIFACT="${ARTIFACT}" \
+            ROLE="${{ matrix.role }}" \
+            IMAGE_ID="${IMAGE_ID}" \
+            SHOULD_PUSH="${{ steps.meta.outputs.should_push }}" \
+            PUBLISHED_TAGS="${{ steps.push_image.outputs.published_tags }}" \
+            REPO_DIGEST="${{ steps.push_image.outputs.repo_digest }}" \
+            PYTHON_VERSION="${PYTHON_VERSION}" \
+            NIX_CLOSURES="${NIX_CLOSURES}" \
+            FLAKE_LOCK_SHA256="${FLAKE_LOCK_SHA256}" \
+            UV_LOCK_SHA256="${UV_LOCK_SHA256}" \
+            MODELS_JSON="${MODELS_JSON}" \
+            python3 - <<'PY' > "dist/inventory/${ARTIFACT}-inventory.json"
+          import json
+          import os
+
+          should_push = os.environ.get("SHOULD_PUSH") == "true"
+          raw_tags = os.environ.get("PUBLISHED_TAGS", "").strip()
+          published_tags = [t for t in raw_tags.split(",") if t] if should_push and raw_tags else []
+          repo_digest = os.environ.get("REPO_DIGEST", "").strip() or None
+
+          inventory = {
+              "artifact": os.environ["ARTIFACT"],
+              "role": os.environ["ROLE"],
+              "git_sha": os.environ["GITHUB_SHA"],
+              "image_id": os.environ["IMAGE_ID"],
+              "published_tags": published_tags,
+              "repo_digest": repo_digest if should_push else None,
+              "python_version": os.environ["PYTHON_VERSION"],
+              "nix_runtime_store_path": os.environ["NIX_CLOSURES"],
+              "flake_lock_sha256": os.environ["FLAKE_LOCK_SHA256"],
+              "uv_lock_sha256": os.environ["UV_LOCK_SHA256"],
+              "models_inventory": json.loads(os.environ["MODELS_JSON"]),
+          }
+          print(json.dumps(inventory, indent=2, sort_keys=True))
+          PY
+
+          {
+            echo "### 📦 Deployment Artifact: \`${ARTIFACT}\`"
+            echo "- **Image ID (SHA-256)**: \`${IMAGE_ID}\`"
+            echo "- **Nix Store Runtime**: \`${NIX_CLOSURES}\`"
+            echo "- **Python Version**: \`${PYTHON_VERSION}\`"
+            echo "- **\`flake.lock\` SHA-256**: \`${FLAKE_LOCK_SHA256}\`"
+            echo "- **\`uv.lock\` SHA-256**: \`${UV_LOCK_SHA256}\`"
+            if [[ "${{ matrix.role }}" == "worker" ]]; then
+              echo "- **Verified AI/OCR Models**: \`yolov8m-world.pt\`, \`ViT-B-32.pt\`, \`qrdet-s.pt\`, \`fra.traineddata\`"
+            fi
+            if [[ "${{ steps.meta.outputs.should_push }}" == "true" ]]; then
+              echo "- **Published GHCR Tags**: \`${{ steps.push_image.outputs.published_tags }}\`"
+              echo "- **Published GHCR Digest**: \`${{ steps.push_image.outputs.repo_digest }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Component Inventory Artifact
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: inventory-${{ matrix.artifact }}
+          path: dist/inventory/${{ matrix.artifact }}-inventory.json
+          retention-days: 30
