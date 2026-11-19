@@ -365,8 +365,15 @@ async def test_dependency_status_classification(status, category):
 
 
 async def test_dependency_and_internal_error_classes():
+    from document_ia_infra.exception.security_exception import (
+        SecurityException,
+        WebhookOrganizationMismatchException,
+    )
+
     assert classify_failure(httpx.ReadTimeout("private")) == "temporary"
     assert classify_failure(ValueError("private")) == "permanent"
+    assert classify_failure(SecurityException("private")) == "permanent"
+    assert classify_failure(WebhookOrganizationMismatchException()) == "permanent"
     assert classify_failure(RuntimeError("private")) == "internal"
 
 

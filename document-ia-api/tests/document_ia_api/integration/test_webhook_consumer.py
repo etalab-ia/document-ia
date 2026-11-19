@@ -51,11 +51,18 @@ class SampleWebhookMessage(SerializableMessage):
         )
 
 
-def _make_webhook_dto(webhook_id: UUID, url: str) -> WebHookDTO:
+DEFAULT_TEST_ORG_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
+def _make_webhook_dto(
+    webhook_id: UUID,
+    url: str,
+    organization_id: UUID = DEFAULT_TEST_ORG_ID,
+) -> WebHookDTO:
     now = datetime.now(UTC)
     return WebHookDTO(
         id=webhook_id,
-        organization_id=uuid4(),
+        organization_id=organization_id,
         url=url,
         headers={"X-Webhook-Test": "1"},
         created_at=now,
@@ -63,19 +70,21 @@ def _make_webhook_dto(webhook_id: UUID, url: str) -> WebHookDTO:
     )
 
 
-def _make_event_dto(execution_id: str) -> EventDTO:
-    org_id = uuid4()
+def _make_event_dto(
+    execution_id: str,
+    organization_id: UUID = DEFAULT_TEST_ORG_ID,
+) -> EventDTO:
     return EventDTO(
         id=uuid4(),
         workflow_id="wf-webhook-test",
-        organization_id=org_id,
+        organization_id=organization_id,
         execution_id=execution_id,
         created_at=datetime.now(UTC),
         event_type=EventType.WORKFLOW_EXECUTION_STARTED,
         event={
             "workflow_id": "wf-webhook-test",
             "execution_id": execution_id,
-            "organization_id": str(org_id),
+            "organization_id": str(organization_id),
             "created_at": datetime.now(UTC).isoformat(),
             "version": 1,
             "s3_file_info": None,
@@ -729,5 +738,362 @@ async def test_end_to_end_handle_webhook_notification_against_mockserver(
         assert await _dlq_len(redis_client, stream) == 0
     finally:
         await consumer.stop()
+        await service.aclose()
+        await redis_client.delete(stream, f"{stream}:dlq")
+
+
+@pytest.mark.asyncio
+async def test_asyncio_consumer_routes_org_mismatch_to_dlq_without_http_or_retry(
+    redis_client: Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from document_ia_api.infra import webhook_notification_service as svc_mod
+
+    stream = f"test_webhook_org_mismatch:{uuid4()}"
+    group = f"group-org-mismatch-{uuid4()}"
+    webhook_id = uuid4()
+    execution_id = str(uuid4())
+    org_a = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    org_b = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    webhook_dto = _make_webhook_dto(
+        webhook_id,
+        "https://forbidden.example.test/hook?secret=SECRET_URL_VAL",
+        organization_id=org_b,
+    )
+    event_dto = _make_event_dto(execution_id, organization_id=org_a)
+
+    @asynccontextmanager
+    async def fake_session():
+        yield object()
+
+    class FakeWebhookRepo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_by_id(self, _wid: UUID) -> WebHookDTO:
+            return webhook_dto
+
+    class FakeEventRepo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_last_event_by_execution_id(self, _eid: str) -> EventDTO:
+            return event_dto
+
+    monkeypatch.setattr(svc_mod.database_manager, "local_session", fake_session)
+    monkeypatch.setattr(svc_mod, "WebHookRepository", FakeWebhookRepo)
+    monkeypatch.setattr(svc_mod, "EventRepository", FakeEventRepo)
+
+    http_calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda req: (http_calls.append(req), httpx.Response(200))[1]
+        )
+    )
+    service = WebhookNotificationService(
+        http_client=client, retry_initial_delay_seconds=5.0
+    )
+    consumer = _make_api_consumer(
+        stream_name=stream,
+        consumer_group=group,
+        message_class=WebHookMessage,
+        handler=service.handle_webhook_notification,
+    )
+
+    await _append_message(
+        redis_client,
+        stream,
+        WebHookMessage(workflow_execution_id=execution_id, webhook_id=webhook_id),
+    )
+
+    await consumer.start()
+    try:
+        await _wait_until(_dlq_len_is_pred(redis_client, stream, 1), timeout=5)
+        await _wait_until(_pending_is_zero_pred(redis_client, stream, group), timeout=5)
+        dlq_entries = await redis_client.xrange(f"{stream}:dlq", "-", "+")
+        assert dlq_entries is not None
+        assert len(dlq_entries) == 1
+        _entry_id, fields = dlq_entries[0]
+        assert fields["reason"] == "not_retryable_error"
+        assert fields["error"] == "WebhookOrganizationMismatchException"
+        assert fields["failure_class"] == "permanent"
+        assert fields["retries"] == "0"
+        serialized = json.dumps(fields)
+        assert str(org_a) not in serialized
+        assert str(org_b) not in serialized
+        assert "SECRET_URL_VAL" not in serialized
+        assert len(http_calls) == 0
+    finally:
+        await consumer.stop()
+        await client.aclose()
+        await service.aclose()
+        await redis_client.delete(stream, f"{stream}:dlq")
+
+
+@pytest.mark.asyncio
+async def test_simple_stream_consumer_retains_org_mismatch_without_retry(
+    redis_client: Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from document_ia_api.infra import webhook_notification_service as svc_mod
+    from document_ia_api.infra.redis.simple_stream_consumer import SimpleStreamConsumer
+
+    stream = f"test_simple_org_mismatch:{uuid4()}"
+    group = f"group-simple-org-{uuid4()}"
+    webhook_id = uuid4()
+    execution_id = str(uuid4())
+    org_a = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    org_b = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    webhook_dto = _make_webhook_dto(
+        webhook_id, "https://forbidden.example.test/hook", organization_id=org_b
+    )
+    event_dto = _make_event_dto(execution_id, organization_id=org_a)
+
+    @asynccontextmanager
+    async def fake_session():
+        yield object()
+
+    class FakeWebhookRepo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_by_id(self, _wid: UUID) -> WebHookDTO:
+            return webhook_dto
+
+    class FakeEventRepo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_last_event_by_execution_id(self, _eid: str) -> EventDTO:
+            return event_dto
+
+    monkeypatch.setattr(svc_mod.database_manager, "local_session", fake_session)
+    monkeypatch.setattr(svc_mod, "WebHookRepository", FakeWebhookRepo)
+    monkeypatch.setattr(svc_mod, "EventRepository", FakeEventRepo)
+
+    http_calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda req: (http_calls.append(req), httpx.Response(200))[1]
+        )
+    )
+    service = WebhookNotificationService(
+        http_client=client, retry_initial_delay_seconds=5.0
+    )
+
+    async def simple_handler(msg: WebHookMessage) -> None:
+        await service.handle_webhook_notification(msg)
+
+    consumer = SimpleStreamConsumer(
+        stream_name=stream,
+        message_class=WebHookMessage,
+        handler=simple_handler,
+        consumer_group=group,
+        consumer_name="simple-test-consumer",
+        count=10,
+        block_ms=50,
+        max_retries=3,
+        retry_initial_delay_seconds=5.0,
+    )
+
+    await _append_message(
+        redis_client,
+        stream,
+        WebHookMessage(workflow_execution_id=execution_id, webhook_id=webhook_id),
+    )
+
+    await consumer.start()
+    try:
+        await _wait_until(_dlq_len_is_pred(redis_client, stream, 1), timeout=5)
+        await _wait_until(_pending_is_zero_pred(redis_client, stream, group), timeout=5)
+        dlq_entries = await redis_client.xrange(f"{stream}:dlq", "-", "+")
+        assert dlq_entries is not None
+        assert len(dlq_entries) == 1
+        _entry_id, fields = dlq_entries[0]
+        assert fields["error"] == "WebhookOrganizationMismatchException"
+        assert len(http_calls) == 0
+    finally:
+        await consumer.stop()
+        await client.aclose()
+        await service.aclose()
+        await redis_client.delete(stream, f"{stream}:dlq")
+
+
+@pytest.mark.asyncio
+async def test_asyncio_consumer_pel_reclaim_blocks_org_mismatch(
+    redis_client: Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from document_ia_api.infra import webhook_notification_service as svc_mod
+
+    stream = f"test_webhook_pel_org_mismatch:{uuid4()}"
+    group = f"group-pel-org-{uuid4()}"
+    webhook_id = uuid4()
+    execution_id = str(uuid4())
+    org_a = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    org_b = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    webhook_dto = _make_webhook_dto(
+        webhook_id, "https://forbidden.example.test/hook", organization_id=org_b
+    )
+    event_dto = _make_event_dto(execution_id, organization_id=org_a)
+
+    @asynccontextmanager
+    async def fake_session():
+        yield object()
+
+    class FakeWebhookRepo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_by_id(self, _wid: UUID) -> WebHookDTO:
+            return webhook_dto
+
+    class FakeEventRepo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_last_event_by_execution_id(self, _eid: str) -> EventDTO:
+            return event_dto
+
+    monkeypatch.setattr(svc_mod.database_manager, "local_session", fake_session)
+    monkeypatch.setattr(svc_mod, "WebHookRepository", FakeWebhookRepo)
+    monkeypatch.setattr(svc_mod, "EventRepository", FakeEventRepo)
+
+    await redis_client.xgroup_create(stream, group, id="0", mkstream=True)
+    await _append_message(
+        redis_client,
+        stream,
+        WebHookMessage(workflow_execution_id=execution_id, webhook_id=webhook_id),
+    )
+    # Simulate a crashed consumer that read the message into PEL without ACK.
+    await redis_client.xreadgroup(group, "dead-consumer", {stream: ">"}, count=1)
+    assert await _pending_count(redis_client, stream, group) == 1
+    await asyncio.sleep(0.05)
+
+    http_calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda req: (http_calls.append(req), httpx.Response(200))[1]
+        )
+    )
+    service = WebhookNotificationService(http_client=client)
+    get_event_model_called = False
+    original_get_event_model = service._execution_service.get_event_model
+
+    def spy_get_event_model(*args: Any, **kwargs: Any) -> Any:
+        nonlocal get_event_model_called
+        get_event_model_called = True
+        return original_get_event_model(*args, **kwargs)
+
+    monkeypatch.setattr(
+        service._execution_service, "get_event_model", spy_get_event_model
+    )
+    consumer = AsyncIoConsumer(
+        consumer_name="recovery-consumer",
+        consumer_group=group,
+        stream_name=stream,
+        batch_size=10,
+        block_time=20,
+        message_class=WebHookMessage,
+        process_message_callable=service.handle_webhook_notification,
+        max_retry_number=4,
+        max_concurrency=5,
+        reclaim_idle_ms=10,
+        reclaim_poll_interval_s=0.05,
+    )
+
+    await consumer.start()
+    try:
+        await _wait_until(_dlq_len_is_pred(redis_client, stream, 1), timeout=5)
+        await _wait_until(_pending_is_zero_pred(redis_client, stream, group), timeout=5)
+        dlq_entries = await redis_client.xrange(f"{stream}:dlq", "-", "+")
+        assert dlq_entries is not None
+        assert len(dlq_entries) == 1
+        _entry_id, fields = dlq_entries[0]
+        assert fields["reason"] == "not_retryable_error"
+        assert fields["error"] == "WebhookOrganizationMismatchException"
+        assert fields["failure_class"] == "permanent"
+        assert fields["retries"] == "1"
+        serialized = json.dumps(fields)
+        assert str(org_a) not in serialized
+        assert str(org_b) not in serialized
+        assert get_event_model_called is False
+        assert len(http_calls) == 0
+    finally:
+        await consumer.stop()
+        await client.aclose()
+        await service.aclose()
+        await redis_client.delete(stream, f"{stream}:dlq")
+
+
+@pytest.mark.asyncio
+async def test_simple_stream_consumer_pel_reclaim_acks_without_requeue_when_already_in_dlq(
+    redis_client: Redis,
+) -> None:
+    from document_ia_api.infra.redis.simple_stream_consumer import SimpleStreamConsumer
+
+    stream = f"test_simple_pel_already_dlq:{uuid4()}"
+    group = f"group-simple-pel-dlq-{uuid4()}"
+    webhook_id = uuid4()
+    execution_id = str(uuid4())
+    message = WebHookMessage(workflow_execution_id=execution_id, webhook_id=webhook_id)
+
+    await redis_client.xgroup_create(stream, group, id="0", mkstream=True)
+    entry_id = await _append_message(redis_client, stream, message)
+
+    # Simulate a crashed consumer that read the message into PEL and retained it in DLQ,
+    # then died before calling XACK.
+    await redis_client.xreadgroup(group, "dead-consumer", {stream: ">"}, count=1)
+    assert await _pending_count(redis_client, stream, group) == 1
+    await redis_client.xadd(
+        f"{stream}:dlq",
+        {
+            "original_stream": stream,
+            "original_id": entry_id,
+            "error": "WebhookOrganizationMismatchException",
+            "data": json.dumps(message.to_dict()),
+        },
+    )
+    assert await _dlq_len(redis_client, stream) == 1
+    await asyncio.sleep(0.05)
+
+    http_calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda req: (http_calls.append(req), httpx.Response(200))[1]
+        )
+    )
+    service = WebhookNotificationService(http_client=client)
+    handler_calls = 0
+
+    async def simple_handler(msg: WebHookMessage) -> None:
+        nonlocal handler_calls
+        handler_calls += 1
+        await service.handle_webhook_notification(msg)
+
+    consumer = SimpleStreamConsumer(
+        stream_name=stream,
+        message_class=WebHookMessage,
+        handler=simple_handler,
+        consumer_group=group,
+        consumer_name="recovery-simple-consumer",
+        count=10,
+        block_ms=50,
+        reclaim_idle_ms=10,
+        max_retries=3,
+        retry_initial_delay_seconds=5.0,
+    )
+
+    await consumer.start()
+    try:
+        await _wait_until(_pending_is_zero_pred(redis_client, stream, group), timeout=5)
+        assert await _dlq_len(redis_client, stream) == 1
+        main_entries = await redis_client.xrange(stream, "-", "+")
+        assert len(main_entries) == 1
+        assert handler_calls == 0
+        assert len(http_calls) == 0
+    finally:
+        await consumer.stop()
+        await client.aclose()
         await service.aclose()
         await redis_client.delete(stream, f"{stream}:dlq")

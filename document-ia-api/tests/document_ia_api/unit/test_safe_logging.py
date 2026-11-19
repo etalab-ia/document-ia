@@ -233,6 +233,7 @@ async def test_webhook_notification_service_sanitizes_urls_and_exceptions(caplog
 
     event_dto = MagicMock(spec=EventDTO)
     event_dto.execution_id = "exec-999"
+    event_dto.organization_id = webhook_dto.organization_id
 
     mock_client = AsyncMock()
     mock_client.is_closed = False

@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
@@ -65,10 +66,12 @@ async def test_notification_matches_pre_refactor_non_debug_payload(name):
     client.is_closed = False
     client.post = AsyncMock(return_value=MagicMock(status_code=200))
     webhook = SimpleNamespace(
-        url="https://example.com/webhook", headers={"X-Test": "fixture"}
+        organization_id=dto.organization_id,
+        url="https://example.com/webhook",
+        headers={"X-Test": "fixture"},
     )
     service = WebhookNotificationService(http_client=client)
-    await service._call_webhook_notification(webhook, dto)
+    await service._call_webhook_notification(cast(Any, webhook), dto)
     client.post.assert_awaited_once()
     args, kwargs = client.post.call_args
     assert args == (webhook.url,)

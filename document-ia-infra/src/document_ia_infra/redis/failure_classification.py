@@ -9,17 +9,24 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from document_ia_infra.exception.openai_authentification_error import (
     OpenAIAuthentificationError,
 )
+from document_ia_infra.exception.retryable_exception import RetryableException
 from document_ia_infra.exception.s3_authentification_exception import (
     S3AuthentificationException,
 )
-from document_ia_infra.exception.retryable_exception import RetryableException
+from document_ia_infra.exception.security_exception import SecurityException
 
 
 def classify_failure(error: Exception) -> Literal["temporary", "permanent", "internal"]:
     if isinstance(error, httpx.HTTPStatusError):
         return classify_http_status(error.response.status_code)
     if isinstance(
-        error, (OpenAIAuthentificationError, S3AuthentificationException, ValueError)
+        error,
+        (
+            OpenAIAuthentificationError,
+            S3AuthentificationException,
+            SecurityException,
+            ValueError,
+        ),
     ):
         return "permanent"
     status = getattr(error, "http_status_code", None)

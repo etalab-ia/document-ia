@@ -47,11 +47,12 @@ class WebHookService:
             await self.db_session.rollback()
             raise
 
-    async def delete(self, webhook_id: UUID) -> None:
+    async def delete(self, webhook_id: UUID, organization_id: UUID) -> None:
         try:
-            deleted = await self.repository.delete(webhook_id)
+            deleted = await self.repository.delete(
+                webhook_id, organization_id=organization_id
+            )
             if not deleted:
-                await self.db_session.rollback()
                 raise HttpEntityNotFoundException(
                     entity_name="webhook", entity_id=str(webhook_id)
                 )
