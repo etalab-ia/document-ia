@@ -19,6 +19,7 @@ dependencies = [
     "mypy-boto3-s3 == 1.43.106",
     "python-logging-loki == 0.3.1",
     "document-ia-schemas",
+    "2ddoc-parser",
     "cryptography == 50.0.2",
     "psycopg2-binary == 2.9.13",
     "pyyaml == 6.0.3",
@@ -44,6 +45,10 @@ dev = [
 
 [tool.uv.sources.document-ia-schemas]
 workspace = true
+
+[tool.uv.sources.2ddoc-parser]
+git = "https://github.com/betagouv/2ddoc-parser.git"
+tag = "v1.0.8"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/document_ia_infra"]

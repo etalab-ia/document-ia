@@ -9,7 +9,13 @@ from pydantic import ValidationError
 
 from document_ia_infra.data.event.dto.event_dto import EventDTO
 from document_ia_infra.data.event.dto.event_type_enum import EventType
-from document_ia_infra.data.event.schema.barcode import Ants2DDoc, DataMatrix, QrCode
+from document_ia_infra.data.event.schema.barcode import (
+    Ants2DDoc,
+    BarcodePosition,
+    DataMatrix,
+    QrCode,
+    VerificationStatus,
+)
 from document_ia_infra.data.event.schema.mappers.event_mapper import (
     convert_event_dto,
     convert_inner_event_dto,
@@ -86,6 +92,7 @@ def test_extraction_and_barcode_subclasses_survive_decoding():
     assert extraction is not None
     assert isinstance(extraction.properties, CNIModel)
     assert extraction.properties.nom == "EXEMPLE"
+    assert extraction.properties.date_naissance is not None
     assert extraction.properties.date_naissance.isoformat() == "1990-01-02"
     assert extraction_event.final_result.barcodes == []
 
@@ -98,7 +105,75 @@ def test_extraction_and_barcode_subclasses_survive_decoding():
     assert isinstance(qr, QrCode) and qr.raw_data == "https://example.com/qr"
     assert isinstance(matrix, DataMatrix) and matrix.raw_data == "matrix-content"
     assert isinstance(ants, Ants2DDoc) and ants.typed_data[0].value == "Alice"
+    assert ants.issue_date is not None
     assert ants.issue_date.isoformat() == "2026-01-01"
+    # Historical persisted events without verification_status decode with None.
+    assert ants.verification_status is None
+
+
+@pytest.mark.parametrize("status", list(VerificationStatus))
+def test_ants_2ddoc_verification_status_roundtrip(status: VerificationStatus) -> None:
+    ants = Ants2DDoc(
+        position=BarcodePosition(
+            top_left=(0, 0),
+            top_right=(10, 0),
+            bottom_right=(10, 10),
+            bottom_left=(0, 10),
+        ),
+        page_number=1,
+        is_valid=(status == VerificationStatus.VERIFIED),
+        verification_status=status,
+        raw_data={"issuer": "example"},
+        typed_data=[],
+    )
+
+    serialized = ants.model_dump(mode="json")
+    assert serialized["verification_status"] == status.value
+    assert serialized["is_valid"] is (status == VerificationStatus.VERIFIED)
+
+    rehydrated = Ants2DDoc.model_validate(serialized)
+    assert rehydrated.verification_status is status
+    assert rehydrated.is_valid is (status == VerificationStatus.VERIFIED)
+
+    dto = make_dto("completed_v2")
+    dto.event["final_result"]["barcodes"][2]["verification_status"] = status.value
+    dto.event["final_result"]["barcodes"][2]["is_valid"] = (
+        status == VerificationStatus.VERIFIED
+    )
+    event = decode_event_dto(dto)
+    assert isinstance(event, WorkflowExecutionCompletedEvent)
+    decoded_ants = event.final_result.barcodes[2]
+    assert isinstance(decoded_ants, Ants2DDoc)
+    assert decoded_ants.verification_status is status
+    assert decoded_ants.is_valid is (status == VerificationStatus.VERIFIED)
+
+
+def test_ants_2ddoc_rejects_invalid_verification_status() -> None:
+    with pytest.raises(ValidationError) as direct_err:
+        Ants2DDoc.model_validate(
+            {
+                "type": "2D_DOC",
+                "page_number": 1,
+                "position": {
+                    "top_left": [0, 0],
+                    "top_right": [10, 0],
+                    "bottom_right": [10, 10],
+                    "bottom_left": [0, 10],
+                },
+                "is_valid": False,
+                "verification_status": "not_a_valid_status",
+            }
+        )
+    assert any(e["loc"] == ("verification_status",) for e in direct_err.value.errors())
+
+    dto = make_dto("completed_v2")
+    dto.event["final_result"]["barcodes"][2]["verification_status"] = (
+        "PRIVATE-INVALID-STATUS"
+    )
+    with pytest.raises(ValueError) as decode_err:
+        decode_event_dto(dto)
+    assert str(decode_err.value).startswith("Invalid persisted workflow event payload")
+    assert "PRIVATE-INVALID-STATUS" not in str(decode_err.value)
 
 
 def test_all_event_types_are_covered():

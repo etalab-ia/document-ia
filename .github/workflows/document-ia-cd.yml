@@ -192,18 +192,18 @@ jobs:
           from PIL import Image
           from document_ia_worker.core.model_artifacts import verify_all_artifacts
           from document_ia_worker.core.preprocessing.yoloworld_crop import detect_boxes
-          from document_ia_worker.main import _prewarm_models
+          from document_ia_worker.main import _prewarm_models_and_trust_store
 
           verified = verify_all_artifacts()
           assert set(verified.keys()) == {'yoloworld', 'clip', 'qrdet', 'tesseract_fra'}
-          _prewarm_models()
+          _prewarm_models_and_trust_store()
           boxes = detect_boxes(
               Image.new('RGB', (128, 128), 'white'),
               class_name='book',
               confidence_threshold=0.25,
           )
           assert isinstance(boxes, list)
-          print('Worker offline smoke test & 4-model pre-warming OK')
+          print('Worker offline smoke test, 4-model & 2D-Doc trust store pre-warming OK')
           "
               ;;
             remove-ppi)

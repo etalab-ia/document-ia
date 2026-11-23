@@ -17,6 +17,7 @@ from document_ia_infra.redis.redis_manager import RedisManager
 from document_ia_infra.redis.redis_settings import redis_settings
 from document_ia_worker.config.logging import setup_logging
 from document_ia_worker.core.temp_file_sweeper import TempFileSweeper
+from document_ia_worker.core.two_ddoc_crl_refresher import TwoDDocCrlRefresher
 from document_ia_worker.workflow.message_handler import process_message
 from document_ia_worker.workflow.terminal_failure import (
     notify_watchdog_terminal_failure,
@@ -56,9 +57,9 @@ def _force_exit() -> None:
 _consumer: ThreadConsumer[WorkflowExecutionMessage] | None = None
 
 
-def _prewarm_models() -> None:
+def _prewarm_models_and_trust_store() -> None:
     logger.info(
-        "[boot] Verifying and pre-warming AI/OCR models (Tesseract, YOLO-World, CLIP, QRDet)..."
+        "[boot] Verifying and pre-warming AI/OCR models and 2D-Doc PKI trust store (Tesseract, YOLO-World, CLIP, QRDet, 2D-Doc TSL)..."
     )
     try:
         from document_ia_worker.core.model_artifacts import (
@@ -103,11 +104,49 @@ def _prewarm_models() -> None:
         logger.critical("[boot]   ❌ Could not pre-load QRDet model: %s", e)
         raise
 
+    try:
+        from fr_2ddoc_parser.crypto.key_resolver import get_default_key_resolver
+        from fr_2ddoc_parser.model.models import TrustListFreshness
+
+        resolver = get_default_key_resolver()
+        tsl_freshness = resolver.get_tsl_freshness()
+        expired_crl_cas = resolver.get_expired_crl_cas()
+        logger.info(
+            "[boot]   ✅ 2D-Doc PKI trust store verified and pre-loaded into RAM "
+            "(tsl_sequence_number=%s, tsl_next_update=%s, tsl_freshness=%s)",
+            resolver.tsl_sequence_number,
+            resolver.tsl_next_update,
+            tsl_freshness.value,
+        )
+        if tsl_freshness != TrustListFreshness.FRESH:
+            logger.warning(
+                "[boot]   ⚠️ 2D-Doc PKI trust list is not fresh "
+                "(tsl_sequence_number=%s, tsl_next_update=%s, tsl_freshness=%s)",
+                resolver.tsl_sequence_number,
+                resolver.tsl_next_update,
+                tsl_freshness.value,
+            )
+        if expired_crl_cas:
+            logger.warning(
+                "[boot]   ⚠️ Bundled 2D-Doc CRLs are expired at pre-warm for CAs %s "
+                "(will be refreshed in memory at startup if CRL refresh is enabled)",
+                expired_crl_cas,
+            )
+    except Exception as e:
+        logger.critical("[boot]   ❌ Could not pre-load 2D-Doc PKI trust store: %s", e)
+        raise
+
 
 async def run_consumer(stop_event: asyncio.Event | None = None) -> None:
     global _consumer
     logger.info("--- Starting document-ia-worker ---")
-    _prewarm_models()
+    _prewarm_models_and_trust_store()
+
+    crl_refresher = TwoDDocCrlRefresher()
+    await crl_refresher.startup_refresh()
+    crl_stop_event = stop_event if stop_event is not None else asyncio.Event()
+    crl_refresh_task: asyncio.Task[None] | None = None
+
     logger.info("Register redis stream consumer for workflow execution")
 
     # This runtime owns the main-loop Redis pool; the consumer borrows it.
@@ -131,8 +170,18 @@ async def run_consumer(stop_event: asyncio.Event | None = None) -> None:
         _consumer.stop_flag.set()
 
     try:
+        crl_refresh_task = asyncio.create_task(
+            crl_refresher.run_periodic_refresh(crl_stop_event)
+        )
         await _consumer.start_consumer()
     finally:
+        if stop_event is None:
+            crl_stop_event.set()
+        if crl_refresh_task is not None and not crl_refresh_task.done():
+            crl_refresh_task.cancel()
+        if crl_refresh_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await crl_refresh_task
         try:
             await asyncio.wait_for(redis_manager.close(), timeout=5)
         except Exception as exc:
