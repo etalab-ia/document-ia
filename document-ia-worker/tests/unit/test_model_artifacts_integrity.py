@@ -403,7 +403,7 @@ def test_download_and_verify_cleans_up_temp_file_on_bad_downloaded_hash(
     assert list(tmp_path.glob("*.part")) == []
 
 
-def test_prewarm_models_is_fail_closed_on_integrity_error(
+def test_prewarm_models_and_trust_store_is_fail_closed_on_integrity_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from document_ia_worker import main as worker_main
@@ -414,7 +414,92 @@ def test_prewarm_models_is_fail_closed_on_integrity_error(
     )
 
     with pytest.raises(ModelArtifactIntegrityError, match="tampered fra.traineddata"):
-        worker_main._prewarm_models()
+        worker_main._prewarm_models_and_trust_store()
+
+
+def test_prewarm_models_and_trust_store_preloads_2ddoc_trust_store(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    from fr_2ddoc_parser.model.models import TrustListFreshness
+
+    from document_ia_worker import main as worker_main
+
+    monkeypatch.setattr(
+        "document_ia_worker.core.model_artifacts.resolve_and_verify_tesseract_lang_data",
+        MagicMock(return_value=Path("/fake/fra.traineddata")),
+    )
+    monkeypatch.setattr(
+        "document_ia_worker.core.model_artifacts.resolve_and_verify_clip_path",
+        MagicMock(return_value=Path("/fake/ViT-B-32.pt")),
+    )
+    monkeypatch.setattr(
+        "document_ia_worker.core.preprocessing.yoloworld_crop.get_yoloworld_model",
+        MagicMock(return_value=object()),
+    )
+    monkeypatch.setattr(
+        "document_ia_worker.workflow.step.extract_barcode_data.extract_barcode_2ddoc_data._get_qrdet_detector",
+        MagicMock(return_value=object()),
+    )
+
+    with caplog.at_level(logging.INFO, logger=worker_main.__name__):
+        worker_main._prewarm_models_and_trust_store()
+
+    assert "2D-Doc PKI trust store verified and pre-loaded into RAM" in caplog.text
+    assert "tsl_sequence_number=" in caplog.text
+    assert "tsl_next_update=" in caplog.text
+    assert "tsl_freshness=" in caplog.text
+
+    # Non-fresh trust list emits a warning without blocking boot.
+    stale_resolver = MagicMock()
+    stale_resolver.tsl_sequence_number = 23
+    stale_resolver.tsl_next_update = "2020-01-01T00:00:00+00:00"
+    stale_resolver.get_tsl_freshness.return_value = TrustListFreshness.STALE
+    monkeypatch.setattr(
+        "fr_2ddoc_parser.crypto.key_resolver.get_default_key_resolver",
+        MagicMock(return_value=stale_resolver),
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=worker_main.__name__):
+        worker_main._prewarm_models_and_trust_store()
+
+    assert "2D-Doc PKI trust list is not fresh" in caplog.text
+    assert "tsl_freshness=stale" in caplog.text
+
+
+def test_prewarm_models_and_trust_store_is_fail_closed_on_trust_store_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fr_2ddoc_parser.exception.exceptions import ResolverUnavailableError
+
+    from document_ia_worker import main as worker_main
+
+    monkeypatch.setattr(
+        "document_ia_worker.core.model_artifacts.resolve_and_verify_tesseract_lang_data",
+        MagicMock(return_value=Path("/fake/fra.traineddata")),
+    )
+    monkeypatch.setattr(
+        "document_ia_worker.core.model_artifacts.resolve_and_verify_clip_path",
+        MagicMock(return_value=Path("/fake/ViT-B-32.pt")),
+    )
+    monkeypatch.setattr(
+        "document_ia_worker.core.preprocessing.yoloworld_crop.get_yoloworld_model",
+        MagicMock(return_value=object()),
+    )
+    monkeypatch.setattr(
+        "document_ia_worker.workflow.step.extract_barcode_data.extract_barcode_2ddoc_data._get_qrdet_detector",
+        MagicMock(return_value=object()),
+    )
+    monkeypatch.setattr(
+        "fr_2ddoc_parser.crypto.key_resolver.get_default_key_resolver",
+        MagicMock(side_effect=ResolverUnavailableError("corrupt TSL signature")),
+    )
+
+    with pytest.raises(ResolverUnavailableError, match="corrupt TSL signature"):
+        worker_main._prewarm_models_and_trust_store()
 
 
 def test_qrdet_loader_rejects_missing_or_tampered_release_marker(

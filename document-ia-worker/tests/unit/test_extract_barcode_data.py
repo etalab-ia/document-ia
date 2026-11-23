@@ -8,7 +8,19 @@ import pytest
 import zxingcpp
 from cv2.typing import MatLike
 
+from datetime import date
+import logging
+from types import SimpleNamespace
+
+from fr_2ddoc_parser.model.models import (
+    Decoded2DDoc,
+    Header,
+    VerificationResult,
+    VerificationStatus,
+)
+
 from document_ia_infra.data.event.schema.barcode import (
+    Ants2DDoc,
     BarcodePosition,
     DataMatrix,
     QrCode,
@@ -743,3 +755,234 @@ async def test_extract_barcode_2ddoc_aborted_while_waiting_for_lock_skips_page()
 
         assert len(result.pages) == 0
         mock_load.assert_not_called()
+
+
+def _make_decoded_2ddoc(
+    *,
+    is_valid: bool,
+    verification: VerificationResult | None,
+) -> Decoded2DDoc:
+    return Decoded2DDoc(
+        header=Header(
+            raw="DC02FR000001FFFF1A2B99",
+            marker="DC",
+            version=2,
+            ca_id="FR00",
+            cert_id="0001",
+            issue_date=date(2025, 1, 15),
+            signature_date=date(2025, 1, 15),
+            doc_type="99",
+            perimeter="",
+            header_len=22,
+        ),
+        sign_payload=b"DC02FR000001FFFF1A2B9910SECRET_PII_VALUE",
+        fields={"10": "SECRET_PII_VALUE"},
+        typed=None,
+        is_valid=is_valid,
+        verification=verification,
+        ants_type=None,
+    )
+
+
+@pytest.mark.parametrize("status", list(VerificationStatus))
+def test_2ddoc_maps_all_verification_statuses_and_enforces_is_valid_invariant(
+    status: VerificationStatus,
+) -> None:
+    expected_valid = status == VerificationStatus.VERIFIED
+    decoded = _make_decoded_2ddoc(
+        is_valid=expected_valid,
+        verification=VerificationResult(
+            status=status,
+            is_valid=expected_valid,
+            ca_id="FR00",
+            cert_id="0001",
+            detail="/internal/trust_store/secret.pem: internal diagnostic detail",
+        ),
+    )
+    pos = DummyPosition((1, 2), (10, 2), (10, 20), (1, 20))
+    barcode = DummyBarcode("DC02_SENSITIVE_PII_PAYLOAD", "DataMatrix", pos)
+
+    with patch(
+        "document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc.decode_2d_doc",
+        return_value=decoded,
+    ):
+        variant, key, is_spec = BaseExtractBarcode2DDoc()._decode_barcode_to_variant(
+            cast(BarcodeLike, barcode), 1
+        )
+
+    assert is_spec is True
+    assert key == "dm:DC02_SENSITIVE_PII_PAYLOAD"
+    assert isinstance(variant, Ants2DDoc)
+    assert variant.verification_status is status
+    assert variant.is_valid is expected_valid
+    dumped = variant.model_dump()
+    assert "detail" not in dumped
+    assert "ca_id" not in dumped
+    assert "cert_id" not in dumped
+
+
+def test_2ddoc_fail_closed_when_verification_is_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    decoded = _make_decoded_2ddoc(is_valid=True, verification=None)
+    pos = DummyPosition((0, 0), (10, 0), (10, 10), (0, 10))
+    barcode = DummyBarcode("DC02_PII_SECRET_NAME", "DataMatrix", pos)
+
+    with (
+        patch(
+            "document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc.decode_2d_doc",
+            return_value=decoded,
+        ),
+        caplog.at_level(
+            logging.WARNING,
+            logger="document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc",
+        ),
+    ):
+        variant, _key, is_spec = BaseExtractBarcode2DDoc()._decode_barcode_to_variant(
+            cast(BarcodeLike, barcode), 1
+        )
+
+    assert is_spec is True
+    assert isinstance(variant, Ants2DDoc)
+    assert variant.verification_status is VerificationStatus.RESOLVER_UNAVAILABLE
+    assert variant.is_valid is False
+    assert "2D-Doc verification result missing" in caplog.text
+    assert "PII_SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize("bad_status", ["unexpected_status", None, 12345])
+def test_2ddoc_fail_closed_when_verification_status_is_unknown_or_invalid(
+    bad_status: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_result = SimpleNamespace(
+        header=SimpleNamespace(issue_date=date(2025, 1, 15), doc_type="99"),
+        fields={"10": "PII_SECRET_VALUE"},
+        typed=None,
+        is_valid=True,
+        verification=SimpleNamespace(status=bad_status),
+        ants_type=None,
+    )
+    pos = DummyPosition((0, 0), (10, 0), (10, 10), (0, 10))
+    barcode = DummyBarcode("DC02_PII_SECRET_VALUE", "DataMatrix", pos)
+
+    with (
+        patch(
+            "document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc.decode_2d_doc",
+            return_value=fake_result,
+        ),
+        caplog.at_level(
+            logging.WARNING,
+            logger="document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc",
+        ),
+    ):
+        variant, _key, is_spec = BaseExtractBarcode2DDoc()._decode_barcode_to_variant(
+            cast(BarcodeLike, barcode), 1
+        )
+
+    assert is_spec is True
+    assert isinstance(variant, Ants2DDoc)
+    assert variant.verification_status is VerificationStatus.RESOLVER_UNAVAILABLE
+    assert variant.is_valid is False
+    assert "Unknown 2D-Doc verification status" in caplog.text
+    assert "PII_SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "non_verified_status",
+    [s for s in VerificationStatus if s != VerificationStatus.VERIFIED],
+)
+def test_2ddoc_fail_closed_when_is_valid_true_conflicts_with_non_verified_status(
+    non_verified_status: VerificationStatus,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    decoded = _make_decoded_2ddoc(
+        is_valid=True,
+        verification=VerificationResult(
+            status=non_verified_status,
+            is_valid=False,
+        ),
+    )
+    pos = DummyPosition((0, 0), (10, 0), (10, 10), (0, 10))
+    barcode = DummyBarcode("DC02_CONFLICT_PII", "DataMatrix", pos)
+
+    with (
+        patch(
+            "document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc.decode_2d_doc",
+            return_value=decoded,
+        ),
+        caplog.at_level(
+            logging.WARNING,
+            logger="document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc",
+        ),
+    ):
+        variant, _key, is_spec = BaseExtractBarcode2DDoc()._decode_barcode_to_variant(
+            cast(BarcodeLike, barcode), 1
+        )
+
+    assert is_spec is True
+    assert isinstance(variant, Ants2DDoc)
+    assert variant.verification_status is non_verified_status
+    assert variant.is_valid is False
+    assert "Inconsistent 2D-Doc verification state" in caplog.text
+    assert "CONFLICT_PII" not in caplog.text
+
+
+def test_2ddoc_enforces_is_valid_false_when_result_is_valid_is_false_even_if_verified() -> (
+    None
+):
+    decoded = _make_decoded_2ddoc(
+        is_valid=False,
+        verification=VerificationResult(
+            status=VerificationStatus.VERIFIED,
+            is_valid=True,
+        ),
+    )
+    pos = DummyPosition((0, 0), (10, 0), (10, 10), (0, 10))
+    barcode = DummyBarcode("DC02_FALSE_VALID", "DataMatrix", pos)
+
+    with patch(
+        "document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc.decode_2d_doc",
+        return_value=decoded,
+    ):
+        variant, _key, is_spec = BaseExtractBarcode2DDoc()._decode_barcode_to_variant(
+            cast(BarcodeLike, barcode), 1
+        )
+
+    assert is_spec is True
+    assert isinstance(variant, Ants2DDoc)
+    assert variant.verification_status is VerificationStatus.VERIFIED
+    assert variant.is_valid is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_status"),
+    [
+        (
+            "DC02FR000001FFFF1A2B9910TEST",
+            VerificationStatus.SIGNATURE_MISSING,
+        ),
+        (
+            "DC02ZZZZ0001FFFF1A2B9910TEST\x1f" + "A" * 103,
+            VerificationStatus.UNKNOWN_CA,
+        ),
+    ],
+)
+def test_2ddoc_real_decode_integration_without_mock(
+    payload: str,
+    expected_status: VerificationStatus,
+) -> None:
+    """Integration test against real fr_2ddoc_parser v1.0.7 without mocking decode_2d_doc."""
+    pos = DummyPosition((5, 5), (50, 5), (50, 50), (5, 50))
+    barcode = DummyBarcode(payload, "DataMatrix", pos)
+
+    variant, key, is_spec = BaseExtractBarcode2DDoc()._decode_barcode_to_variant(
+        cast(BarcodeLike, barcode), 1
+    )
+
+    assert is_spec is True
+    assert key == f"dm:{payload}"
+    assert isinstance(variant, Ants2DDoc)
+    assert variant.is_valid is False
+    assert variant.verification_status is expected_status
+    assert variant.doc_type == "99"

@@ -19,7 +19,7 @@ async def test_worker_main_sigterm_waits_for_consumer_graceful_drain(
     la main."""
     from document_ia_worker import main as worker_main
 
-    monkeypatch.setattr(worker_main, "_prewarm_models", lambda: None)
+    monkeypatch.setattr(worker_main, "_prewarm_models_and_trust_store", lambda: None)
 
     started = asyncio.Event()
     drain_completed = False
@@ -58,7 +58,7 @@ async def test_worker_main_propagates_consumer_crash_and_cancels_stop_wait(
     relève l'exception sans laisser de tâche pendante."""
     from document_ia_worker import main as worker_main
 
-    monkeypatch.setattr(worker_main, "_prewarm_models", lambda: None)
+    monkeypatch.setattr(worker_main, "_prewarm_models_and_trust_store", lambda: None)
 
     class CrashingConsumer[T]:
         def __init__(self, **_kwargs: Any) -> None:
@@ -82,7 +82,7 @@ async def test_signal_stops_consumer_and_waits_for_shutdown(
 ) -> None:
     from document_ia_worker import main as worker_main
 
-    monkeypatch.setattr(worker_main, "_prewarm_models", lambda: None)
+    monkeypatch.setattr(worker_main, "_prewarm_models_and_trust_store", lambda: None)
     monkeypatch.setattr(worker_main.logger, "disabled", True)
 
     created_consumers = []
@@ -117,7 +117,7 @@ async def test_signal_cancels_consumer_after_shutdown_deadline(
 ) -> None:
     from document_ia_worker import main as worker_main
 
-    monkeypatch.setattr(worker_main, "_prewarm_models", lambda: None)
+    monkeypatch.setattr(worker_main, "_prewarm_models_and_trust_store", lambda: None)
     monkeypatch.setattr(worker_main.logger, "disabled", True)
 
     class StuckConsumer[T]:
@@ -167,7 +167,7 @@ async def test_runtime_closes_owned_redis_manager(monkeypatch, outcome):
                 raise asyncio.CancelledError
 
     monkeypatch.setattr(worker_main, "_consumer", None)
-    monkeypatch.setattr(worker_main, "_prewarm_models", lambda: None)
+    monkeypatch.setattr(worker_main, "_prewarm_models_and_trust_store", lambda: None)
     monkeypatch.setattr(worker_main, "RedisManager", lambda: owner)
     monkeypatch.setattr(worker_main, "ThreadConsumer", Consumer)
     if outcome == "success":
@@ -186,7 +186,7 @@ async def test_signal_forces_exit_if_handler_thread_is_still_running(
 ) -> None:
     from document_ia_worker import main as worker_main
 
-    monkeypatch.setattr(worker_main, "_prewarm_models", lambda: None)
+    monkeypatch.setattr(worker_main, "_prewarm_models_and_trust_store", lambda: None)
     monkeypatch.setattr(worker_main.logger, "disabled", True)
 
     class RunningHandlerConsumer[T]:
@@ -215,7 +215,7 @@ async def test_consumer_crash_forces_exit_if_handler_thread_is_still_running(
 ) -> None:
     from document_ia_worker import main as worker_main
 
-    monkeypatch.setattr(worker_main, "_prewarm_models", lambda: None)
+    monkeypatch.setattr(worker_main, "_prewarm_models_and_trust_store", lambda: None)
     monkeypatch.setattr(worker_main.logger, "disabled", True)
 
     class CrashedConsumer[T]:

@@ -268,6 +268,7 @@
               "page_number": 3,
               "type": "2D_DOC",
               "is_valid": true,
+              "verification_status": null,
               "raw_data": {
                 "issuer": "example"
               },
@@ -368,6 +369,7 @@
               "page_number": 3,
               "type": "2D_DOC",
               "is_valid": true,
+              "verification_status": null,
               "raw_data": {
                 "issuer": "example"
               },

@@ -779,7 +779,31 @@ async def execute_workflow_v2(
                                                 }
                                             ],
                                         },
-                                        "barcodes": [],
+                                        "barcodes": [
+                                            {
+                                                "type": "2D_DOC",
+                                                "position": {
+                                                    "top_left": [120, 480],
+                                                    "top_right": [260, 480],
+                                                    "bottom_right": [260, 620],
+                                                    "bottom_left": [120, 620],
+                                                },
+                                                "page_number": 1,
+                                                "is_valid": True,
+                                                "verification_status": "verified",
+                                                "raw_data": {"issuer": "ANTS"},
+                                                "typed_data": [
+                                                    {
+                                                        "name": "first_name",
+                                                        "value": "Alice",
+                                                        "type": "string",
+                                                    }
+                                                ],
+                                                "issue_date": "2024-01-15",
+                                                "ants_type": "01",
+                                                "doc_type": "01",
+                                            }
+                                        ],
                                     },
                                 },
                             },

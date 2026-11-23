@@ -56,9 +56,9 @@ def _force_exit() -> None:
 _consumer: ThreadConsumer[WorkflowExecutionMessage] | None = None
 
 
-def _prewarm_models() -> None:
+def _prewarm_models_and_trust_store() -> None:
     logger.info(
-        "[boot] Verifying and pre-warming AI/OCR models (Tesseract, YOLO-World, CLIP, QRDet)..."
+        "[boot] Verifying and pre-warming AI/OCR models and 2D-Doc PKI trust store (Tesseract, YOLO-World, CLIP, QRDet, 2D-Doc TSL)..."
     )
     try:
         from document_ia_worker.core.model_artifacts import (
@@ -103,11 +103,36 @@ def _prewarm_models() -> None:
         logger.critical("[boot]   ❌ Could not pre-load QRDet model: %s", e)
         raise
 
+    try:
+        from fr_2ddoc_parser.crypto.key_resolver import get_default_key_resolver
+        from fr_2ddoc_parser.model.models import TrustListFreshness
+
+        resolver = get_default_key_resolver()
+        tsl_freshness = resolver.get_tsl_freshness()
+        logger.info(
+            "[boot]   ✅ 2D-Doc PKI trust store verified and pre-loaded into RAM "
+            "(tsl_sequence_number=%s, tsl_next_update=%s, tsl_freshness=%s)",
+            resolver.tsl_sequence_number,
+            resolver.tsl_next_update,
+            tsl_freshness.value,
+        )
+        if tsl_freshness != TrustListFreshness.FRESH:
+            logger.warning(
+                "[boot]   ⚠️ 2D-Doc PKI trust list is not fresh "
+                "(tsl_sequence_number=%s, tsl_next_update=%s, tsl_freshness=%s)",
+                resolver.tsl_sequence_number,
+                resolver.tsl_next_update,
+                tsl_freshness.value,
+            )
+    except Exception as e:
+        logger.critical("[boot]   ❌ Could not pre-load 2D-Doc PKI trust store: %s", e)
+        raise
+
 
 async def run_consumer(stop_event: asyncio.Event | None = None) -> None:
     global _consumer
     logger.info("--- Starting document-ia-worker ---")
-    _prewarm_models()
+    _prewarm_models_and_trust_store()
     logger.info("Register redis stream consumer for workflow execution")
 
     # This runtime owns the main-loop Redis pool; the consumer borrows it.

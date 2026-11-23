@@ -69,7 +69,7 @@ sequenceDiagram
 
     Boot->>Manifest: model_artifacts --verify on .models/
     Note over Boot: Missing or altered artifact -> exit 1 (Fail-Closed)
-    Boot->>Loader: _prewarm_models() at worker startup (loads YOLO-World + set_classes(["book"]) + CLIP + QRDet)
+    Boot->>Loader: _prewarm_models_and_trust_store() at worker startup (loads YOLO-World + set_classes(["book"]) + CLIP + QRDet + 2D-Doc PKI trust store)
     Loader->>Manifest: verify_file_sha256() before any torch.load(), clip.load(), or OCR call
     Note over Loader: Implicit runtime downloads are strictly forbidden (YOLO_OFFLINE=true)
 ```
@@ -83,11 +83,11 @@ sequenceDiagram
 - `resolve_and_verify_yoloworld_path(models_dir: Path | None = None) -> Path`:
   Called by `get_yoloworld_model()` in `yoloworld_crop.py` prior to `YOLOWorld(str(verified_path))`.
 - `resolve_and_verify_clip_path(models_dir: Path | None = None) -> Path`:
-  Supports `CLIP_WEIGHTS_PATH` and `MODELS_DIR`; called by `ensure_yoloworld_classes()` / `detect_boxes()` in `yoloworld_crop.py` and `_prewarm_models()` in `main.py` prior to `set_classes()`.
+  Supports `CLIP_WEIGHTS_PATH` and `MODELS_DIR`; called by `ensure_yoloworld_classes()` / `detect_boxes()` in `yoloworld_crop.py` and `_prewarm_models_and_trust_store()` in `main.py` prior to `set_classes()`.
 - `resolve_and_verify_qrdet_dir(model_size: str = "s", models_dir: Path | None = None) -> Path`:
   Called by `_get_qrdet_detector()` in `extract_barcode_2ddoc_data.py` prior to `QRDetector(...)`. Rejects any unpinned `model_size`.
 - `resolve_and_verify_tesseract_lang_data(lang: str = "fra", models_dir: Path | None = None) -> Path | None`:
-  Called by `_prewarm_models()` in `main.py` and `ExtractContentOcrStep._prepare_step()` in `extract_content_ocr.py`.
+  Called by `_prewarm_models_and_trust_store()` in `main.py` and `ExtractContentOcrStep._prepare_step()` in `extract_content_ocr.py`.
 - `_download_file(url: str, destination: Path, *, max_bytes: int | None = None) -> None`:
   Enforces HTTPS, an explicit allowlist of upstream hostnames (`github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`, `openaipublic.azureedge.net`), and streaming byte-limit enforcement.
 
@@ -148,7 +148,7 @@ Triggered only on manual dispatch (`workflow_dispatch`, verification-only mode, 
 2. Builds all 6 multi-stage Nix-backed container images locally.
 3. Verifies container hardening across all 6 images (`nix`, `uv`, and `git` are absent; `/app` and `.models/` are read-only for UID `10001`).
 4. Runs a **negative integrity test** (`--network none`) on `document-ia-worker` proving that flipping 1 byte in `yolov8m-world.pt` or `clip/ViT-B-32.pt` causes `model_artifacts --verify`, `get_yoloworld_model()`, and `detect_boxes()` to fail closed before `torch.load` / `clip.load`.
-5. Runs **offline smoke tests** (`--network none`) on all 6 images (including `_prewarm_models()` and `detect_boxes()` in the worker image, and an actual PDF-preview write/read-back as UID `10001` in the evals image while verifying that application source remains read-only).
+5. Runs **offline smoke tests** (`--network none`) on all 6 images (including `_prewarm_models_and_trust_store()` and `detect_boxes()` in the worker image, and an actual PDF-preview write/read-back as UID `10001` in the evals image while verifying that application source remains read-only).
 6. When `should_push == 'true'`, logs in to GHCR (`docker/login-action` pinned by 40-char SHA) and pushes the already-verified local images to `ghcr.io/etalab-ia/*` (`<tag>`, `sha-<12>`, `latest`).
 7. Generates and uploads a **verifiable JSON & Markdown component inventory** recording the image SHA-256 digest, `repo_digest` and `published_tags` (on release pushes), Nix store runtime path, `flake.lock` SHA-256, `uv.lock` SHA-256, and all 4 verified model hashes.
 
@@ -184,7 +184,7 @@ To update any of the four pinned model weights (`yolov8m-world.pt`, `ViT-B-32.pt
 On Scalingo, deployments run through the Python buildpack:
 - Python dependencies are installed from the locked root [`uv.lock`](../uv.lock).
 - [`document-ia-worker/bin/post_compile`](../document-ia-worker/bin/post_compile) invokes `python -m document_ia_worker.core.model_artifacts --download-and-verify` using `uv run --no-project` (preventing any secondary dependency resolution) and verifies SHA-256 digests and sizes even when `.models/` is restored from the Scalingo build cache.
-- [`document-ia-worker/bin/start_worker.sh`](../document-ia-worker/bin/start_worker.sh) exports `YOLO_OFFLINE="true"`, `YOLO_CONFIG_DIR="/tmp/Ultralytics"`, and `CLIP_WEIGHTS_PATH`, and along with `_prewarm_models()` re-verifies all four SHA-256 digests at boot before loading weights into memory.
+- [`document-ia-worker/bin/start_worker.sh`](../document-ia-worker/bin/start_worker.sh) exports `YOLO_OFFLINE="true"`, `YOLO_CONFIG_DIR="/tmp/Ultralytics"`, and `CLIP_WEIGHTS_PATH`, and along with `_prewarm_models_and_trust_store()` re-verifies all four SHA-256 digests and loads the bundled 2D-Doc PKI trust store at boot before loading weights into memory.
 
 ### 6.2. Verifiability vs. Bit-for-Bit Reproducibility
 - **Guaranteed Verifiability**: Every input to the build is cryptographically pinned (`flake.lock` NAR hashes for Nix system packages, `uv.lock` wheel/sdist SHA-256 hashes for Python packages, and SHA-256 digests + byte sizes for all four AI/OCR models). Each CD run publishes the resulting container image digest (`sha256:...`), `repo_digest`, and component inventory JSON.

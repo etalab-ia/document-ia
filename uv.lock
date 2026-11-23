@@ -826,6 +826,7 @@ name = "document-ia-infra"
 version = "1.0.11"
 source = { editable = "document-ia-infra" }
 dependencies = [
+    { name = "2ddoc-parser" },
     { name = "asyncpg" },
     { name = "boto3" },
     { name = "botocore" },
@@ -860,6 +861,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "2ddoc-parser", git = "https://github.com/betagouv/2ddoc-parser.git?tag=v1.0.7" },
     { name = "asyncpg", specifier = "==0.32.0" },
     { name = "boto3", specifier = "==1.43.126" },
     { name = "botocore", specifier = "==1.43.126" },

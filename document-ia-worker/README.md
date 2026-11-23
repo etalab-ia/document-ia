@@ -163,7 +163,7 @@ By default, PyTorch and OpenCV detect all host CPU cores (e.g. 16–32 cores) an
 
 ### 3. AI Model Pre-bundling & Boot Pre-warming
 - **Pre-downloading at build time**: Model weights for **YOLO-World** (`yolov8m-world.pt`) and **QRDet** (`qrdet-s.pt`), as well as Tesseract language files (`fra.traineddata`), are downloaded during `bin/post_compile` and stored in `$APP_ROOT/.models/`.
-- **Pre-warming on boot**: Before listening to Redis events, `src/document_ia_worker/main.py` invokes `_prewarm_models()` to load YOLO-World and QRDet models into RAM once at worker startup. This avoids concurrent on-the-fly downloads, model reloading delays, or race conditions during job execution.
+- **Pre-warming on boot**: Before listening to Redis events, `src/document_ia_worker/main.py` invokes `_prewarm_models_and_trust_store()` to verify and load YOLO-World, CLIP, QRDet, Tesseract, and the offline 2D-Doc PKI trust store into RAM once at worker startup. This avoids concurrent on-the-fly downloads, model reloading delays, or race conditions during job execution.
 
 ### 4. Critical Section Thread Locking for Heavy C/RAM Steps
 Network I/O steps (downloading from S3, HTTP OCR, LLM API calls) use virtually zero RAM and run with high concurrency (`REDIS_WORKER_NUMBER = 10+`).
