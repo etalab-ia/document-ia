@@ -683,6 +683,15 @@ class WorkflowManager:
             )
             else 1
         )
+        fallback_version = (
+            raw_version
+            if (
+                isinstance(raw_version, int)
+                and not isinstance(raw_version, bool)
+                and raw_version in (1, 2)
+            )
+            else 1
+        )
         workflow_version = (
             self.main_workflow_context.workflow_version
             if (
