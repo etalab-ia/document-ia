@@ -413,6 +413,7 @@ class WorkflowManager:
                 workflow_version_raw if isinstance(workflow_version_raw, int) else 1
             )
             if self.main_workflow_context is not None:
+                self.main_workflow_context.organization_id = event_dto.organization_id
                 self.main_workflow_context.workflow_version = workflow_version
 
             workflow_v1: Optional[WorkflowDTO] = None
@@ -431,10 +432,6 @@ class WorkflowManager:
                 raise WorkflowNotFoundException(self.message.workflow_execution_id)
 
             self.workflow = workflow_v1
-
-            if self.main_workflow_context is not None:
-                self.main_workflow_context.organization_id = event_dto.organization_id
-                self.main_workflow_context.workflow_version = workflow_version
 
             return False
         except Exception as e:
@@ -681,14 +678,24 @@ class WorkflowManager:
             if isinstance(self.event_dto.event, dict)
             else None
         )
+        fallback_version = (
+            raw_version
+            if (
+                isinstance(raw_version, int)
+                and not isinstance(raw_version, bool)
+                and raw_version in (1, 2)
+            )
+            else 1
+        )
         workflow_version = (
             self.main_workflow_context.workflow_version
             if (
                 self.main_workflow_context is not None
                 and isinstance(self.main_workflow_context.workflow_version, int)
+                and not isinstance(self.main_workflow_context.workflow_version, bool)
                 and self.main_workflow_context.workflow_version in (1, 2)
             )
-            else (raw_version if isinstance(raw_version, int) else 1)
+            else fallback_version
         )
 
         await EventStoreService(db).emit_workflow_failed(

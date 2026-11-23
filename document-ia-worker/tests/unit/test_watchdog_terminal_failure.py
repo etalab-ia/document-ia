@@ -663,8 +663,23 @@ async def test_save_failure_event_preserves_workflow_version_v2(
         start_time=datetime.now(UTC),
         steps_metadata=[],
     )
+    assert manager.main_workflow_context.workflow_version is None
 
     session = _FakeSession()
+
+    # Case A: before _prepare_workflow populates main_workflow_context.workflow_version,
+    # _save_failure_event falls back to self.event_dto.event["version"].
+    manager.event_dto = started_v2_event
+    await manager._save_failure_event(
+        session,  # type: ignore[arg-type]
+        WorkflowStepException("prepare_workflow", ValueError("Pre-prepare failure")),
+    )
+    assert len(_FakeEventStoreService.emitted) == 1
+    assert _FakeEventStoreService.emitted[0]["workflow_version"] == 2
+    assert _FakeEventStoreService.emitted[0]["failed_step"] == "prepare_workflow"
+
+    # Case B: after _prepare_workflow populates main_workflow_context.workflow_version == 2
+    _FakeEventStoreService.emitted.clear()
     is_dup = await manager._prepare_workflow(session)  # type: ignore[arg-type]
     assert is_dup is False
     assert manager.main_workflow_context.workflow_version == 2
