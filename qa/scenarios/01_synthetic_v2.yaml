@@ -101,7 +101,7 @@ scenarios:
         confidence: { gte: 0.7 }
 
   - id: func-v2-invalid-date-anomaly
-    description: "Impossible date (31/04/2026) yields value=null and anomaly.code=invalid_date (#170)"
+    description: "Impossible date (29/02/2026) yields value=null and anomaly.code=invalid_date (#170)"
     tags: [develop, functional, synthetic, v2]
     min_profile: develop
     request:

@@ -33,6 +33,7 @@ from qa.reporter import (
 from qa.runners.chaos import ChaosConfigError
 from qa.runners.load_runner import LoadConfig, run_load_test
 from qa.runners.protocol_runner import (
+    PROTOCOL_SCENARIOS,
     filter_protocol_scenarios,
     run_protocol_scenarios,
 )
@@ -187,8 +188,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-c",
         "--concurrency",
         type=int,
-        default=4,
-        help="Max concurrent declarative scenarios (default: 4).",
+        default=2,
+        help="Max concurrent declarative scenarios (default: 2).",
     )
     p_run.add_argument(
         "--report",
@@ -398,6 +399,14 @@ async def _cmd_run_async(args: argparse.Namespace) -> int:
         default_scenarios_dir=DEFAULT_SCENARIOS_DIR,
     )
     all_scenarios = load_scenarios(scenario_files)
+    if explicit_ids is not None:
+        known_ids = {s.id for s in all_scenarios} | set(PROTOCOL_SCENARIOS.keys())
+        unknown_ids = explicit_ids - known_ids
+        if unknown_ids:
+            raise ConfigError(
+                f"Unknown scenario/protocol ID(s): {', '.join(sorted(unknown_ids))}"
+            )
+
     selected_scenarios = filter_scenarios(
         all_scenarios,
         include_tags=include_tags,
@@ -411,6 +420,8 @@ async def _cmd_run_async(args: argparse.Namespace) -> int:
         scenario_ids=explicit_ids,
         target_profile=env_config.profile,
     )
+    if not selected_scenarios and not selected_protocols:
+        raise ConfigError("No scenarios matched the requested filters.")
 
     started_at = utc_now_iso()
     t0 = time.perf_counter()

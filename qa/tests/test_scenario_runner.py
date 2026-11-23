@@ -8,11 +8,19 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+from qa.cli import build_parser
 from qa.client import DocumentIAClient
 from qa.config import ResolvedEnvConfig
 from qa.fixtures import DEFAULT_SCENARIOS_DIR, discover_scenario_files
 from qa.models import ScenarioDefinition
-from qa.runners.scenario_runner import ScenarioLoadError, load_scenarios, run_scenario
+from qa.runners.scenario_runner import (
+    DEFAULT_MAX_SUBMIT_ATTEMPTS,
+    TRANSIENT_SUBMIT_STATUSES,
+    ScenarioLoadError,
+    load_scenarios,
+    run_scenario,
+    run_scenarios,
+)
 
 
 def _make_env(profile: str = "develop") -> ResolvedEnvConfig:
@@ -114,6 +122,111 @@ async def test_async_v2_scenario_passes_with_transient_poll_503(tmp_path: Path) 
     assert result.snapshot is not None
     assert result.snapshot.execution_id == "exec-42"
     assert result.snapshot.total_processing_time_ms == 320
+
+
+@pytest.mark.asyncio
+async def test_scenario_retries_transient_502_on_initial_submit(
+    tmp_path: Path,
+) -> None:
+    assert DEFAULT_MAX_SUBMIT_ATTEMPTS == 5
+    assert TRANSIENT_SUBMIT_STATUSES == frozenset({502, 503, 504})
+    assert build_parser().parse_args(["run"]).concurrency == 2
+
+    submit_calls = 0
+    health_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal submit_calls, health_calls
+        if request.method == "GET" and request.url.path == "/api/v1/health":
+            health_calls += 1
+            return httpx.Response(502)
+        if (
+            request.method == "POST"
+            and request.url.path
+            == "/api/v2/workflows/document-barcode-extraction-v2/execute"
+        ):
+            submit_calls += 1
+            if submit_calls <= 3:
+                return httpx.Response(502)
+            return httpx.Response(
+                200,
+                json={"status": "success", "data": {"execution_id": "exec-502-ok"}},
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/api/v1/executions/exec-502-ok"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "exec-502-ok",
+                    "status": "SUCCESS",
+                    "purged": False,
+                    "data": {
+                        "total_processing_time_ms": 120,
+                        "result": {"barcodes": []},
+                    },
+                },
+            )
+        return httpx.Response(404)
+
+    scenario = ScenarioDefinition.model_validate(
+        {
+            "id": "test-retry-502-submit",
+            "tags": ["baseline", "synthetic"],
+            "request": {
+                "api_version": "v2",
+                "mode": "async",
+                "workflow_id": "document-barcode-extraction-v2",
+                "file": "synthetic:minimal_pdf",
+                "poll_interval_s": 0.01,
+                "max_timeout_s": 2.0,
+            },
+            "expect": {
+                "http_status": 200,
+                "execution_status": "SUCCESS",
+            },
+        }
+    )
+
+    async with DocumentIAClient(
+        _make_env("develop"), transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await run_scenario(
+            client,
+            scenario,
+            fixtures_dir=tmp_path,
+            retry_delay_scale=0.01,
+        )
+
+    assert result.status == "PASS"
+    assert submit_calls == 4
+    assert result.snapshot is not None
+    assert result.snapshot.execution_id == "exec-502-ok"
+
+    # Also verify run_scenarios triggers warm-up health check when len(scenarios) > 1 and concurrency > 1 (default 2)
+    sc_health = ScenarioDefinition.model_validate(
+        {
+            "id": "test-health-after-warmup",
+            "request": {
+                "mode": "http",
+                "method": "GET",
+                "path": "/api/v1/executions",
+            },
+            "expect": {"http_status": 404},
+        }
+    )
+    async with DocumentIAClient(
+        _make_env("develop"), transport=httpx.MockTransport(handler)
+    ) as client:
+        results = await run_scenarios(
+            client,
+            [sc_health, sc_health.model_copy(update={"id": "test-health-2"})],
+            fixtures_dir=tmp_path,
+            retry_delay_scale=0.01,
+        )
+    assert len(results) == 2
+    assert health_calls == 1
 
 
 @pytest.mark.asyncio

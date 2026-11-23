@@ -37,14 +37,39 @@ def validate_safe_identifier(value: str, field_name: str) -> str:
 
 
 def _default_cmd_runner(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        args,
-        shell=False,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=DEFAULT_CHAOS_CMD_TIMEOUT_S,
-    )
+    cmd_str = " ".join(args)
+    try:
+        return subprocess.run(
+            args,
+            shell=False,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=DEFAULT_CHAOS_CMD_TIMEOUT_S,
+        )
+    except FileNotFoundError as exc:
+        binary = args[0] if args else "<empty>"
+        raise ChaosConfigError(
+            f"Chaos command binary {binary!r} not found in PATH while running '{cmd_str}'."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        stderr_raw = exc.stderr
+        if isinstance(stderr_raw, bytes):
+            stderr_msg = stderr_raw.decode("utf-8", errors="replace").strip()
+        elif isinstance(stderr_raw, str):
+            stderr_msg = stderr_raw.strip()
+        else:
+            stderr_msg = ""
+        detail = f" (stderr: {stderr_msg})" if stderr_msg else ""
+        raise ChaosConfigError(
+            f"Chaos command '{cmd_str}' timed out after {exc.timeout}s{detail}."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        stderr_msg = (exc.stderr or "").strip() if isinstance(exc.stderr, str) else ""
+        detail = f": {stderr_msg}" if stderr_msg else ""
+        raise ChaosConfigError(
+            f"Chaos command '{cmd_str}' failed with exit code {exc.returncode}{detail}"
+        ) from exc
 
 
 class ChaosProvider(ABC):

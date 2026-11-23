@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from qa.client import HttpResponse
-from qa.matcher import evaluate_expectations, evaluate_field_rule, normalize_text
-from qa.models import FieldRule, ScenarioExpect
+from qa.matcher import (
+    evaluate_expectations,
+    evaluate_field_rule,
+    normalize_text,
+    resolve_json_path,
+)
+from qa.models import FieldRule, ScenarioExpect, ScenarioRequest
 
 
 def _resp(
@@ -147,6 +155,7 @@ def test_evaluate_expectations_full_execution_and_purged_profile() -> None:
             "classification": {
                 "document_type": "CNI",
                 "confidence": {"gte": 0.75},
+                "explanation": {"not_empty": True, "contains": "french"},
             },
             "extraction": {
                 "type": "cni",
@@ -182,6 +191,10 @@ def test_evaluate_expectations_full_execution_and_purged_profile() -> None:
         target_profile="baseline",
     )
     assert all(a.passed for a in res_baseline)
+    assert any(
+        a.path == "classification.explanation.not_empty" and a.passed
+        for a in res_baseline
+    )
 
     # On develop profile, missing 'purged' fails
     res_develop_missing = evaluate_expectations(
@@ -206,10 +219,9 @@ def test_evaluate_expectations_full_execution_and_purged_profile() -> None:
 def test_resolve_json_path_root_and_nested_length_and_sensitive_header_redaction() -> (
     None
 ):
-    from qa.matcher import resolve_json_path
-
     assert resolve_json_path([1, 2, 3], "$length") == (True, 3)
     assert resolve_json_path({"data": [1, 2]}, "data.$length") == (True, 2)
+    assert resolve_json_path({"data": [1, 2]}, "data.$length.invalid") == (False, None)
     assert resolve_json_path({"a": {"b": 42}}, "$.a.b") == (True, 42)
     assert resolve_json_path(123, "$length") == (False, None)
 
@@ -253,3 +265,60 @@ def test_resolve_json_path_root_and_nested_length_and_sensitive_header_redaction
         and r.actual == "***REDACTED***"
         for r in results
     )
+
+
+def test_classification_explanation_and_invalid_field_rule_validation() -> None:
+    # 1. classification.explanation fails when empty
+    expect_expl = ScenarioExpect.model_validate(
+        {
+            "http_status": 200,
+            "classification": {
+                "document_type": "cni",
+                "explanation": {"not_empty": True},
+            },
+        }
+    )
+    exec_empty_expl = _resp(
+        200,
+        body={
+            "status": "SUCCESS",
+            "data": {
+                "result": {
+                    "classification": {
+                        "document_type": "cni",
+                        "explanation": "   ",
+                    }
+                }
+            },
+        },
+    )
+    res_fail = evaluate_expectations(
+        expect_expl,
+        http_response=_resp(200),
+        execution_response=exec_empty_expl,
+    )
+    assert any(
+        a.path == "classification.explanation.not_empty" and not a.passed
+        for a in res_fail
+    )
+
+    # 2. ScenarioRequest accepts poll_timeout_s alias and excludes api_key_override from repr/dump
+    req = ScenarioRequest.model_validate(
+        {
+            "workflow_id": "document-classification-extraction-v2",
+            "file": "synthetic:minimal_pdf",
+            "poll_timeout_s": 180.0,
+            "api_key_override": "dia_test_override_secret_key",
+        }
+    )
+    assert req.max_timeout_s == 180.0
+    assert "dia_test_override_secret_key" not in repr(req)
+    assert "api_key_override" not in req.model_dump()
+    assert "dia_test_override_secret_key" not in req.model_dump_json()
+
+    # 3. FieldRule rejects malformed regex and inverted between bounds at validation time
+    with pytest.raises(ValidationError, match="Invalid regex pattern"):
+        FieldRule.model_validate({"regex": "[unclosed("})
+
+    with pytest.raises(ValidationError, match="Invalid 'between' bounds"):
+        FieldRule.model_validate({"between": [1.0, 0.5]})

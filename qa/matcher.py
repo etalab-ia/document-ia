@@ -55,9 +55,9 @@ def resolve_json_path(payload: Any, path: str) -> tuple[bool, Any]:
     current: Any = payload
     segments = [seg for seg in cleaned_path.split(".") if seg]
 
-    for segment in segments:
+    for seg_idx, segment in enumerate(segments):
         if segment == "$length":
-            if isinstance(current, (list, dict, str)):
+            if seg_idx == len(segments) - 1 and isinstance(current, (list, dict, str)):
                 return True, len(current)
             return False, None
 
@@ -681,6 +681,15 @@ def evaluate_expectations(
                         expect.classification.confidence,
                         found="confidence" in classification,
                         actual=classification.get("confidence"),
+                    )
+                )
+            if expect.classification.explanation is not None:
+                results.extend(
+                    evaluate_field_rule(
+                        "classification.explanation",
+                        expect.classification.explanation,
+                        found="explanation" in classification,
+                        actual=classification.get("explanation"),
                     )
                 )
 

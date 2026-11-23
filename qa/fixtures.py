@@ -238,12 +238,14 @@ def _gen_invalid_date_pdf() -> ResolvedFixture:
                 "NOM: MARTIN",
                 "Prenom(s): CLAIRE",
                 "Sexe: F",
-                "Ne(e) le: 12/03/1988",
+                "Ne(e) le: 29/02/2026",
                 "a: LYON",
                 "Delivree le: 15/05/2016",
-                "Valable jusqu'au: 31/04/2026",
-                "Date d'expiration: 31/04/2026",
+                "Valable jusqu'au: 29/02/2026",
+                "Date d'expiration: 29/02/2026",
                 "Autorite: PREFECTURE DU RHONE",
+                "IDFRAMARTIN<<<<<<<<<<<<<<<<<<<<750001",
+                "9876543210982CLAIRE<<<<<<<<2602298F2602298",
             ]
         ]
     )

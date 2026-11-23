@@ -9,7 +9,12 @@ from pathlib import Path
 import httpx
 import yaml
 
-from qa.client import DocumentIAClient, HttpResponse, extract_execution_id
+from qa.client import (
+    DocumentIAClient,
+    HttpResponse,
+    extract_execution_id,
+    parse_retry_after,
+)
 from qa.fixtures import (
     FixtureNotFoundError,
     FixturePathTraversalError,
@@ -29,6 +34,8 @@ from qa.models import (
 INVALID_DEMO_API_KEY = "_".join(
     ("dia", "staging", "2", "BADPREFX", "INVALIDKEYBODY" + "0" * 28, "0000")
 )
+DEFAULT_MAX_SUBMIT_ATTEMPTS = 5
+TRANSIENT_SUBMIT_STATUSES = frozenset({502, 503, 504})
 
 
 class ScenarioLoadError(RuntimeError):
@@ -142,12 +149,109 @@ def _is_clean_sync_rejection(
     return http_response.status_code in expected_statuses and 200 in expected_statuses
 
 
+async def _send_initial_request(
+    client: DocumentIAClient,
+    scenario: ScenarioDefinition,
+    *,
+    fixture: ResolvedFixture | None,
+    use_admin_key: bool,
+    api_key_override: str | None,
+    omit_api_key: bool,
+    max_submit_attempts: int = DEFAULT_MAX_SUBMIT_ATTEMPTS,
+    retry_delay_scale: float = 1.0,
+) -> HttpResponse:
+    """Send the initial scenario HTTP/workflow request with transient 502/503/504 & transport retries."""
+    req = scenario.request
+    is_sync = req.mode == "sync"
+    expected_statuses = (
+        [scenario.expect.http_status]
+        if isinstance(scenario.expect.http_status, int)
+        else list(scenario.expect.http_status)
+    )
+    attempts = max(1, max_submit_attempts)
+    http_response: HttpResponse | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            if req.mode == "http":
+                assert req.path is not None
+                http_response = await client.request(
+                    req.method,
+                    req.path,
+                    use_admin_key=use_admin_key,
+                    api_key_override=api_key_override,
+                    omit_api_key=omit_api_key,
+                    extra_headers=req.headers or None,
+                )
+            elif req.api_version == "v2":
+                assert req.workflow_id is not None
+                http_response = await client.execute_workflow_v2(
+                    req.workflow_id,
+                    fixture=fixture,
+                    file_url=req.file_url,
+                    override=req.override,
+                    raw_override=req.raw_override,
+                    metadata=req.metadata,
+                    raw_metadata=req.raw_metadata,
+                    idempotency_key=req.idempotency_key,
+                    extra_headers=req.headers or None,
+                    api_key_override=api_key_override,
+                    omit_api_key=omit_api_key,
+                    sync=is_sync,
+                    timeout_s=req.max_timeout_s if is_sync else None,
+                )
+            else:
+                assert req.workflow_id is not None
+                http_response = await client.execute_workflow_v1(
+                    req.workflow_id,
+                    fixture=fixture,
+                    file_url=req.file_url,
+                    classification_parameters=req.classification_parameters,
+                    extraction_parameters=req.extraction_parameters,
+                    metadata=req.metadata,
+                    raw_metadata=req.raw_metadata,
+                    idempotency_key=req.idempotency_key,
+                    extra_headers=req.headers or None,
+                    api_key_override=api_key_override,
+                    omit_api_key=omit_api_key,
+                    sync=is_sync,
+                    timeout_s=req.max_timeout_s if is_sync else None,
+                )
+        except httpx.TransportError:
+            if attempt < attempts:
+                wait_s = min(1.0 * attempt, 5.0) * retry_delay_scale
+                await asyncio.sleep(max(0.0, wait_s))
+                continue
+            raise
+
+        if (
+            http_response.status_code in TRANSIENT_SUBMIT_STATUSES
+            and http_response.status_code not in expected_statuses
+            and attempt < attempts
+        ):
+            wait_s = (
+                min(
+                    parse_retry_after(http_response, default_s=1.0 * attempt),
+                    5.0,
+                )
+                * retry_delay_scale
+            )
+            await asyncio.sleep(max(0.0, wait_s))
+            continue
+        break
+
+    assert http_response is not None
+    return http_response
+
+
 async def run_scenario(
     client: DocumentIAClient,
     scenario: ScenarioDefinition,
     *,
     fixtures_dir: Path,
     strict_fixtures: bool = False,
+    max_submit_attempts: int = DEFAULT_MAX_SUBMIT_ATTEMPTS,
+    retry_delay_scale: float = 1.0,
 ) -> ScenarioResult:
     """Execute a single declarative scenario and evaluate all expectations."""
     start = time.perf_counter()
@@ -227,74 +331,43 @@ async def run_scenario(
         )
 
     try:
-        http_response: HttpResponse
         execution_response: HttpResponse | None = None
         execution_status_override: str | None = None
 
-        if req.mode == "http":
-            if not req.path:
-                return ScenarioResult(
-                    id=scenario.id,
-                    description=scenario.description,
-                    kind="scenario",
-                    tags=list(scenario.tags),
-                    status="ERROR",
-                    duration_ms=(time.perf_counter() - start) * 1000.0,
-                    message="Scenario with mode='http' must define request.path.",
-                )
-            http_response = await client.request(
-                req.method,
-                req.path,
-                use_admin_key=use_admin_key,
-                api_key_override=api_key_override,
-                omit_api_key=omit_api_key,
-                extra_headers=req.headers or None,
+        if req.mode == "http" and not req.path:
+            return ScenarioResult(
+                id=scenario.id,
+                description=scenario.description,
+                kind="scenario",
+                tags=list(scenario.tags),
+                status="ERROR",
+                duration_ms=(time.perf_counter() - start) * 1000.0,
+                message="Scenario with mode='http' must define request.path.",
             )
-        else:
-            if not req.workflow_id:
-                return ScenarioResult(
-                    id=scenario.id,
-                    description=scenario.description,
-                    kind="scenario",
-                    tags=list(scenario.tags),
-                    status="ERROR",
-                    duration_ms=(time.perf_counter() - start) * 1000.0,
-                    message="Workflow scenario must define request.workflow_id.",
-                )
-            is_sync = req.mode == "sync"
-            if req.api_version == "v2":
-                http_response = await client.execute_workflow_v2(
-                    req.workflow_id,
-                    fixture=fixture,
-                    file_url=req.file_url,
-                    override=req.override,
-                    raw_override=req.raw_override,
-                    metadata=req.metadata,
-                    raw_metadata=req.raw_metadata,
-                    idempotency_key=req.idempotency_key,
-                    extra_headers=req.headers or None,
-                    api_key_override=api_key_override,
-                    omit_api_key=omit_api_key,
-                    sync=is_sync,
-                    timeout_s=req.max_timeout_s if is_sync else None,
-                )
-            else:
-                http_response = await client.execute_workflow_v1(
-                    req.workflow_id,
-                    fixture=fixture,
-                    file_url=req.file_url,
-                    classification_parameters=req.classification_parameters,
-                    extraction_parameters=req.extraction_parameters,
-                    metadata=req.metadata,
-                    raw_metadata=req.raw_metadata,
-                    idempotency_key=req.idempotency_key,
-                    extra_headers=req.headers or None,
-                    api_key_override=api_key_override,
-                    omit_api_key=omit_api_key,
-                    sync=is_sync,
-                    timeout_s=req.max_timeout_s if is_sync else None,
-                )
+        if req.mode != "http" and not req.workflow_id:
+            return ScenarioResult(
+                id=scenario.id,
+                description=scenario.description,
+                kind="scenario",
+                tags=list(scenario.tags),
+                status="ERROR",
+                duration_ms=(time.perf_counter() - start) * 1000.0,
+                message="Workflow scenario must define request.workflow_id.",
+            )
 
+        is_sync = req.mode == "sync"
+        http_response = await _send_initial_request(
+            client,
+            scenario,
+            fixture=fixture,
+            use_admin_key=use_admin_key,
+            api_key_override=api_key_override,
+            omit_api_key=omit_api_key,
+            max_submit_attempts=max_submit_attempts,
+            retry_delay_scale=retry_delay_scale,
+        )
+
+        if req.mode != "http":
             if is_sync:
                 execution_response = http_response
             elif _needs_polling(scenario.expect, http_response):
@@ -390,9 +463,17 @@ async def run_scenarios(
     *,
     fixtures_dir: Path,
     strict_fixtures: bool = False,
-    concurrency: int = 4,
+    concurrency: int = 2,
+    max_submit_attempts: int = DEFAULT_MAX_SUBMIT_ATTEMPTS,
+    retry_delay_scale: float = 1.0,
 ) -> list[ScenarioResult]:
     """Execute a list of declarative scenarios with bounded concurrency."""
+    if len(scenarios) > 1 and concurrency > 1:
+        try:
+            await client.health()
+        except httpx.HTTPError:
+            pass
+
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async def _bounded(sc: ScenarioDefinition) -> ScenarioResult:
@@ -402,6 +483,8 @@ async def run_scenarios(
                 sc,
                 fixtures_dir=fixtures_dir,
                 strict_fixtures=strict_fixtures,
+                max_submit_attempts=max_submit_attempts,
+                retry_delay_scale=retry_delay_scale,
             )
 
     tasks = [_bounded(sc) for sc in scenarios]

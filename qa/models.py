@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 EnvProfile = Literal["baseline", "develop"]
 ScenarioStatus = Literal["PASS", "FAIL", "SKIPPED", "ERROR"]
@@ -61,6 +62,21 @@ class FieldRule(BaseModel):
             normalized["has_not_equals"] = True
         return normalized
 
+    @model_validator(mode="after")
+    def _validate_rule_parameters(self) -> FieldRule:
+        if self.regex is not None:
+            try:
+                re.compile(self.regex)
+            except re.error as exc:
+                raise ValueError(
+                    f"Invalid regex pattern {self.regex!r}: {exc}"
+                ) from exc
+        if self.between is not None and self.between[0] > self.between[1]:
+            raise ValueError(
+                f"Invalid 'between' bounds {self.between!r}: lower bound must be <= upper bound"
+            )
+        return self
+
 
 class ClassificationExpect(BaseModel):
     """Expectations on execution classification result."""
@@ -69,6 +85,7 @@ class ClassificationExpect(BaseModel):
 
     document_type: str | FieldRule | None = Field(default=None)
     confidence: FieldRule | None = Field(default=None)
+    explanation: FieldRule | None = Field(default=None)
 
 
 class ExtractionExpect(BaseModel):
@@ -127,8 +144,8 @@ class ScenarioRequest(BaseModel):
     method: str = Field(default="GET")
     path: str | None = Field(default=None)
     auth: Literal["default", "none", "invalid", "admin"] = Field(default="default")
-    # Reserved for synthetic/invalid test keys only; never serialized into reports.
-    api_key_override: str | None = Field(default=None)
+    # Reserved for synthetic/invalid test keys only; never serialized into reports or repr.
+    api_key_override: str | None = Field(default=None, repr=False, exclude=True)
 
     # Workflow execution fields
     workflow_id: str | None = Field(default=None)
@@ -143,7 +160,11 @@ class ScenarioRequest(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     idempotency_key: str | None = Field(default=None)
     poll_interval_s: float | None = Field(default=None, gt=0)
-    max_timeout_s: float | None = Field(default=None, gt=0)
+    max_timeout_s: float | None = Field(
+        default=None,
+        gt=0,
+        validation_alias=AliasChoices("max_timeout_s", "poll_timeout_s"),
+    )
 
 
 class ScenarioDefinition(BaseModel):

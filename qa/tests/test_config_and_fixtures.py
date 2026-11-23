@@ -179,7 +179,7 @@ def test_synthetic_pdf_generators_produce_valid_xref_pdfs(tmp_path: Path) -> Non
     assert b"14/05/1990" in cni.content
 
     invalid_date = resolve_fixture("synthetic:invalid_date_pdf", tmp_path)
-    assert b"31/04/2026" in invalid_date.content
+    assert b"29/02/2026" in invalid_date.content
 
     multipage = resolve_fixture("synthetic:multipage_pdf", tmp_path)
     assert b"/Count 3" in multipage.content

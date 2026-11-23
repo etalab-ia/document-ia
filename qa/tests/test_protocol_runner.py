@@ -283,7 +283,9 @@ async def test_proto_webhook_isolation_and_cleanup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_proto_auth_binding_fails_when_401_consumes_quota() -> None:
+async def test_proto_auth_binding_fails_when_401_consumes_quota_or_header_missing() -> (
+    None
+):
     env = _make_env()
     valid_key = env.get_api_key()
     rem_min = 60
@@ -315,6 +317,29 @@ async def test_proto_auth_binding_fails_when_401_consumes_quota() -> None:
     assert any(
         a.path == "auth.quota_not_consumed_by_401" and not a.passed
         for a in res.assertions
+    )
+
+    # Also fail when X-RateLimit-Remaining-Minute header is missing on valid calls
+    def missing_header_handler(req: httpx.Request) -> httpx.Response:
+        if req.headers.get("X-API-KEY") != valid_key:
+            return httpx.Response(401, json={"detail": "Unauthorized"})
+        return httpx.Response(200, json={"status": "success"})
+
+    async with DocumentIAClient(
+        env, transport=httpx.MockTransport(missing_header_handler)
+    ) as client_no_hdr:
+        res_no_hdr = (
+            await run_protocol_scenarios(
+                client_no_hdr, [PROTOCOL_SCENARIOS["proto-auth-binding"]]
+            )
+        )[0]
+
+    assert res_no_hdr.status == "FAIL"
+    assert any(
+        a.path == "auth.quota_not_consumed_by_401"
+        and not a.passed
+        and "Missing or non-integer 'X-RateLimit-Remaining-Minute'" in a.message
+        for a in res_no_hdr.assertions
     )
 
 
@@ -417,3 +442,47 @@ async def test_proto_oom_decompression_bomb_accepts_safe_success_empty_barcodes(
         a.path == "oom_bomb.execution_status" and not a.passed
         for a in res_timeout.assertions
     )
+
+
+@pytest.mark.asyncio
+async def test_protocol_scenarios_retry_transient_502_504_and_transport_error() -> None:
+    env = _make_env()
+    calls = 0
+    rem_min = 60
+    rem_day = 100
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls, rem_min, rem_day
+        calls += 1
+        if calls == 1:
+            return httpx.Response(502, text="Bad Gateway")
+        if calls == 2:
+            return httpx.Response(504, text="Gateway Timeout")
+        if calls == 3:
+            raise httpx.ConnectError("transient gateway reset")
+        rem_min -= 1
+        rem_day -= 1
+        return httpx.Response(
+            200,
+            json={"status": "success"},
+            headers={
+                "X-RateLimit-Remaining-Minute": str(rem_min),
+                "X-RateLimit-Remaining-Daily": str(rem_day),
+                "X-RateLimit-Reset-Minute": "2026-11-23T15:01:00",
+                "X-RateLimit-Reset-Daily": "2026-11-24T00:00:00",
+            },
+        )
+
+    async with DocumentIAClient(env, transport=httpx.MockTransport(handler)) as client:
+        res = (
+            await run_protocol_scenarios(
+                client,
+                [PROTOCOL_SCENARIOS["proto-ratelimit-headers"]],
+                retry_delay_scale=0.01,
+            )
+        )[0]
+        assert "request" not in client.__dict__
+
+    assert res.status == "PASS", res.message
+    # First test_auth took 4 attempts (502, 504, ConnectError, 200) + second test_auth took 1 attempt = 5
+    assert calls == 5

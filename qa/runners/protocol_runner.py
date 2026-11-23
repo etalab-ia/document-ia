@@ -7,6 +7,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
@@ -25,6 +26,37 @@ from qa.runners.scenario_runner import matches_tag_filter
 ProtocolFunc = Callable[[DocumentIAClient], Awaitable[ScenarioResult]]
 
 FAST_PROTOCOL_WORKFLOW = "document-barcode-extraction-v2"
+DEFAULT_MAX_GATEWAY_ATTEMPTS = 4
+TRANSIENT_GATEWAY_STATUSES = frozenset({502, 503, 504})
+
+
+async def _call_with_gateway_retry(
+    call: Callable[[], Awaitable[HttpResponse]],
+    *,
+    max_attempts: int = DEFAULT_MAX_GATEWAY_ATTEMPTS,
+    retry_delay_scale: float = 1.0,
+) -> HttpResponse:
+    """Retry a protocol HTTP call up to max_attempts on transient 502/503/504 or TransportError."""
+    attempts = max(1, max_attempts)
+    resp: HttpResponse | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = await call()
+        except httpx.TransportError:
+            if attempt < attempts:
+                wait_s = min(1.0 * attempt, 4.0) * retry_delay_scale
+                await asyncio.sleep(max(0.0, wait_s))
+                continue
+            raise
+
+        if resp.status_code in TRANSIENT_GATEWAY_STATUSES and attempt < attempts:
+            wait_s = min(1.0 * attempt, 4.0) * retry_delay_scale
+            await asyncio.sleep(max(0.0, wait_s))
+            continue
+        break
+
+    assert resp is not None
+    return resp
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +274,19 @@ async def _run_proto_auth_binding(client: DocumentIAClient) -> ScenarioResult:
                     ""
                     if quota_preserved
                     else f"401 requests consumed valid key quota: before={rem_before}, after={rem_after}"
+                ),
+            )
+        )
+    else:
+        assertions.append(
+            AssertionResult(
+                path="auth.quota_not_consumed_by_401",
+                passed=False,
+                expected="X-RateLimit-Remaining-Minute integer header on valid auth calls",
+                actual={"before": rem_before, "after": rem_after},
+                message=(
+                    "Missing or non-integer 'X-RateLimit-Remaining-Minute' header on "
+                    f"valid auth calls (before={rem_before!r}, after={rem_after!r})"
                 ),
             )
         )
@@ -1057,40 +1102,66 @@ def filter_protocol_scenarios(
 async def run_protocol_scenarios(
     client: DocumentIAClient,
     specs: list[ProtocolScenarioSpec],
+    *,
+    max_gateway_attempts: int = DEFAULT_MAX_GATEWAY_ATTEMPTS,
+    retry_delay_scale: float = 1.0,
 ) -> list[ScenarioResult]:
     """Run selected protocol scenarios sequentially to avoid cross-test rate-limit interference."""
     results: list[ScenarioResult] = []
-    for spec in specs:
-        if client.env_config.profile == "baseline" and spec.min_profile == "develop":
-            results.append(
-                ScenarioResult(
-                    id=spec.id,
-                    description=spec.description,
-                    kind="protocol",
-                    tags=list(spec.tags),
-                    status="SKIPPED",
-                    message="Skipped on baseline profile (requires min_profile=develop).",
+    original_request = client.request
+    had_instance_request = "request" in client.__dict__
+
+    async def _request_with_gateway_retry(
+        *args: Any,
+        **kwargs: Any,
+    ) -> HttpResponse:
+        return await _call_with_gateway_retry(
+            lambda: original_request(*args, **kwargs),
+            max_attempts=max_gateway_attempts,
+            retry_delay_scale=retry_delay_scale,
+        )
+
+    client.__dict__["request"] = _request_with_gateway_retry
+    try:
+        for spec in specs:
+            if (
+                client.env_config.profile == "baseline"
+                and spec.min_profile == "develop"
+            ):
+                results.append(
+                    ScenarioResult(
+                        id=spec.id,
+                        description=spec.description,
+                        kind="protocol",
+                        tags=list(spec.tags),
+                        status="SKIPPED",
+                        message="Skipped on baseline profile (requires min_profile=develop).",
+                    )
                 )
-            )
-            continue
-        start = time.perf_counter()
-        try:
-            res = await spec.runner(client)
-        except httpx.HTTPError as exc:
-            res = _build_result(
-                spec,
-                start,
-                [],
-                override_status="ERROR",
-                override_message=f"HTTP transport error: {type(exc).__name__}: {exc}",
-            )
-        except (ValueError, KeyError, RuntimeError, OSError) as exc:
-            res = _build_result(
-                spec,
-                start,
-                [],
-                override_status="ERROR",
-                override_message=f"Unexpected error: {type(exc).__name__}: {exc}",
-            )
-        results.append(res)
+                continue
+            start = time.perf_counter()
+            try:
+                res = await spec.runner(client)
+            except httpx.HTTPError as exc:
+                res = _build_result(
+                    spec,
+                    start,
+                    [],
+                    override_status="ERROR",
+                    override_message=f"HTTP transport error: {type(exc).__name__}: {exc}",
+                )
+            except (ValueError, KeyError, RuntimeError, OSError) as exc:
+                res = _build_result(
+                    spec,
+                    start,
+                    [],
+                    override_status="ERROR",
+                    override_message=f"Unexpected error: {type(exc).__name__}: {exc}",
+                )
+            results.append(res)
+    finally:
+        if had_instance_request:
+            client.__dict__["request"] = original_request
+        else:
+            client.__dict__.pop("request", None)
     return results

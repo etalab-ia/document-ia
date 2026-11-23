@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import subprocess
+import time
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -18,6 +20,7 @@ from qa.runners.chaos import (
     DockerChaosProvider,
     ManualPauseChaosProvider,
     ScalingoChaosProvider,
+    _default_cmd_runner,
     validate_safe_identifier,
 )
 from qa.runners.load_runner import LoadConfig, compute_latency_stats, run_load_test
@@ -452,3 +455,167 @@ async def test_load_runner_detects_idempotency_duplicate_poll_500_and_redis_chao
     assert redis_report.chaos_event is not None
     assert redis_report.chaos_event.redis_write_fail_closed_503 is False
     assert redis_report.assertions.all_passed is False
+
+
+@pytest.mark.asyncio
+async def test_manual_chaos_pauses_subsequent_submissions_until_operator_confirms(
+    tmp_path: Path,
+) -> None:
+    post_count = 0
+    posts_seen_during_manual_pause: list[int] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if req.url.path == "/api/v1/health":
+            return httpx.Response(200, json={"status": "healthy"})
+        if req.method == "POST":
+            post_count += 1
+            return httpx.Response(
+                200, json={"data": {"execution_id": f"exec-manual-{post_count}"}}
+            )
+        if req.method == "GET" and req.url.path.startswith("/api/v1/executions/"):
+            eid = req.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200, json={"id": eid, "status": "SUCCESS", "data": {}}
+            )
+        return httpx.Response(404)
+
+    def operator_prompt(_msg: str) -> str:
+        # Sleep briefly in worker thread to give the event loop a chance to run any unblocked tasks
+        time.sleep(0.05)
+        posts_seen_during_manual_pause.append(post_count)
+        return ""
+
+    manual_provider = ManualPauseChaosProvider(
+        target="staging-worker",
+        prompt_fn=operator_prompt,
+    )
+    cfg = LoadConfig(
+        requests=6,
+        concurrency=5,  # intentionally higher than chaos_after=2
+        use_idempotency_key=False,
+        chaos_mode="manual",
+        chaos_after=2,
+        poll_interval_s=0.01,
+        max_timeout_s=1.0,
+    )
+
+    async with DocumentIAClient(
+        _make_env(), transport=httpx.MockTransport(handler)
+    ) as client:
+        report = await run_load_test(
+            client,
+            cfg,
+            fixtures_dir=tmp_path,
+            chaos_provider=manual_provider,
+        )
+
+    # While operator was prompted, only the first `chaos_after` (2) submissions were sent
+    assert posts_seen_during_manual_pause == [2]
+    # After operator confirmed, all 6 requests completed
+    assert post_count == 6
+    assert report.accepted_count == 6
+    assert report.success_count == 6
+    assert report.assertions.all_passed is True
+
+
+def test_default_cmd_runner_wraps_subprocess_errors_with_stderr() -> None:
+    # 1. CalledProcessError includes stderr
+    with (
+        patch(
+            "qa.runners.chaos.subprocess.run",
+            side_effect=subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["docker", "restart", "missing-container"],
+                stderr="Error response from daemon: No such container: missing-container\n",
+            ),
+        ),
+        pytest.raises(
+            ChaosConfigError,
+            match="No such container: missing-container",
+        ),
+    ):
+        _default_cmd_runner(["docker", "restart", "missing-container"])
+
+    # 2. TimeoutExpired includes timeout and stderr
+    with (
+        patch(
+            "qa.runners.chaos.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd=["scalingo", "--app", "doc-ia-staging", "restart", "worker"],
+                timeout=60.0,
+                stderr="API gateway timeout\n",
+            ),
+        ),
+        pytest.raises(
+            ChaosConfigError,
+            match="timed out after 60.0s.*API gateway timeout",
+        ),
+    ):
+        _default_cmd_runner(
+            ["scalingo", "--app", "doc-ia-staging", "restart", "worker"]
+        )
+
+    # 3. FileNotFoundError mentions missing binary
+    with (
+        patch(
+            "qa.runners.chaos.subprocess.run",
+            side_effect=FileNotFoundError("No such file or directory: 'scalingo'"),
+        ),
+        pytest.raises(
+            ChaosConfigError,
+            match="binary 'scalingo' not found in PATH",
+        ),
+    ):
+        _default_cmd_runner(
+            ["scalingo", "--app", "doc-ia-staging", "restart", "worker"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_load_runner_emits_realtime_progress_logs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    attempts = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        if req.url.path == "/api/v1/health":
+            return httpx.Response(200, json={"status": "healthy"})
+        if req.method == "POST":
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(429, headers={"Retry-After": "0.01"})
+            return httpx.Response(
+                200, json={"data": {"execution_id": f"exec-prog-{attempts}"}}
+            )
+        if req.method == "GET" and req.url.path.startswith("/api/v1/executions/"):
+            eid = req.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200, json={"id": eid, "status": "SUCCESS", "data": {}}
+            )
+        return httpx.Response(404)
+
+    cfg = LoadConfig(
+        requests=2,
+        concurrency=1,
+        use_idempotency_key=False,
+        poll_interval_s=0.01,
+        max_timeout_s=1.0,
+        retry_backoff_scale=0.0,
+        show_progress=True,
+    )
+    async with DocumentIAClient(
+        _make_env(), transport=httpx.MockTransport(handler)
+    ) as client:
+        await run_load_test(client, cfg, fixtures_dir=tmp_path)
+
+    captured = capsys.readouterr().out
+    assert "[LOAD] Phase 1/2" in captured
+    assert "[SUBMIT-RETRY]" in captured
+    assert "[SUBMIT 1/2]" in captured
+    assert "[SUBMIT 2/2]" in captured
+    assert "[LOAD] Phase 1 terminée : 2/2 exécutions acceptées" in captured
+    assert "[POLL [" in captured
+    assert "[PENDING (1)]" in captured

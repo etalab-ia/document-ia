@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from qa.cli import main
 from qa.models import ExecutionSnapshot, RunReport, ScenarioResult
 from qa.reporter import (
@@ -146,3 +148,19 @@ def test_cli_handles_invalid_load_args_path_traversal_and_bad_json_cleanly(
     bad_json = tmp_path / "broken.json"
     bad_json.write_text("{not-valid-json", encoding="utf-8")
     assert main(["compare", str(bad_json), str(bad_json)]) == 2
+
+
+def test_cli_run_rejects_unknown_scenario_id_or_empty_selection(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Unknown --id returns exit code 2
+    code_unknown_id = main(["run", "--env", "local", "--id", "non-existent-scenario"])
+    assert code_unknown_id == 2
+    err_id = capsys.readouterr().err
+    assert "Unknown scenario/protocol ID(s): non-existent-scenario" in err_id
+
+    # Filter matching 0 scenarios returns exit code 2
+    code_empty_tags = main(["run", "--env", "local", "--tags", "non-existent-tag"])
+    assert code_empty_tags == 2
+    err_tags = capsys.readouterr().err
+    assert "No scenarios matched the requested filters" in err_tags

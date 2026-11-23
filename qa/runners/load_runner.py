@@ -53,6 +53,16 @@ class LoadConfig:
     chaos_downtime_s: float = 5.0
     max_retries_per_request: int = 6
     retry_backoff_scale: float = 1.0
+    show_progress: bool = True
+
+
+def _format_progress_bar(completed: int, total: int, width: int = 20) -> str:
+    """Build an ASCII progress bar like `[##########..........]`."""
+    if total <= 0:
+        return f"[{'#' * width}]"
+    ratio = min(1.0, max(0.0, completed / total))
+    filled = round(ratio * width)
+    return f"[{'#' * filled}{'.' * (width - filled)}]"
 
 
 def compute_latency_stats(samples_ms: list[float]) -> LatencyStats:
@@ -111,6 +121,10 @@ async def run_load_test(
     if config.concurrency < 1:
         raise ValueError("concurrency must be >= 1")
 
+    def _log_progress(msg: str) -> None:
+        if config.show_progress:
+            print(msg, flush=True)
+
     resolved_fixtures: list[ResolvedFixture] = [
         resolve_fixture(spec, fixtures_dir)
         for spec in (config.files or ["synthetic:minimal_pdf"])
@@ -152,6 +166,24 @@ async def run_load_test(
     chaos_lock = asyncio.Lock()
     chaos_task: asyncio.Task[ChaosEvent] | None = None
     chaos_triggered = False
+    chaos_threshold = max(1, min(config.chaos_after, config.requests))
+    chaos_gate = asyncio.Event()
+    chaos_gate.set()
+    manual_pre_chaos_sem = asyncio.Semaphore(chaos_threshold)
+
+    async def _run_chaos_trigger() -> ChaosEvent:
+        try:
+            return await provider.trigger(
+                client=client,
+                probe_execution_id=first_accepted_exec_id,
+                probe_workflow_id=config.workflow_id,
+                probe_fixture=resolved_fixtures[0],
+            )
+        finally:
+            chaos_gate.set()
+            if provider.mode == "manual":
+                for _ in range(config.requests):
+                    manual_pre_chaos_sem.release()
 
     async def _maybe_trigger_chaos() -> None:
         nonlocal chaos_task, chaos_triggered
@@ -160,168 +192,203 @@ async def run_load_test(
         async with chaos_lock:
             if chaos_triggered:
                 return
-            if accepted_counter >= max(1, min(config.chaos_after, config.requests)):
+            if accepted_counter >= chaos_threshold:
                 chaos_triggered = True
-                chaos_task = asyncio.create_task(
-                    provider.trigger(
-                        client=client,
-                        probe_execution_id=first_accepted_exec_id,
-                        probe_workflow_id=config.workflow_id,
-                        probe_fixture=resolved_fixtures[0],
-                    )
-                )
+                if provider.mode == "manual":
+                    chaos_gate.clear()
+                chaos_task = asyncio.create_task(_run_chaos_trigger())
 
     submit_semaphore = asyncio.Semaphore(config.concurrency)
 
     async def _submit_one(record: LoadRequestRecord, fixture: ResolvedFixture) -> None:
         nonlocal accepted_counter, first_accepted_exec_id
-        async with submit_semaphore:
-            req_start = time.perf_counter()
-            req_start_by_index[record.request_index] = req_start
-            max_attempts = max(1, config.max_retries_per_request + 1)
+        acquired_pre_chaos = False
+        accepted_this_request = False
+        if provider.mode == "manual":
+            await manual_pre_chaos_sem.acquire()
+            acquired_pre_chaos = True
+        try:
+            await chaos_gate.wait()
+            async with submit_semaphore:
+                await chaos_gate.wait()
+                req_start = time.perf_counter()
+                req_start_by_index[record.request_index] = req_start
+                max_attempts = max(1, config.max_retries_per_request + 1)
 
-            for attempt in range(1, max_attempts + 1):
-                record.attempts = attempt
-                try:
-                    resp = await client.execute_workflow_v2(
-                        config.workflow_id,
-                        fixture=fixture,
-                        override=config.override,
-                        metadata={
-                            "qa_load_run": run_id,
-                            "request_index": record.request_index,
-                        },
-                        idempotency_key=record.idempotency_key,
-                    )
-                    record.http_status = resp.status_code
-
-                    if resp.status_code == 200:
-                        exec_id = extract_execution_id(resp.body_json)
-                        if (
-                            resp.get_header(IDEMPOTENT_REPLAY_HEADER) or ""
-                        ).lower() == "true":
-                            record.idempotent_replay_count += 1
-                        if exec_id:
-                            now = time.perf_counter()
-                            record.execution_id = exec_id
-                            record.final_status = "STARTED"
-                            record.submit_ms = round((now - req_start) * 1000.0, 2)
-                            submitted_at_by_index[record.request_index] = now
-                            if record.idempotency_key:
-                                key_to_exec_ids.setdefault(
-                                    record.idempotency_key, set()
-                                ).add(exec_id)
-                            accepted_counter += 1
-                            if first_accepted_exec_id is None:
-                                first_accepted_exec_id = exec_id
-                            await _maybe_trigger_chaos()
-                            return
-                        record.final_status = "NO_EXECUTION_ID"
-                        record.error_detail = "HTTP 200 without execution_id"
-                        record.submit_ms = round(
-                            (time.perf_counter() - req_start) * 1000.0, 2
+                for attempt in range(1, max_attempts + 1):
+                    await chaos_gate.wait()
+                    record.attempts = attempt
+                    try:
+                        resp = await client.execute_workflow_v2(
+                            config.workflow_id,
+                            fixture=fixture,
+                            override=config.override,
+                            metadata={
+                                "qa_load_run": run_id,
+                                "request_index": record.request_index,
+                            },
+                            idempotency_key=record.idempotency_key,
                         )
-                        return
+                        record.http_status = resp.status_code
 
-                    if resp.status_code == 409:
-                        err_code = extract_error_code(resp.body_json)
-                        existing_id = extract_execution_id(resp.body_json)
-                        if err_code == "idempotency_in_progress" and existing_id:
-                            now = time.perf_counter()
-                            record.execution_id = existing_id
-                            record.final_status = "STARTED"
-                            record.submit_ms = round((now - req_start) * 1000.0, 2)
-                            submitted_at_by_index[record.request_index] = now
-                            if record.idempotency_key:
-                                key_to_exec_ids.setdefault(
-                                    record.idempotency_key, set()
-                                ).add(existing_id)
-                            return
-                        record.final_status = "HTTP_409"
-                        record.error_detail = f"Conflict: {err_code}"
-                        return
-
-                    if resp.status_code in (503, 429):
-                        if resp.status_code == 503:
-                            record.backpressure_503_count += 1
-                        else:
-                            record.rate_limit_429_count += 1
-                        if attempt < max_attempts:
-                            wait_s = (
-                                parse_retry_after(resp, default_s=1.0)
-                                * config.retry_backoff_scale
+                        if resp.status_code == 200:
+                            exec_id = extract_execution_id(resp.body_json)
+                            if (
+                                resp.get_header(IDEMPOTENT_REPLAY_HEADER) or ""
+                            ).lower() == "true":
+                                record.idempotent_replay_count += 1
+                            if exec_id:
+                                now = time.perf_counter()
+                                record.execution_id = exec_id
+                                record.final_status = "STARTED"
+                                record.submit_ms = round((now - req_start) * 1000.0, 2)
+                                submitted_at_by_index[record.request_index] = now
+                                if record.idempotency_key:
+                                    key_to_exec_ids.setdefault(
+                                        record.idempotency_key, set()
+                                    ).add(exec_id)
+                                accepted_counter += 1
+                                accepted_this_request = True
+                                if first_accepted_exec_id is None:
+                                    first_accepted_exec_id = exec_id
+                                _log_progress(
+                                    f"[SUBMIT {accepted_counter}/{config.requests}] "
+                                    f"req=#{record.request_index:03d} "
+                                    f"execution_id={record.execution_id} "
+                                    f"fixture={record.fixture_name} "
+                                    f"({record.submit_ms:.0f}ms)"
+                                )
+                                await _maybe_trigger_chaos()
+                                return
+                            record.final_status = "NO_EXECUTION_ID"
+                            record.error_detail = "HTTP 200 without execution_id"
+                            record.submit_ms = round(
+                                (time.perf_counter() - req_start) * 1000.0, 2
                             )
-                            await asyncio.sleep(max(0.0, wait_s))
+                            return
+
+                        if resp.status_code == 409:
+                            err_code = extract_error_code(resp.body_json)
+                            existing_id = extract_execution_id(resp.body_json)
+                            if err_code == "idempotency_in_progress" and existing_id:
+                                now = time.perf_counter()
+                                record.execution_id = existing_id
+                                record.final_status = "STARTED"
+                                record.submit_ms = round((now - req_start) * 1000.0, 2)
+                                submitted_at_by_index[record.request_index] = now
+                                if record.idempotency_key:
+                                    key_to_exec_ids.setdefault(
+                                        record.idempotency_key, set()
+                                    ).add(existing_id)
+                                accepted_counter += 1
+                                accepted_this_request = True
+                                if first_accepted_exec_id is None:
+                                    first_accepted_exec_id = existing_id
+                                _log_progress(
+                                    f"[SUBMIT {accepted_counter}/{config.requests}] "
+                                    f"req=#{record.request_index:03d} "
+                                    f"execution_id={record.execution_id} "
+                                    f"fixture={record.fixture_name} "
+                                    f"({record.submit_ms:.0f}ms)"
+                                )
+                                await _maybe_trigger_chaos()
+                                return
+                            record.final_status = "HTTP_409"
+                            record.error_detail = f"Conflict: {err_code}"
+                            return
+
+                        if resp.status_code in (503, 429):
+                            if resp.status_code == 503:
+                                record.backpressure_503_count += 1
+                            else:
+                                record.rate_limit_429_count += 1
+                            if attempt < max_attempts:
+                                wait_s = (
+                                    parse_retry_after(resp, default_s=1.0)
+                                    * config.retry_backoff_scale
+                                )
+                                _log_progress(
+                                    f"[SUBMIT-RETRY] req=#{record.request_index:03d} "
+                                    f"attempt={attempt} status={resp.status_code} "
+                                    f"wait={wait_s:.1f}s"
+                                )
+                                await asyncio.sleep(max(0.0, wait_s))
+                                continue
+                            record.final_status = f"HTTP_{resp.status_code}"
+                            record.error_detail = (
+                                f"Exhausted retries after HTTP {resp.status_code}"
+                            )
+                            record.submit_ms = round(
+                                (time.perf_counter() - req_start) * 1000.0, 2
+                            )
+                            return
+
+                        # Under chaos/proxy restarts, 502/504 are safe to retry with an Idempotency-Key
+                        if (
+                            resp.status_code in (502, 504)
+                            and config.use_idempotency_key
+                            and attempt < max_attempts
+                        ):
+                            record.network_error_count += 1
+                            backoff = (
+                                min(1.0 * attempt, 5.0) * config.retry_backoff_scale
+                            )
+                            await asyncio.sleep(max(0.0, backoff))
                             continue
+
+                        if resp.status_code >= 500:
+                            record.final_status = f"HTTP_{resp.status_code}"
+                            record.error_detail = f"Server error HTTP {resp.status_code}: {resp.body_text[:160]}"
+                            record.submit_ms = round(
+                                (time.perf_counter() - req_start) * 1000.0, 2
+                            )
+                            return
+
+                        # Non-retryable 4xx
                         record.final_status = f"HTTP_{resp.status_code}"
-                        record.error_detail = (
-                            f"Exhausted retries after HTTP {resp.status_code}"
-                        )
+                        record.error_detail = f"Client error HTTP {resp.status_code}: {resp.body_text[:160]}"
                         record.submit_ms = round(
                             (time.perf_counter() - req_start) * 1000.0, 2
                         )
                         return
 
-                    # Under chaos/proxy restarts, 502/504 are safe to retry with an Idempotency-Key
-                    if (
-                        resp.status_code in (502, 504)
-                        and config.use_idempotency_key
-                        and attempt < max_attempts
-                    ):
+                    except httpx.HTTPError as exc:
                         record.network_error_count += 1
-                        backoff = min(1.0 * attempt, 5.0) * config.retry_backoff_scale
-                        await asyncio.sleep(max(0.0, backoff))
-                        continue
-
-                    if resp.status_code >= 500:
-                        record.final_status = f"HTTP_{resp.status_code}"
-                        record.error_detail = f"Server error HTTP {resp.status_code}: {resp.body_text[:160]}"
+                        record.error_detail = f"{type(exc).__name__}: {exc}"
+                        if attempt < max_attempts:
+                            backoff = (
+                                min(1.0 * attempt, 5.0) * config.retry_backoff_scale
+                            )
+                            await asyncio.sleep(max(0.0, backoff))
+                            continue
+                        record.final_status = "NETWORK_ERROR"
                         record.submit_ms = round(
                             (time.perf_counter() - req_start) * 1000.0, 2
                         )
                         return
-
-                    # Non-retryable 4xx
-                    record.final_status = f"HTTP_{resp.status_code}"
-                    record.error_detail = (
-                        f"Client error HTTP {resp.status_code}: {resp.body_text[:160]}"
-                    )
-                    record.submit_ms = round(
-                        (time.perf_counter() - req_start) * 1000.0, 2
-                    )
-                    return
-
-                except httpx.HTTPError as exc:
-                    record.network_error_count += 1
-                    record.error_detail = f"{type(exc).__name__}: {exc}"
-                    if attempt < max_attempts:
-                        backoff = min(1.0 * attempt, 5.0) * config.retry_backoff_scale
-                        await asyncio.sleep(max(0.0, backoff))
-                        continue
-                    record.final_status = "NETWORK_ERROR"
-                    record.submit_ms = round(
-                        (time.perf_counter() - req_start) * 1000.0, 2
-                    )
-                    return
+        finally:
+            if acquired_pre_chaos and not accepted_this_request:
+                manual_pre_chaos_sem.release()
 
     # Phase 1: Submit all requests concurrently
+    _log_progress(
+        f"[LOAD] Phase 1/2 — Envoi de {config.requests} requêtes "
+        f"(concurrency={config.concurrency}, workflow={config.workflow_id})..."
+    )
     submit_tasks = [
         _submit_one(records[i], resolved_fixtures[i % len(resolved_fixtures)])
         for i in range(config.requests)
     ]
     await asyncio.gather(*submit_tasks)
+    _log_progress(
+        f"[LOAD] Phase 1 terminée : {accepted_counter}/{config.requests} "
+        "exécutions acceptées. Démarrage Phase 2 (polling)..."
+    )
 
     # If chaos was requested but accepted_counter never reached chaos_after (e.g. small N), trigger once now
     if provider.mode != "none" and not chaos_triggered:
         chaos_triggered = True
-        chaos_task = asyncio.create_task(
-            provider.trigger(
-                client=client,
-                probe_execution_id=first_accepted_exec_id,
-                probe_workflow_id=config.workflow_id,
-                probe_fixture=resolved_fixtures[0],
-            )
-        )
+        chaos_task = asyncio.create_task(_run_chaos_trigger())
 
     chaos_event: ChaosEvent | None = None
     if chaos_task is not None:
@@ -373,9 +440,16 @@ async def run_load_test(
     # Phase 2: Poll all accepted executions until terminal status or timeout
     poll_semaphore = asyncio.Semaphore(max(config.concurrency, 10))
     poll_http_500_count = 0
+    records_to_poll = [rec for rec in records if rec.execution_id is not None]
+    total_to_poll = len(records_to_poll)
+    pending_by_index: dict[int, LoadRequestRecord] = {
+        rec.request_index: rec for rec in records_to_poll
+    }
+    completed_polls = 0
+    poll_phase_start = time.perf_counter()
 
     async def _poll_one(record: LoadRequestRecord) -> None:
-        nonlocal poll_http_500_count
+        nonlocal poll_http_500_count, completed_polls
         if not record.execution_id:
             return
         async with poll_semaphore:
@@ -417,9 +491,65 @@ async def run_load_test(
                     f"Timed out after {config.max_timeout_s:.1f}s (still non-terminal)"
                 )
 
-    poll_tasks = [_poll_one(rec) for rec in records if rec.execution_id is not None]
+            completed_polls += 1
+            pending_by_index.pop(record.request_index, None)
+            bar = _format_progress_bar(completed_polls, total_to_poll)
+            pct = (
+                round((completed_polls / total_to_poll) * 100)
+                if total_to_poll > 0
+                else 100
+            )
+            _log_progress(
+                f"[POLL {bar} {completed_polls}/{total_to_poll} ({pct}%)] "
+                f"req=#{record.request_index:03d} execution_id={record.execution_id} "
+                f"-> {record.final_status} "
+                f"(process={record.process_ms:.0f}ms, total={record.total_ms:.0f}ms) "
+                f"| restant={len(pending_by_index)}"
+            )
+            if 0 < len(pending_by_index) <= 10:
+                pending_summary = ", ".join(
+                    f"#{r.request_index:03d}:{r.execution_id}({r.fixture_name})"
+                    for r in pending_by_index.values()
+                )
+                _log_progress(f"[PENDING ({len(pending_by_index)})] {pending_summary}")
+
+    heartbeat_interval_s = max(5.0, min(config.poll_interval_s, 15.0))
+
+    async def _progress_monitor() -> None:
+        try:
+            while True:
+                await asyncio.sleep(heartbeat_interval_s)
+                if not pending_by_index:
+                    break
+                elapsed = time.perf_counter() - poll_phase_start
+                pending_list = list(pending_by_index.values())
+                _log_progress(
+                    f"[WAIT {elapsed:.0f}s] {completed_polls}/{total_to_poll} terminées, "
+                    f"{len(pending_list)} encore en cours (STARTED)..."
+                )
+                if len(pending_list) <= 15:
+                    items_str = ", ".join(
+                        f"req=#{r.request_index:03d} execution_id={r.execution_id} fixture={r.fixture_name}"
+                        for r in pending_list
+                    )
+                else:
+                    first_ten = ", ".join(
+                        f"req=#{r.request_index:03d} execution_id={r.execution_id} fixture={r.fixture_name}"
+                        for r in pending_list[:10]
+                    )
+                    items_str = f"{first_ten} ... (+{len(pending_list) - 10} autres)"
+                _log_progress(f"[WAIT-PENDING] {items_str}")
+        except asyncio.CancelledError:
+            return
+
+    poll_tasks = [_poll_one(rec) for rec in records_to_poll]
     if poll_tasks:
-        await asyncio.gather(*poll_tasks)
+        monitor_task = asyncio.create_task(_progress_monitor())
+        try:
+            await asyncio.gather(*poll_tasks)
+        finally:
+            monitor_task.cancel()
+            await asyncio.gather(monitor_task, return_exceptions=True)
 
     total_duration_s = round(time.perf_counter() - global_start, 3)
 
