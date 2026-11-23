@@ -1,0 +1,114 @@
+# Template for real-document non-regression scenarios (PII stays outside Git!).
+#
+# Usage:
+#   mkdir -p qa/data/scenarios
+#   cp qa/scenarios/real_documents.yaml.example qa/data/scenarios/real_documents.yaml
+#   # Put your local PDFs/images in qa/data/ and edit expected values below.
+#   uv run python -m qa run --env sandbox --tags real --report qa/reports/sandbox_real.json
+#   uv run python -m qa run --env staging --tags real --report qa/reports/staging_real.json
+#   uv run python -m qa compare qa/reports/sandbox_real.json qa/reports/staging_real.json
+
+scenarios:
+  - id: real-cni-v2
+    description: "Real CNI document: classification + key identity fields"
+    tags: [baseline, functional, real, v2]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-classification-extraction-v2
+      file: cni/cni_sample.pdf
+      metadata:
+        qa_scenario: real-cni-v2
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      classification:
+        document_type: cni
+        confidence: { gte: 0.75 }
+      extraction:
+        type: cni
+        properties:
+          nom: { iequals: "DUPONT" }
+          prenom: { contains: "Jean" }
+          date_naissance: { equals: "1990-05-14" }
+
+  - id: real-passeport-v2
+    description: "Real French passport: classification + MRZ & identity extraction"
+    tags: [baseline, functional, real, v2]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-classification-extraction-v2
+      file: passeport/passeport_sample.pdf
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      classification:
+        document_type: passeport
+        confidence: { gte: 0.75 }
+      extraction:
+        type: passeport
+        properties:
+          nom: { not_empty: true }
+          prenom: { not_empty: true }
+
+  - id: real-avis-imposition-v2
+    description: "Real Avis d'imposition: RFR, fiscal year and reference number"
+    tags: [baseline, functional, real, v2]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-classification-extraction-v2
+      file: avis_imposition/avis_sample.pdf
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      classification:
+        document_type: avis_imposition
+        confidence: { gte: 0.75 }
+      extraction:
+        type: avis_imposition
+        properties:
+          annee_revenus: { equals: "2024" }
+          reference_avis: { not_empty: true }
+          revenu_fiscal_reference: { gte: 0 }
+
+  - id: real-bulletin-salaire-v2
+    description: "Real payslip: employer, SIRET and net taxable income"
+    tags: [baseline, functional, real, v2]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-classification-extraction-v2
+      file: bulletin_salaire/bulletin_sample.pdf
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      classification:
+        document_type: bulletin_salaire
+        confidence: { gte: 0.75 }
+      extraction:
+        type: bulletin_salaire
+        properties:
+          nom_employeur: { not_empty: true }
+          net_imposable: { gte: 0 }
+
+  - id: real-2ddoc-extraction-v2
+    description: "Real document containing a 2D-Doc barcode"
+    tags: [baseline, functional, real, v2]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-barcode-extraction-v2
+      file: 2ddoc/doc_2ddoc.pdf
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      barcodes:
+        min_count: 1
+        contains_type: "2D_DOC"

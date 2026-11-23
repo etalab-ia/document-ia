@@ -1,0 +1,139 @@
+# Negative input validation tests and Anti-SSRF / MIME confinement checks (#152, #153).
+scenarios:
+  - id: neg-auth-missing
+    description: "Authenticated route without X-API-KEY returns 401"
+    tags: [baseline, negative, synthetic]
+    request:
+      mode: http
+      method: GET
+      path: /api/v2/workflows/
+      auth: none
+    expect:
+      http_status: 401
+
+  - id: neg-auth-invalid
+    description: "Authenticated route with invalid X-API-KEY returns 401"
+    tags: [baseline, negative, synthetic]
+    request:
+      mode: http
+      method: GET
+      path: /api/v2/workflows/
+      auth: invalid
+    expect:
+      http_status: 401
+
+  - id: neg-mutually-exclusive-file-and-url
+    description: "Providing both file and file_url is rejected with 400"
+    tags: [baseline, negative, synthetic]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-barcode-extraction-v2
+      file: synthetic:minimal_pdf
+      file_url: "https://example.com/document.pdf"
+    expect:
+      http_status: 400
+
+  - id: neg-invalid-override-unknown-param
+    description: "Unknown override parameter is rejected cleanly with 400/422"
+    tags: [baseline, negative, synthetic]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-barcode-extraction-v2
+      file: synthetic:minimal_pdf
+      override:
+        extract_barcode_data:
+          - param: unknown_qa_param
+            value: invalid
+    expect:
+      http_status: [400, 422]
+
+  - id: neg-malformed-override-json
+    description: "Malformed JSON in override returns 400/422 without 500 (#153)"
+    tags: [baseline, negative, synthetic]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-barcode-extraction-v2
+      file: synthetic:minimal_pdf
+      raw_override: "{malformed-json"
+    expect:
+      http_status: [400, 422]
+
+  - id: neg-invalid-mime-fake-pdf
+    description: "Shell script spoofed as application/pdf is rejected cleanly (#152)"
+    tags: [baseline, negative, synthetic]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-barcode-extraction-v2
+      file: synthetic:fake_pdf_shell
+    expect:
+      http_status: [200, 400, 422]
+      execution_status: FAILED
+
+  - id: sec-ssrf-http-cleartext
+    description: "Anti-SSRF rejects cleartext http:// file_url (#152)"
+    tags: [security, ssrf, synthetic, develop]
+    min_profile: develop
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-barcode-extraction-v2
+      file_url: "http://example.com/document.pdf"
+    expect:
+      http_status: [200, 400, 422]
+      execution_status: FAILED
+
+  - id: sec-ssrf-loopback-ip
+    description: "Anti-SSRF blocks loopback IP 127.0.0.1 (#152)"
+    tags: [security, ssrf, synthetic, develop]
+    min_profile: develop
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-barcode-extraction-v2
+      file_url: "https://127.0.0.1/secret.pdf"
+    expect:
+      http_status: [200, 400, 422]
+      execution_status: FAILED
+
+  - id: sec-ssrf-loopback-localhost
+    description: "Anti-SSRF blocks localhost (#152)"
+    tags: [security, ssrf, synthetic, develop]
+    min_profile: develop
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-barcode-extraction-v2
+      file_url: "https://localhost/secret.pdf"
+    expect:
+      http_status: [200, 400, 422]
+      execution_status: FAILED
+
+  - id: sec-ssrf-cloud-metadata
+    description: "Anti-SSRF blocks link-local cloud metadata 169.254.169.254 (#152)"
+    tags: [security, ssrf, synthetic, develop]
+    min_profile: develop
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-barcode-extraction-v2
+      file_url: "https://169.254.169.254/latest/meta-data/"
+    expect:
+      http_status: [200, 400, 422]
+      execution_status: FAILED
+
+  - id: sec-ssrf-rfc1918
+    description: "Anti-SSRF blocks private RFC1918 address 10.0.0.1 (#152)"
+    tags: [security, ssrf, synthetic, develop]
+    min_profile: develop
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-barcode-extraction-v2
+      file_url: "https://10.0.0.1/internal.pdf"
+    expect:
+      http_status: [200, 400, 422]
+      execution_status: FAILED

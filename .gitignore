@@ -226,3 +226,10 @@ vendor/
 log-worker-*
 /data/
 benchmark_*.json
+
+# QA tool local data (PII), reports and secrets
+qa/data/*
+!qa/data/.gitkeep
+!qa/data/README.md
+qa/reports/
+.env.qa
