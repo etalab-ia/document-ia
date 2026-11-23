@@ -615,3 +615,69 @@ async def test_start_purges_s3_when_download_step_delete_returns_false(
     assert download_step.s3_cleanup_succeeded is False
     assert manager._s3_cleaned_up is False
     assert deleted_keys == [raw_s3_key, raw_s3_key]
+
+
+async def test_save_failure_event_preserves_workflow_version_v2(
+    _patch_workflow_resources, monkeypatch
+):
+    from datetime import datetime, UTC
+    from document_ia_worker.exception.workflow_step_exception import (
+        WorkflowStepException,
+    )
+    from document_ia_worker.workflow.main_workflow_context import (
+        MainWorkflowContext,
+    )
+
+    exec_id = str(uuid4())
+    started_v2_event = _event(
+        "WorkflowExecutionStarted",
+        payload={"version": 2},
+        execution_id=exec_id,
+    )
+    started_v2_event.workflow_id = "document-barcode-extraction-v2"
+
+    class _FakeEventRepo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_created_event_if_execution_not_completed_or_failed(
+            self, _exec_id: str
+        ) -> Any:
+            return started_v2_event
+
+    monkeypatch.setattr(workflow_manager_module, "EventRepository", _FakeEventRepo)
+    monkeypatch.setattr(
+        workflow_manager_module.workflow_v2_repository,
+        "get_raw_workflow_by_id",
+        lambda _wf_id: {"id": "document-barcode-extraction-v2"},
+    )
+
+    manager = WorkflowManager(
+        WorkflowExecutionMessage(workflow_execution_id=exec_id),
+        0,
+        is_last_retry=True,
+    )
+    manager.main_workflow_context = MainWorkflowContext(
+        execution_id=exec_id,
+        organization_id=None,
+        start_time=datetime.now(UTC),
+        steps_metadata=[],
+    )
+
+    session = _FakeSession()
+    is_dup = await manager._prepare_workflow(session)  # type: ignore[arg-type]
+    assert is_dup is False
+    assert manager.main_workflow_context.workflow_version == 2
+
+    await manager._save_failure_event(
+        session,  # type: ignore[arg-type]
+        WorkflowStepException("DownloadFileStep", ValueError("SSRF blocked")),
+    )
+
+    assert len(_FakeEventStoreService.emitted) == 1
+    emitted = _FakeEventStoreService.emitted[0]
+    assert emitted["workflow_id"] == "document-barcode-extraction-v2"
+    assert emitted["execution_id"] == exec_id
+    assert emitted["error_type"] == "ValueError"
+    assert emitted["failed_step"] == "DownloadFileStep"
+    assert emitted["workflow_version"] == 2
