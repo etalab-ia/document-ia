@@ -164,6 +164,7 @@ By default, PyTorch and OpenCV detect all host CPU cores (e.g. 16–32 cores) an
 ### 3. AI Model Pre-bundling & Boot Pre-warming
 - **Pre-downloading at build time**: Model weights for **YOLO-World** (`yolov8m-world.pt`) and **QRDet** (`qrdet-s.pt`), as well as Tesseract language files (`fra.traineddata`), are downloaded during `bin/post_compile` and stored in `$APP_ROOT/.models/`.
 - **Pre-warming on boot**: Before listening to Redis events, `src/document_ia_worker/main.py` invokes `_prewarm_models_and_trust_store()` to verify and load YOLO-World, CLIP, QRDet, Tesseract, and the offline 2D-Doc PKI trust store into RAM once at worker startup. This avoids concurrent on-the-fly downloads, model reloading delays, or race conditions during job execution.
+- **In-memory 2D-Doc CRL refresh**: Immediately after pre-warming (and before reading the first Redis message), `TwoDDocCrlRefresher` refreshes the ANTS 2D-Doc CRLs in memory and then schedules a periodic background refresh (every `3.0` hours by default, configurable) to detect both updated CRLs and early certificate revocations without writing to disk. Network failures degrade gracefully without crashing the worker (see [`docs/TWO_D_DOC_VERIFICATION.md`](../docs/TWO_D_DOC_VERIFICATION.md)).
 
 ### 4. Critical Section Thread Locking for Heavy C/RAM Steps
 Network I/O steps (downloading from S3, HTTP OCR, LLM API calls) use virtually zero RAM and run with high concurrency (`REDIS_WORKER_NUMBER = 10+`).
@@ -313,6 +314,11 @@ When Loki push requires authentication, set `LOKI_BEARER_TOKEN` to the raw token
 - `OPENAI_ENCODING_MODEL` (str, default: `"gpt-4"`)
 - `OPENAI_TIMEOUT` (int, default: `30`)
 - `OPENAI_MAX_RETRIES` (int, default: `3`)
+
+### 2D-Doc CRL Refresh
+- `TWO_D_DOC_CRL_REFRESH_ENABLED` (bool, default: `True`) — enable startup and periodic in-memory 2D-Doc CRL refresh
+- `TWO_D_DOC_CRL_REFRESH_INTERVAL_HOURS` (float, default: `3.0`) — interval in hours between periodic CRL refreshes
+- `TWO_D_DOC_CRL_REFRESH_TIMEOUT_SECONDS` (int, default: `10`) — HTTP timeout in seconds per CRL fetch
 
 ### Task Scheduler
 - `EVENT_STORE_PPI_RETENTION_DAYS` (int, default: `7`)

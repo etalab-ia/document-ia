@@ -48,7 +48,7 @@ workspace = true
 
 [tool.uv.sources.2ddoc-parser]
 git = "https://github.com/betagouv/2ddoc-parser.git"
-tag = "v1.0.7"
+tag = "v1.0.8"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/document_ia_infra"]

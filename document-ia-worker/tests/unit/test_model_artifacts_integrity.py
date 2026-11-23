@@ -457,6 +457,7 @@ def test_prewarm_models_and_trust_store_preloads_2ddoc_trust_store(
     stale_resolver.tsl_sequence_number = 23
     stale_resolver.tsl_next_update = "2020-01-01T00:00:00+00:00"
     stale_resolver.get_tsl_freshness.return_value = TrustListFreshness.STALE
+    stale_resolver.get_expired_crl_cas.return_value = ()
     monkeypatch.setattr(
         "fr_2ddoc_parser.crypto.key_resolver.get_default_key_resolver",
         MagicMock(return_value=stale_resolver),
@@ -468,6 +469,27 @@ def test_prewarm_models_and_trust_store_preloads_2ddoc_trust_store(
 
     assert "2D-Doc PKI trust list is not fresh" in caplog.text
     assert "tsl_freshness=stale" in caplog.text
+    assert "Bundled 2D-Doc CRLs are expired" not in caplog.text
+
+    # Bundled expired CRLs emit a warning at pre-warm without blocking boot.
+    expired_crl_resolver = MagicMock()
+    expired_crl_resolver.tsl_sequence_number = 23
+    expired_crl_resolver.tsl_next_update = "2027-05-11T14:00:00+00:00"
+    expired_crl_resolver.get_tsl_freshness.return_value = TrustListFreshness.FRESH
+    expired_crl_resolver.get_expired_crl_cas.return_value = ("FR01", "FR06")
+    monkeypatch.setattr(
+        "fr_2ddoc_parser.crypto.key_resolver.get_default_key_resolver",
+        MagicMock(return_value=expired_crl_resolver),
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=worker_main.__name__):
+        worker_main._prewarm_models_and_trust_store()
+
+    assert (
+        "Bundled 2D-Doc CRLs are expired at pre-warm for CAs ('FR01', 'FR06')"
+        in caplog.text
+    )
 
 
 def test_prewarm_models_and_trust_store_is_fail_closed_on_trust_store_error(

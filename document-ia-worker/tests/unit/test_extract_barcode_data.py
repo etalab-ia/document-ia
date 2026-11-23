@@ -9,9 +9,11 @@ import zxingcpp
 from cv2.typing import MatLike
 
 from datetime import date
+import functools
 import logging
 from types import SimpleNamespace
 
+from fr_2ddoc_parser.api import decode_2d_doc as real_decode_2d_doc
 from fr_2ddoc_parser.model.models import (
     Decoded2DDoc,
     Header,
@@ -1000,13 +1002,20 @@ def test_2ddoc_real_decode_integration_without_mock(
     payload: str,
     expected_status: VerificationStatus,
 ) -> None:
-    """Integration test against real fr_2ddoc_parser v1.0.7 without mocking decode_2d_doc."""
+    """Integration test against real fr_2ddoc_parser v1.0.7 with a pinned evaluation_date."""
     pos = DummyPosition((5, 5), (50, 5), (50, 50), (5, 50))
     barcode = DummyBarcode(payload, "DataMatrix", pos)
 
-    variant, key, is_spec = BaseExtractBarcode2DDoc()._decode_barcode_to_variant(
-        cast(BarcodeLike, barcode), 1
-    )
+    with patch(
+        "document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc.decode_2d_doc",
+        new=functools.partial(
+            real_decode_2d_doc,
+            evaluation_date=date(2026, 11, 23),
+        ),
+    ):
+        variant, key, is_spec = BaseExtractBarcode2DDoc()._decode_barcode_to_variant(
+            cast(BarcodeLike, barcode), 1
+        )
 
     assert is_spec is True
     assert key == f"dm:{payload}"
@@ -1014,3 +1023,31 @@ def test_2ddoc_real_decode_integration_without_mock(
     assert variant.is_valid is False
     assert variant.verification_status is expected_status
     assert variant.doc_type == "99"
+
+
+def test_2ddoc_decode_exception_logs_only_exception_type_without_pii(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pos = DummyPosition((0, 0), (10, 0), (10, 10), (0, 10))
+    barcode = DummyBarcode("DC02_INVALID_PAYLOAD_PII", "DataMatrix", pos)
+
+    with (
+        patch(
+            "document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc.decode_2d_doc",
+            side_effect=ValueError("Invalid field 10: SECRET_CITIZEN_PII"),
+        ),
+        caplog.at_level(
+            logging.WARNING,
+            logger="document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc",
+        ),
+    ):
+        variant, key, is_spec = BaseExtractBarcode2DDoc()._decode_barcode_to_variant(
+            cast(BarcodeLike, barcode), 1
+        )
+
+    assert is_spec is False
+    assert key == "dm:DC02_INVALID_PAYLOAD_PII"
+    assert isinstance(variant, DataMatrix)
+    assert variant.raw_data == "DC02_INVALID_PAYLOAD_PII"
+    assert "Failed to decode 2D-Doc barcode: ValueError" in caplog.text
+    assert "SECRET_CITIZEN_PII" not in caplog.text

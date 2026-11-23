@@ -30,8 +30,8 @@ members = [
 
 [[package]]
 name = "2ddoc-parser"
-version = "1.0.7"
-source = { git = "https://github.com/betagouv/2ddoc-parser.git?tag=v1.0.7#0237b8a4664219947b28a654a34273fd4b41769c" }
+version = "1.0.8"
+source = { git = "https://github.com/betagouv/2ddoc-parser.git?tag=v1.0.8#87053f399b5a236f25f4402c46d69c1f60fb65ae" }
 dependencies = [
     { name = "cryptography" },
     { name = "lxml" },
@@ -861,7 +861,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "2ddoc-parser", git = "https://github.com/betagouv/2ddoc-parser.git?tag=v1.0.7" },
+    { name = "2ddoc-parser", git = "https://github.com/betagouv/2ddoc-parser.git?tag=v1.0.8" },
     { name = "asyncpg", specifier = "==0.32.0" },
     { name = "boto3", specifier = "==1.43.126" },
     { name = "botocore", specifier = "==1.43.126" },
@@ -962,7 +962,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "2ddoc-parser", git = "https://github.com/betagouv/2ddoc-parser.git?tag=v1.0.7" },
+    { name = "2ddoc-parser", git = "https://github.com/betagouv/2ddoc-parser.git?tag=v1.0.8" },
     { name = "clip", git = "https://github.com/ultralytics/CLIP.git?rev=c4b6ea0932a2c0f39a0fa528af5ec4982ff15cab" },
     { name = "document-ia-infra", editable = "document-ia-infra" },
     { name = "document-ia-schemas", editable = "document-ia-schemas" },

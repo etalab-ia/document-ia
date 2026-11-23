@@ -8,7 +8,6 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from fr_2ddoc_parser.model.models import VerificationStatus
 
 from document_ia_api.api.contracts.execution.success import ExecutionSuccessModel
 from document_ia_api.application.services.execution_service import ExecutionService
@@ -18,7 +17,11 @@ from document_ia_api.infra.webhook_notification_service import (
 from document_ia_api.main import app
 from document_ia_infra.data.event.dto.event_dto import EventDTO
 from document_ia_infra.data.event.dto.event_type_enum import EventType
-from document_ia_infra.data.event.schema.barcode import Ants2DDoc, BarcodePosition
+from document_ia_infra.data.event.schema.barcode import (
+    Ants2DDoc,
+    BarcodePosition,
+    VerificationStatus,
+)
 from document_ia_infra.data.event.schema.workflow.workflow_execution_completed_event import (
     CompletedEventResult,
     WorkflowExecutionCompletedEvent,

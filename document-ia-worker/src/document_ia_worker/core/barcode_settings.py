@@ -29,6 +29,20 @@ class BarcodeSettings(BaseDocumentIaSettings):
         gt=0,
         description="Maximum total pixel count (width * height) permitted for an image before cv2.imread decompression, protecting against decompression bombs.",
     )
+    TWO_D_DOC_CRL_REFRESH_ENABLED: bool = Field(
+        default=True,
+        description="Enable startup and periodic in-memory 2D-Doc CRL refresh.",
+    )
+    TWO_D_DOC_CRL_REFRESH_INTERVAL_HOURS: float = Field(
+        default=3.0,
+        gt=0,
+        description="Interval in hours between periodic 2D-Doc CRL refreshes to detect updated CRLs and certificate revocations.",
+    )
+    TWO_D_DOC_CRL_REFRESH_TIMEOUT_SECONDS: int = Field(
+        default=10,
+        gt=0,
+        description="HTTP timeout in seconds per CRL fetch during 2D-Doc CRL refresh.",
+    )
 
 
 barcode_settings = BarcodeSettings()

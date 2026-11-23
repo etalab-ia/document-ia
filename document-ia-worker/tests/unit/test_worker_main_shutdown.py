@@ -10,6 +10,21 @@ from typing import Any
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _mock_two_ddoc_crl_refresher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent any real network CRL refresh in worker main shutdown unit tests."""
+    from document_ia_worker import main as worker_main
+
+    class NoOpCrlRefresher:
+        async def startup_refresh(self) -> None:
+            return None
+
+        async def run_periodic_refresh(self, stop_event: asyncio.Event) -> None:
+            await stop_event.wait()
+
+    monkeypatch.setattr(worker_main, "TwoDDocCrlRefresher", NoOpCrlRefresher)
+
+
 @pytest.mark.asyncio
 async def test_worker_main_sigterm_waits_for_consumer_graceful_drain(
     monkeypatch: pytest.MonkeyPatch,
@@ -235,3 +250,54 @@ async def test_consumer_crash_forces_exit_if_handler_thread_is_still_running(
         await worker_main.main()
 
     assert forced_exit == [1]
+
+
+@pytest.mark.asyncio
+async def test_run_consumer_runs_crl_startup_refresh_before_consumer_and_cleans_up_periodic_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from document_ia_worker import main as worker_main
+
+    events: list[str] = []
+    periodic_started = asyncio.Event()
+    periodic_finished = asyncio.Event()
+
+    class TrackingCrlRefresher:
+        async def startup_refresh(self) -> None:
+            events.append("startup_refresh")
+
+        async def run_periodic_refresh(self, stop_event: asyncio.Event) -> None:
+            events.append("periodic_started")
+            periodic_started.set()
+            try:
+                await stop_event.wait()
+            except asyncio.CancelledError:
+                events.append("periodic_cancelled")
+                raise
+            finally:
+                periodic_finished.set()
+
+    class TrackingConsumer[T]:
+        def __init__(self, **_kwargs: Any) -> None:
+            self.stop_flag = asyncio.Event()
+            self.has_running_handlers = False
+
+        async def start_consumer(self) -> None:
+            events.append("start_consumer")
+            await asyncio.wait_for(periodic_started.wait(), timeout=2.0)
+
+    owner = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setattr(worker_main, "_consumer", None)
+    monkeypatch.setattr(worker_main, "_prewarm_models_and_trust_store", lambda: None)
+    monkeypatch.setattr(worker_main, "TwoDDocCrlRefresher", TrackingCrlRefresher)
+    monkeypatch.setattr(worker_main, "RedisManager", lambda: owner)
+    monkeypatch.setattr(worker_main, "ThreadConsumer", TrackingConsumer)
+
+    await asyncio.wait_for(worker_main.run_consumer(), timeout=2.0)
+
+    assert events[:3] == ["startup_refresh", "start_consumer", "periodic_started"]
+    assert periodic_finished.is_set()
+    owner.close.assert_awaited_once()
