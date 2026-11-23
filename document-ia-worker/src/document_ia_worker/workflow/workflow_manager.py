@@ -673,11 +673,7 @@ class WorkflowManager:
             else self.event_dto.workflow_id
         )
 
-        raw_version = (
-            self.event_dto.event.get("version")
-            if isinstance(self.event_dto.event, dict)
-            else None
-        )
+        raw_version = self.event_dto.event.get("version")
         fallback_version = (
             raw_version
             if (
