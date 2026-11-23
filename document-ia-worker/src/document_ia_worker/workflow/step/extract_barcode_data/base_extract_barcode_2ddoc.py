@@ -50,9 +50,26 @@ class BaseExtractBarcode2DDoc(BaseExtractBarcode):
             )
             return VerificationStatus.RESOLVER_UNAVAILABLE, False
 
-        raw_is_valid = bool(getattr(result, "is_valid", False))
-        is_valid = bool(raw_is_valid and status == VerificationStatus.VERIFIED)
-        if raw_is_valid and not is_valid:
+        raw_result_valid = bool(getattr(result, "is_valid", False))
+        raw_verification_valid = bool(getattr(verification, "is_valid", False))
+
+        if status == VerificationStatus.VERIFIED and not (
+            raw_result_valid and raw_verification_valid
+        ):
+            logger.warning(
+                "Inconsistent 2D-Doc verification state (status=%s with is_valid mismatch); "
+                "falling back to fail-closed status=%s",
+                status.value,
+                VerificationStatus.RESOLVER_UNAVAILABLE.value,
+            )
+            return VerificationStatus.RESOLVER_UNAVAILABLE, False
+
+        is_valid = bool(
+            raw_result_valid
+            and raw_verification_valid
+            and status == VerificationStatus.VERIFIED
+        )
+        if (raw_result_valid or raw_verification_valid) and not is_valid:
             logger.warning(
                 "Inconsistent 2D-Doc verification state (is_valid=True with status=%s); forcing is_valid=False",
                 status.value,

@@ -126,7 +126,7 @@ In the `2ddoc-parser v1.0.7` bundled snapshot, the CRL for legacy authority `FR0
   "verification_status": "verified",
   "raw_data": {"01": "EXAMPLE"},
   "typed_data": [
-    {"name": "first_name", "value": "Alice", "type": "str"}
+    {"name": "first_name", "value": "Alice", "type": "string"}
   ],
   "issue_date": "2026-01-01",
   "ants_type": "01",

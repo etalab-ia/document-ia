@@ -113,8 +113,20 @@ def test_openapi_schema_exposes_verification_status_enum_and_ants_2ddoc_ref() ->
     assert {"type": "null"} in verification_prop["anyOf"]
 
     # Internal VerificationResult fields must never be exposed in API schema.
-    for forbidden_field in ("detail", "ca_id", "cert_id", "tsl_freshness"):
+    for forbidden_field in (
+        "detail",
+        "ca_id",
+        "cert_id",
+        "reference_date",
+        "tsl_sequence_number",
+        "tsl_next_update",
+        "tsl_freshness",
+    ):
         assert forbidden_field not in ants_properties
+
+    # Sensitive 2D-Doc content fields must retain their masking annotation.
+    assert ants_properties["raw_data"].get("x-mask") is True
+    assert ants_properties["typed_data"].get("x-mask") is True
 
 
 @pytest.mark.parametrize("status", list(VerificationStatus))

@@ -892,15 +892,25 @@ def test_2ddoc_fail_closed_when_verification_status_is_unknown_or_invalid(
     "non_verified_status",
     [s for s in VerificationStatus if s != VerificationStatus.VERIFIED],
 )
+@pytest.mark.parametrize(
+    ("result_is_valid", "verification_is_valid"),
+    [
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+)
 def test_2ddoc_fail_closed_when_is_valid_true_conflicts_with_non_verified_status(
     non_verified_status: VerificationStatus,
+    result_is_valid: bool,
+    verification_is_valid: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     decoded = _make_decoded_2ddoc(
-        is_valid=True,
+        is_valid=result_is_valid,
         verification=VerificationResult(
             status=non_verified_status,
-            is_valid=False,
+            is_valid=verification_is_valid,
         ),
     )
     pos = DummyPosition((0, 0), (10, 0), (10, 10), (0, 10))
@@ -928,22 +938,38 @@ def test_2ddoc_fail_closed_when_is_valid_true_conflicts_with_non_verified_status
     assert "CONFLICT_PII" not in caplog.text
 
 
-def test_2ddoc_enforces_is_valid_false_when_result_is_valid_is_false_even_if_verified() -> (
-    None
-):
+@pytest.mark.parametrize(
+    ("result_is_valid", "verification_is_valid"),
+    [
+        (False, True),
+        (True, False),
+        (False, False),
+    ],
+)
+def test_2ddoc_fail_closed_when_verified_status_conflicts_with_is_valid_flags(
+    result_is_valid: bool,
+    verification_is_valid: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     decoded = _make_decoded_2ddoc(
-        is_valid=False,
+        is_valid=result_is_valid,
         verification=VerificationResult(
             status=VerificationStatus.VERIFIED,
-            is_valid=True,
+            is_valid=verification_is_valid,
         ),
     )
     pos = DummyPosition((0, 0), (10, 0), (10, 10), (0, 10))
-    barcode = DummyBarcode("DC02_FALSE_VALID", "DataMatrix", pos)
+    barcode = DummyBarcode("DC02_VERIFIED_MISMATCH_PII", "DataMatrix", pos)
 
-    with patch(
-        "document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc.decode_2d_doc",
-        return_value=decoded,
+    with (
+        patch(
+            "document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc.decode_2d_doc",
+            return_value=decoded,
+        ),
+        caplog.at_level(
+            logging.WARNING,
+            logger="document_ia_worker.workflow.step.extract_barcode_data.base_extract_barcode_2ddoc",
+        ),
     ):
         variant, _key, is_spec = BaseExtractBarcode2DDoc()._decode_barcode_to_variant(
             cast(BarcodeLike, barcode), 1
@@ -951,8 +977,10 @@ def test_2ddoc_enforces_is_valid_false_when_result_is_valid_is_false_even_if_ver
 
     assert is_spec is True
     assert isinstance(variant, Ants2DDoc)
-    assert variant.verification_status is VerificationStatus.VERIFIED
+    assert variant.verification_status is VerificationStatus.RESOLVER_UNAVAILABLE
     assert variant.is_valid is False
+    assert "Inconsistent 2D-Doc verification state" in caplog.text
+    assert "VERIFIED_MISMATCH_PII" not in caplog.text
 
 
 @pytest.mark.parametrize(
