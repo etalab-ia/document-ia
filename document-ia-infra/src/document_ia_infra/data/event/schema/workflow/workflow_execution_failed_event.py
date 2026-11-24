@@ -1,4 +1,4 @@
-from typing import Optional, Literal
+from typing import Literal, Optional
 
 from pydantic import Field
 
@@ -18,3 +18,7 @@ class WorkflowExecutionFailedEvent(BaseEvent):
         default=None, description="Step where failure occurred"
     )
     retry_count: int = Field(default=0, description="Number of retry attempts")
+    is_terminal: bool = Field(
+        default=True,
+        description="Whether this failure is final (no further retries scheduled)",
+    )

@@ -428,6 +428,7 @@ class TestWorkflowManager:
             mock_save_fail.assert_called_once_with(
                 mock_db_manager.return_value.local_session.return_value.__aenter__.return_value,
                 step_error,
+                is_terminal=True,
             )
 
             # Non-retryable failure must purge S3
