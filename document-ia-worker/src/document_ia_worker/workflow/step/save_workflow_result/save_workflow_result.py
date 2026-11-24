@@ -1,3 +1,5 @@
+import contextlib
+import inspect
 import logging
 from datetime import datetime, UTC
 from typing import Optional, Any
@@ -9,6 +11,7 @@ from document_ia_infra.data.event.schema.workflow.workflow_execution_completed_e
     CompletedEventResult,
 )
 from document_ia_infra.service.event_store_service import EventStoreService
+from document_ia_worker.core.db_semaphore import acquire_worker_db_slot
 from document_ia_worker.workflow.main_workflow_context import (
     MainWorkflowContext,
     StepMetadata,
@@ -77,24 +80,36 @@ class SaveWorkflowResultStep(BaseStep[None]):
         try:
             if self.main_workflow_context.organization_id is None:
                 raise ValueError("Organization ID is not set in workflow context")
-            await self.event_service.emit_workflow_completed(
-                workflow_id=self.workflow_id,
-                execution_id=self.execution_id,
-                organization_id=self.main_workflow_context.organization_id,
-                final_result=final_result,
-                total_processing_time_ms=int(
-                    (end_time - self.main_workflow_context.start_time).total_seconds()
-                    * 1000
-                ),
-                output_summary={},
-                steps_completed=self.main_workflow_context.number_of_step_executed + 1,
-                workflow_metadata=self.main_workflow_context.steps_metadata,
-                workflow_version=(
-                    self.main_workflow_context.workflow_version
-                    if self.main_workflow_context.workflow_version is not None
-                    else 1
-                ),
-            )
+            async with acquire_worker_db_slot():
+                try:
+                    await self.event_service.emit_workflow_completed(
+                        workflow_id=self.workflow_id,
+                        execution_id=self.execution_id,
+                        organization_id=self.main_workflow_context.organization_id,
+                        final_result=final_result,
+                        total_processing_time_ms=int(
+                            (
+                                end_time - self.main_workflow_context.start_time
+                            ).total_seconds()
+                            * 1000
+                        ),
+                        output_summary={},
+                        steps_completed=self.main_workflow_context.number_of_step_executed
+                        + 1,
+                        workflow_metadata=self.main_workflow_context.steps_metadata,
+                        workflow_version=(
+                            self.main_workflow_context.workflow_version
+                            if self.main_workflow_context.workflow_version is not None
+                            else 1
+                        ),
+                    )
+                finally:
+                    close_fn = getattr(self.database_session, "close", None)
+                    if callable(close_fn):
+                        with contextlib.suppress(Exception):
+                            maybe_coro = close_fn()
+                            if inspect.isawaitable(maybe_coro):
+                                await maybe_coro
             return None, None
         except Exception as e:
             logger.error(f"Error during saving workflow result: {e}")

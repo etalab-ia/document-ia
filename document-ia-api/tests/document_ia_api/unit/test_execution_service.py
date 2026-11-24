@@ -7,7 +7,9 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from unittest.mock import AsyncMock, MagicMock
 
+from document_ia_api.application.services.api_key.api_key_service import ApiKeyService
 from document_ia_api.application.services.execution_service import ExecutionService
+
 from document_ia_api.api.contracts.execution.types import ExecutionStatus
 from document_ia_infra.core.model.file_info import FileInfo
 from document_ia_infra.core.model.typed_generic_model import GenericProperty
@@ -35,6 +37,9 @@ from document_ia_infra.data.event.schema.workflow.workflow_execution_started_eve
     ClassificationParameters,
     ExtractionParameters,
 )
+
+
+_REAL_GET_FROM_PRESENTED_KEY = ApiKeyService.get_from_presented_key
 
 
 class SampleProps(BaseModel):
@@ -581,3 +586,88 @@ def test_anonymize_payload_roundtrip_with_decode_and_execution_service(
     assert failed_model.status == ExecutionStatus.FAILED
     assert failed_model.purged is True
     assert failed_model.data.error_message == "[PURGED]"
+
+
+@pytest.mark.asyncio
+async def test_api_key_service_raises_503_on_database_error(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import HTTPException
+    from sqlalchemy.exc import DBAPIError, OperationalError
+
+    monkeypatch.setattr(
+        ApiKeyService, "get_from_presented_key", _REAL_GET_FROM_PRESENTED_KEY
+    )
+    api_key_service = ApiKeyService(db_session)
+    api_key_service.api_key_helper.get_key_prefix = MagicMock(return_value="ABCDEFGH")
+    presented_key = "dia_dev_2_ABCDEFGH_" + "A" * 44 + "_AAAA"
+
+    class TooManyConnectionsError(Exception):
+        pass
+
+    for db_exc in (
+        OperationalError("SELECT 1", {}, Exception("connection failed")),
+        DBAPIError.instance(
+            "SELECT 1",
+            {},
+            TooManyConnectionsError(
+                "remaining connection slots are reserved for roles with the SUPERUSER attribute"
+            ),
+            Exception,
+        ),
+    ):
+        api_key_service.api_key_repository.get_by_prefix_with_relation = AsyncMock(
+            side_effect=db_exc
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            await api_key_service.get_from_presented_key(presented_key)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.headers == {"Retry-After": "5"}
+
+
+@pytest.mark.asyncio
+async def test_get_execution_route_raises_503_on_retryable_db_error(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import HTTPException
+    from document_ia_api.api.routes.v1 import executions as executions_route
+    from document_ia_infra.data.organization.dto.organization_dto import (
+        OrganizationDTO,
+    )
+    from document_ia_infra.data.organization.enum.platform_role import PlatformRole
+    from document_ia_infra.exception.retryable_exception import RetryableException
+
+    class _FailingEventStoreService:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_last_event_for_execution_id(self, _exec_id: str) -> Any:
+            raise RetryableException(
+                Exception("remaining connection slots are reserved")
+            )
+
+    monkeypatch.setattr(
+        executions_route, "EventStoreService", _FailingEventStoreService
+    )
+    org = OrganizationDTO(
+        id=uuid4(),
+        name="Test Org",
+        contact_email="test@example.com",
+        platform_role=PlatformRole.STANDARD,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await executions_route.get_execution(
+            execution_id="exec-123",
+            organization=org,
+            db_session=db_session,
+            is_debug_mode=False,
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.headers == {"Retry-After": "5"}

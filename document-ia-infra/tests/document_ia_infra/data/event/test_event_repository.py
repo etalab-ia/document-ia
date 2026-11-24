@@ -706,3 +706,82 @@ class TestGetCreatedEventIfExecutionNotCompletedOrFailed:
         )
         assert len(events) == 1
         assert events[0].id == entity.id
+
+    async def test_dbapi_errors_translate_to_retryable_exception(
+        self, event_repository, mock_session
+    ):
+        from sqlalchemy.exc import (
+            DBAPIError,
+            IntegrityError,
+            InterfaceError,
+            OperationalError,
+            TimeoutError as SATimeoutError,
+        )
+
+        class TooManyConnectionsError(Exception):
+            pass
+
+        too_many_conns_exc = DBAPIError.instance(
+            "SELECT 1",
+            {},
+            TooManyConnectionsError(
+                "remaining connection slots are reserved for roles with the SUPERUSER attribute"
+            ),
+            Exception,
+        )
+        operational_exc = OperationalError("SELECT 1", {}, Exception("connection lost"))
+        interface_exc = InterfaceError("SELECT 1", {}, Exception("interface closed"))
+        pool_timeout_exc = SATimeoutError(
+            "QueuePool limit of size 5 overflow 5 reached"
+        )
+
+        for transient_exc in (
+            too_many_conns_exc,
+            operational_exc,
+            interface_exc,
+            pool_timeout_exc,
+            TooManyConnectionsError("remaining connection slots are reserved"),
+        ):
+            mock_session.execute.side_effect = transient_exc
+            with pytest.raises(RetryableException):
+                await event_repository.get_created_event_if_execution_not_completed_or_failed(
+                    "exec1"
+                )
+            with pytest.raises(RetryableException):
+                await event_repository.get_started_event_by_execution_id("exec1")
+            with pytest.raises(RetryableException):
+                await event_repository.get_last_event_by_execution_id("exec1")
+
+            mock_session.flush.side_effect = transient_exc
+            with pytest.raises(RetryableException):
+                await event_repository.put_event(
+                    workflow_id="wf_1",
+                    organization_id=uuid4(),
+                    execution_id="exec1",
+                    event_type=EventType.WORKFLOW_EXECUTION_STARTED.value,
+                    event_data={},
+                )
+            mock_session.flush.side_effect = None
+
+        # IntegrityError must NOT be translated into RetryableException
+        integrity_exc = IntegrityError("INSERT", {}, Exception("duplicate key"))
+        mock_session.flush.side_effect = integrity_exc
+        with pytest.raises(IntegrityError):
+            await event_repository.put_event(
+                workflow_id="wf_1",
+                organization_id=uuid4(),
+                execution_id="exec1",
+                event_type=EventType.WORKFLOW_EXECUTION_STARTED.value,
+                event_data={},
+            )
+
+    async def test_database_manager_use_null_pool(self):
+        from sqlalchemy.pool import NullPool
+        from document_ia_infra.data.database import DatabaseManager
+
+        dbm = DatabaseManager(pool_size=1, max_overflow=1, use_null_pool=True)
+        try:
+            assert dbm.use_null_pool is True
+            assert isinstance(dbm.async_engine.pool, NullPool)
+        finally:
+            await dbm.dispose_async()

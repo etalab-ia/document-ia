@@ -5,6 +5,8 @@ This module implements the repository pattern for event store operations,
 providing async CRUD operations and event stream reconstruction.
 """
 
+import asyncio
+import contextlib
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Sequence
@@ -12,7 +14,16 @@ from uuid import UUID
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import (
+    DBAPIError,
+    DataError,
+    DisconnectionError,
+    IntegrityError,
+    InterfaceError,
+    OperationalError,
+    ProgrammingError,
+    TimeoutError as SATimeoutError,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -27,6 +38,44 @@ from document_ia_infra.exception.retryable_exception import RetryableException
 from document_ia_infra.redis.progress_tracker import get_current_progress_tracker
 
 logger = logging.getLogger(__name__)
+
+_TRANSIENT_DB_EXCEPTION_NAMES = frozenset(
+    {
+        "TooManyConnectionsError",
+        "CannotConnectNowError",
+        "ConnectionDoesNotExistError",
+        "PostgresConnectionError",
+        "DeadlockDetectedError",
+        "SerializationError",
+        "QueryCanceledError",
+        "AdminShutdownError",
+        "CrashShutdownError",
+    }
+)
+
+
+def is_transient_db_error(exc: BaseException) -> bool:
+    """Return True if the exception represents a transient database connectivity, pool, or lock failure."""
+    if isinstance(exc, (OSError, TimeoutError, asyncio.TimeoutError)):
+        return True
+    if isinstance(
+        exc,
+        (SATimeoutError, OperationalError, InterfaceError, DisconnectionError),
+    ):
+        return True
+    if isinstance(exc, DBAPIError) and not isinstance(
+        exc, (IntegrityError, ProgrammingError, DataError)
+    ):
+        return True
+    if type(exc).__name__ in _TRANSIENT_DB_EXCEPTION_NAMES:
+        return True
+    cause = getattr(exc, "orig", None) or exc.__cause__
+    if cause is not None and cause is not exc:
+        if isinstance(cause, (OSError, TimeoutError, asyncio.TimeoutError)):
+            return True
+        if type(cause).__name__ in _TRANSIENT_DB_EXCEPTION_NAMES:
+            return True
+    return False
 
 
 def ensure_processing_not_aborted(detail: str) -> None:
@@ -48,6 +97,18 @@ class EventRepository:
 
     def __init__(self, session: AsyncSession):
         self.session = session
+
+    async def _handle_transient_or_reraise(
+        self, exc: Exception, context_msg: str
+    ) -> None:
+        if is_transient_db_error(exc):
+            logger.error(f"Database connection error ({context_msg}): {exc}")
+            with contextlib.suppress(Exception):
+                await self.session.rollback()
+            raise RetryableException(exc) from exc
+        logger.error(f"Unexpected error ({context_msg}): {exc}")
+        await self.session.rollback()
+        raise exc
 
     @staticmethod
     def _to_dto(event: EventEntity) -> EventDTO:
@@ -134,6 +195,13 @@ class EventRepository:
             await self.session.rollback()
             raise
         except Exception as e:
+            if is_transient_db_error(e):
+                logger.error(
+                    f"Database connection error storing event {event_type} for execution {execution_id}: {e}"
+                )
+                with contextlib.suppress(Exception):
+                    await self.session.rollback()
+                raise RetryableException(e) from e
             logger.error(
                 f"Unexpected error storing event {event_type} for execution {execution_id}: {e}"
             )
@@ -190,10 +258,12 @@ class EventRepository:
                 return self._to_dto(event)
             return None
 
-        except OSError as e:
-            logger.error(f"Database connection error: {e}")
-            raise RetryableException(e)
         except Exception as e:
+            if is_transient_db_error(e):
+                logger.error(f"Database connection error: {e}")
+                with contextlib.suppress(Exception):
+                    await self.session.rollback()
+                raise RetryableException(e) from e
             logger.error(
                 f"Unexpected error retrieving last event for execution {execution_id}: {e}"
             )
@@ -228,10 +298,12 @@ class EventRepository:
                 return self._to_dto(event)
             return None
 
-        except OSError as e:
-            logger.error(f"Database connection error: {e}")
-            raise RetryableException(e)
         except Exception as e:
+            if is_transient_db_error(e):
+                logger.error(f"Database connection error: {e}")
+                with contextlib.suppress(Exception):
+                    await self.session.rollback()
+                raise RetryableException(e) from e
             logger.error(
                 f"Unexpected error retrieving last event for execution {execution_id}: {e}"
             )
@@ -260,10 +332,12 @@ class EventRepository:
                 return self._to_dto(event)
             return None
 
-        except OSError as e:
-            logger.error(f"Database connection error: {e}")
-            raise RetryableException(e)
         except Exception as e:
+            if is_transient_db_error(e):
+                logger.error(f"Database connection error: {e}")
+                with contextlib.suppress(Exception):
+                    await self.session.rollback()
+                raise RetryableException(e) from e
             logger.error(
                 f"Unexpected error retrieving started event for execution {execution_id}: {e}"
             )
@@ -302,10 +376,16 @@ class EventRepository:
         if limit:
             query = query.limit(limit)
 
-        result = await self.session.execute(query)
-        events = result.scalars().all()
+        try:
+            result = await self.session.execute(query)
+            events = result.scalars().all()
 
-        return [self._to_dto(event) for event in events]
+            return [self._to_dto(event) for event in events]
+        except Exception as e:
+            await self._handle_transient_or_reraise(
+                e, f"retrieving events for execution {execution_id}"
+            )
+            raise
 
     async def get_events_to_anonymize(
         self,
@@ -342,10 +422,14 @@ class EventRepository:
             EventEntity.created_at.asc(), EventEntity.id.asc()
         ).limit(limit)
 
-        result = await self.session.execute(query)
-        events = list(result.scalars().all())
-        self.session.expunge_all()
-        return events
+        try:
+            result = await self.session.execute(query)
+            events = list(result.scalars().all())
+            self.session.expunge_all()
+            return events
+        except Exception as e:
+            await self._handle_transient_or_reraise(e, "retrieving events to anonymize")
+            raise
 
     async def get_not_anonymized_events_before(
         self,
@@ -395,16 +479,22 @@ class EventRepository:
 
         query = query.order_by(EventEntity.created_at.asc()).limit(1)
 
-        result = await self.session.execute(query)
-        oldest_created_at = result.scalar_one_or_none()
-        if oldest_created_at is None:
-            return None
+        try:
+            result = await self.session.execute(query)
+            oldest_created_at = result.scalar_one_or_none()
+            if oldest_created_at is None:
+                return None
 
-        now = datetime.now(timezone.utc)
-        if oldest_created_at.tzinfo is None:
-            oldest_created_at = oldest_created_at.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if oldest_created_at.tzinfo is None:
+                oldest_created_at = oldest_created_at.replace(tzinfo=timezone.utc)
 
-        return max(0.0, (now - oldest_created_at).total_seconds())
+            return max(0.0, (now - oldest_created_at).total_seconds())
+        except Exception as e:
+            await self._handle_transient_or_reraise(
+                e, "retrieving oldest pending event age"
+            )
+            raise
 
     @staticmethod
     def anonymize_payload(
@@ -469,7 +559,11 @@ class EventRepository:
             self.session.add(event)
             await self.session.flush()
             await self.session.commit()
-        except Exception:
+        except Exception as e:
+            if is_transient_db_error(e):
+                with contextlib.suppress(Exception):
+                    await self.session.rollback()
+                raise RetryableException(e) from e
             await self.session.rollback()
             raise
 
@@ -484,8 +578,12 @@ class EventRepository:
             .order_by(EventEntity.created_at.desc())
             .limit(1)
         )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
+        try:
+            result = await self.session.execute(query)
+            return result.scalar_one_or_none()
+        except Exception as e:
+            await self._handle_transient_or_reraise(e, "retrieving replication cursor")
+            raise
 
     async def get_events_created_after(
         self,
@@ -511,17 +609,27 @@ class EventRepository:
             query = query.where(EventEntity.created_at >= after)
         query = query.order_by(EventEntity.created_at.asc()).limit(limit)
 
-        result = await self.session.execute(query)
-        return list(result.scalars().all())
+        try:
+            result = await self.session.execute(query)
+            return list(result.scalars().all())
+        except Exception as e:
+            await self._handle_transient_or_reraise(
+                e, "retrieving events created after cursor"
+            )
+            raise
 
     async def count_events_by_statuses(self, statuses: Sequence[str]) -> int:
         """Count total events matching the given anonymization statuses."""
         query = select(func.count(EventEntity.id)).where(
             EventEntity.anonymization_status.in_(statuses)
         )
-        result = await self.session.execute(query)
-        val = result.scalar_one_or_none()
-        return val if val is not None else 0
+        try:
+            result = await self.session.execute(query)
+            val = result.scalar_one_or_none()
+            return val if val is not None else 0
+        except Exception as e:
+            await self._handle_transient_or_reraise(e, "counting events by statuses")
+            raise
 
     async def get_events_by_cursor(
         self,
@@ -536,8 +644,12 @@ class EventRepository:
         if after_id is not None:
             query = query.where(EventEntity.id > after_id)
         query = query.order_by(EventEntity.id.asc()).limit(limit)
-        result = await self.session.execute(query)
-        return list(result.scalars().all())
+        try:
+            result = await self.session.execute(query)
+            return list(result.scalars().all())
+        except Exception as e:
+            await self._handle_transient_or_reraise(e, "retrieving events by cursor")
+            raise
 
     async def bulk_insert_events(self, events: List[EventEntity]) -> None:
         """Bulk insert replicated events, updating payload and status on conflict.
@@ -564,8 +676,12 @@ class EventRepository:
                 "anonymization_status": insert_stmt.excluded.anonymization_status,
             },
         )
-        await self.session.execute(stmt)
-        await self.session.commit()
+        try:
+            await self.session.execute(stmt)
+            await self.session.commit()
+        except Exception as e:
+            await self._handle_transient_or_reraise(e, "bulk inserting events")
+            raise
 
     async def save_failed_anonymization(self, event: EventEntity | UUID) -> None:
         """Mark an event's anonymization as failed.
@@ -582,6 +698,10 @@ class EventRepository:
             )
             await self.session.execute(stmt)
             await self.session.commit()
-        except Exception:
+        except Exception as e:
+            if is_transient_db_error(e):
+                with contextlib.suppress(Exception):
+                    await self.session.rollback()
+                raise RetryableException(e) from e
             await self.session.rollback()
             raise

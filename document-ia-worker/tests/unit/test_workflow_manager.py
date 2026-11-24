@@ -498,3 +498,105 @@ class TestWorkflowManager:
         finally:
             # Satisfy mock_dependencies fixture teardown assertion
             await manager._webhook_redis_manager.close()
+
+    @pytest.mark.asyncio
+    async def test_acquire_worker_db_slot_bounds_concurrency(self, monkeypatch):
+        import asyncio
+        from document_ia_infra.data.data_settings import database_settings
+        from document_ia_worker.core.db_semaphore import (
+            acquire_worker_db_slot,
+            reset_worker_db_semaphore,
+        )
+
+        monkeypatch.setattr(database_settings, "WORKER_DB_MAX_CONNECTIONS", 2)
+        reset_worker_db_semaphore()
+
+        active_count = 0
+        max_observed = 0
+
+        async def worker_task():
+            nonlocal active_count, max_observed
+            async with acquire_worker_db_slot():
+                active_count += 1
+                max_observed = max(max_observed, active_count)
+                await asyncio.sleep(0.02)
+                active_count -= 1
+
+        try:
+            await asyncio.gather(*(worker_task() for _ in range(6)))
+            assert max_observed == 2
+        finally:
+            reset_worker_db_semaphore()
+
+    @pytest.mark.asyncio
+    async def test_start_closes_session_before_execute_workflow(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        """La session DB doit être fermée dès la fin de _prepare_workflow avant _execute_workflow."""
+        manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        parsed_event = MagicMock(version=1)
+        mock_session = mock_db_manager.return_value.local_session.return_value.__aenter__.return_value
+
+        closed_before_execute = False
+
+        async def fake_execute():
+            nonlocal closed_before_execute
+            closed_before_execute = mock_session.close.await_count >= 1
+
+        with (
+            patch.object(
+                manager,
+                "_prepare_workflow",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(manager, "_parse_start_event", return_value=parsed_event),
+            patch.object(manager, "_prepare_executor"),
+            patch.object(manager, "_execute_workflow", side_effect=fake_execute),
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ),
+        ):
+            await manager.start()
+
+        assert closed_before_execute is True
+        assert mock_session.close.await_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_start_dbapi_error_in_prepare_workflow_raises_retryable_exception(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        """Un TooManyConnectionsError / DBAPIError dans _prepare_workflow remonte en RetryableException."""
+        from sqlalchemy.exc import DBAPIError
+
+        class TooManyConnectionsError(Exception):
+            pass
+
+        db_exc = DBAPIError.instance(
+            "SELECT 1",
+            {},
+            TooManyConnectionsError(
+                "remaining connection slots are reserved for roles with the SUPERUSER attribute"
+            ),
+            Exception,
+        )
+
+        manager = WorkflowManager(
+            mock_workflow_message, retry_count=0, is_last_retry=False
+        )
+        mock_session = mock_db_manager.return_value.local_session.return_value.__aenter__.return_value
+        mock_session.execute.side_effect = db_exc
+
+        with (
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
+        ):
+            with pytest.raises(RetryableException):
+                await manager.start()
+
+            mock_notify.assert_not_awaited()
+            mock_purge_s3.assert_not_awaited()
