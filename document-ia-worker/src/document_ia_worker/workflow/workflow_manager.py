@@ -317,7 +317,9 @@ class WorkflowManager:
                                                 )
 
                                     if self.event_dto is not None:
-                                        await self._save_failure_event(session, e)
+                                        await self._save_failure_event(
+                                            session, e, is_terminal=is_terminal_failure
+                                        )
                                 finally:
                                     await close_session_safely(session)
                         except Exception as save_err:
@@ -706,7 +708,9 @@ class WorkflowManager:
             self.step_list.clear()
             _release_worker_memory()
 
-    async def _save_failure_event(self, db: AsyncSession, exception: Exception):
+    async def _save_failure_event(
+        self, db: AsyncSession, exception: Exception, *, is_terminal: bool = True
+    ):
         if self.event_dto is None:
             with contextlib.suppress(Exception):
                 self.event_dto = await EventRepository(
@@ -790,6 +794,7 @@ class WorkflowManager:
             failed_step=final_failed_step,
             retry_count=self.retry_count,
             workflow_version=workflow_version,
+            is_terminal=is_terminal,
         )
 
     def _cleanup_execution_sandbox(self, context_label: str) -> bool:
@@ -874,6 +879,7 @@ class WorkflowManager:
                                 failed_step="watchdog",
                                 retry_count=self.retry_count,
                                 workflow_version=workflow_version,
+                                is_terminal=True,
                             )
                     finally:
                         await close_session_safely(session)
@@ -932,5 +938,8 @@ class WorkflowManager:
         if event.event_type == EventType.WORKFLOW_EXECUTION_COMPLETED.value:
             return True
         if event.event_type == EventType.WORKFLOW_EXECUTION_FAILED.value:
+            is_terminal = event.event.get("is_terminal")
+            if isinstance(is_terminal, bool):
+                return is_terminal
             return event.event.get("error_type") != RetryableException.__name__
         return False

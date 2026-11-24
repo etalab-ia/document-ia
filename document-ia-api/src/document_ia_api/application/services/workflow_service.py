@@ -31,6 +31,8 @@ from document_ia_api.infra.s3_service import s3_service
 from document_ia_api.schemas.workflow import WorkflowExecutionData
 from document_ia_infra.core.model.file_info import FileInfo
 from document_ia_infra.core.security.safe_logging import extract_safe_host
+from document_ia_infra.data.event.dto.event_dto import EventDTO
+from document_ia_infra.data.event.dto.event_type_enum import EventType
 from document_ia_infra.data.event.schema.workflow.workflow_execution_started_event import (
     ClassificationParameters,
     ExtractionParameters,
@@ -287,8 +289,21 @@ class WorkflowService:
                     status_code=403, detail="Forbidden access to execution"
                 )
 
+            started_event_dto: EventDTO | None = None
+            if (
+                event_dto.event_type == EventType.WORKFLOW_EXECUTION_FAILED
+                and event_dto.event.get("is_terminal", True) is False
+            ):
+                started_tuple = await event_store_service.get_workflow_started_event(
+                    execution_id
+                )
+                started_event_dto = started_tuple[0] if started_tuple else None
+
             last_model = execution_service.get_event_model(
-                event_dto, execution_id, is_debug_mode
+                event_dto,
+                execution_id,
+                is_debug_mode,
+                started_event_dto=started_event_dto,
             )
 
             if last_model.status != ExecutionStatus.STARTED:

@@ -442,7 +442,7 @@ async def test_start_aborted_during_save_failure_event_does_not_purge_s3(
     async def failing_execute():
         raise RuntimeError("Execution failed")
 
-    async def aborted_save_failure(_session, _exc):
+    async def aborted_save_failure(_session, _exc, **_kwargs):
         fake_tracker.is_aborted = True
         raise ProcessingAbortedException("Fenced by watchdog")
 
