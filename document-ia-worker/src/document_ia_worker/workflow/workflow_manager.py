@@ -295,16 +295,31 @@ class WorkflowManager:
                     if self.event_dto is not None or is_terminal_failure:
                         try:
                             async with acquire_worker_db_slot():
-                                if self.event_dto is None and is_terminal_failure:
-                                    with contextlib.suppress(Exception):
-                                        self.event_dto = await EventRepository(
-                                            session
-                                        ).get_started_event_by_execution_id(
-                                            self.message.workflow_execution_id
-                                        )
+                                try:
+                                    if self.event_dto is None and is_terminal_failure:
+                                        with contextlib.suppress(Exception):
+                                            event_repository = EventRepository(session)
+                                            last_event = await event_repository.get_last_event_by_execution_id(
+                                                self.message.workflow_execution_id
+                                            )
+                                            if (
+                                                last_event is not None
+                                                and self._is_terminal_event(last_event)
+                                            ):
+                                                logger.info(
+                                                    "Execution %s is already terminal (%s); skipping duplicate failure event",
+                                                    self.message.workflow_execution_id,
+                                                    last_event.event_type,
+                                                )
+                                            else:
+                                                self.event_dto = await event_repository.get_started_event_by_execution_id(
+                                                    self.message.workflow_execution_id
+                                                )
 
-                                if self.event_dto is not None:
-                                    await self._save_failure_event(session, e)
+                                    if self.event_dto is not None:
+                                        await self._save_failure_event(session, e)
+                                finally:
+                                    await close_session_safely(session)
                         except Exception as save_err:
                             with contextlib.suppress(Exception):
                                 await session.rollback()
@@ -320,8 +335,6 @@ class WorkflowManager:
                                 self.message.workflow_execution_id,
                                 type(save_err).__name__,
                             )
-                        finally:
-                            await close_session_safely(session)
 
                     tracker = get_current_progress_tracker()
                     if tracker is not None and tracker.is_aborted:
