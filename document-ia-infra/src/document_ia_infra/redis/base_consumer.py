@@ -989,6 +989,7 @@ class BaseConsumer(ABC, Generic[T]):
             self._requeue_once,
             self._send_to_dlq,
             on_terminal_failure=self._notify_terminal_failure,
+            has_scheduled_retry=self.delivery.has_scheduled_retry,
         )
 
     async def _ensure_consumer_group(self, redis_connection: Redis) -> None:

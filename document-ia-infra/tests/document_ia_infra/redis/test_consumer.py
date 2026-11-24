@@ -210,6 +210,18 @@ class MockRedis:
             zset[orig] = due_at_ms
             return [1, orig]
 
+        if "XADD" not in script and "ZSCORE" in script:
+            delayed_key, stream = keys[0], keys[1]
+            orig = argv[0]
+            if orig in self.delayed_zsets.get(delayed_key, {}):
+                return 1
+            for recorded_stream, fields in self.xadd_calls:
+                if recorded_stream == stream and str(
+                    fields.get("original_id", "")
+                ) == str(orig):
+                    return 1
+            return 0
+
         stream = keys[0]
         orig = argv[0]
         if self.xrange.__code__ is not MockRedis.xrange.__code__:

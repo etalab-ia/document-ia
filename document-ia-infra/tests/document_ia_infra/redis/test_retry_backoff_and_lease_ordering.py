@@ -955,3 +955,161 @@ async def test_handler_finalized_errors_do_not_double_notify_terminal_failure(
 
     assert notifications == []
     assert consumer.delivery.ack.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_requeue_failure_with_committed_retry_skips_dlq_and_terminal_failure(
+    redis_client: Redis, stream: str
+) -> None:
+    """If Redis committed the retry (ZSET or stream) before the reply was lost, do not DLQ or finalize."""
+    notifications: list[tuple[str, dict[str, Any], str]] = []
+
+    async def noop(_msg: RetryTestMessage, _rc: int, _is_last: bool) -> None:
+        return None
+
+    async def on_terminal_failure(
+        msg_id: str, fields: dict[str, Any], reason: str
+    ) -> None:
+        notifications.append((msg_id, dict(fields), reason))
+
+    group = "g-ambiguous"
+    consumer = AsyncIoConsumer[RetryTestMessage](
+        consumer_name="c-ambiguous",
+        consumer_group=group,
+        stream_name=stream,
+        batch_size=1,
+        block_time=10,
+        message_class=RetryTestMessage,
+        process_message_callable=noop,
+        max_retry_number=4,
+        retry_backoff_delays_s=(0.0, 1.0, 10.0),
+        on_terminal_failure=on_terminal_failure,
+    )
+    await consumer.delivery.ensure_group(redis_client, "0-0")
+
+    # Case 1: Delayed retry committed to ZSET before TimeoutError (lost reply)
+    orig_id = await redis_client.xadd(
+        stream,
+        {
+            "data": json.dumps({"workflow_execution_id": "exec-lost-zset"}),
+            "retries": "1",
+        },
+    )
+    await redis_client.xreadgroup(group, "c-ambiguous", {stream: ">"}, count=1)
+
+    real_schedule = consumer.delivery.schedule_delayed_retry
+
+    async def commit_then_timeout(
+        redis: Redis,
+        entry_id: str,
+        fields: dict[str, Any],
+        retries: int,
+        due_at_ms: int,
+    ) -> bool:
+        await real_schedule(redis, entry_id, fields, retries, due_at_ms)
+        raise TimeoutError("lost reply after ZSET commit")
+
+    consumer.delivery.schedule_delayed_retry = commit_then_timeout  # type: ignore[method-assign]
+    consumer._send_to_dlq = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+    fut.set_exception(RetryableException("HTTP 429"))
+
+    fields = {
+        "data": json.dumps({"workflow_execution_id": "exec-lost-zset"}),
+        "retries": "1",
+    }
+    await consumer._handle_finished_future(fut, orig_id, fields, redis_client)
+    await consumer._drain_terminal_failure_tasks()
+
+    assert consumer._send_to_dlq.await_count == 0
+    assert notifications == []
+    assert await redis_client.zcard(consumer.delivery.delayed_retry_key) == 1
+    assert (await redis_client.xpending(stream, group))["pending"] == 0
+
+    # Case 2: Immediate requeue committed to main stream before TimeoutError (lost reply)
+    orig_id_2 = await redis_client.xadd(
+        stream,
+        {
+            "data": json.dumps({"workflow_execution_id": "exec-lost-stream"}),
+            "retries": "0",
+        },
+    )
+    await redis_client.xreadgroup(group, "c-ambiguous", {stream: ">"}, count=1)
+
+    real_requeue = consumer.delivery.requeue
+
+    async def requeue_commit_then_timeout(
+        redis: Redis, entry_id: str, fields: dict[str, Any], retries: int
+    ) -> bool:
+        await real_requeue(redis, entry_id, fields, retries)
+        raise TimeoutError("lost reply after XADD commit")
+
+    consumer.delivery.requeue = requeue_commit_then_timeout  # type: ignore[method-assign]
+
+    fut2: asyncio.Future[Any] = loop.create_future()
+    fut2.set_exception(RetryableException("HTTP 429"))
+    fields2 = {
+        "data": json.dumps({"workflow_execution_id": "exec-lost-stream"}),
+        "retries": "0",
+    }
+    await consumer._handle_finished_future(fut2, orig_id_2, fields2, redis_client)
+    await consumer._drain_terminal_failure_tasks()
+
+    assert consumer._send_to_dlq.await_count == 0
+    assert notifications == []
+    assert (await redis_client.xpending(stream, group))["pending"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_requeue_failure_when_verification_fails_leaves_entry_pending() -> (
+    None
+):
+    """If Redis is unreachable during retry-state verification, leave entry pending in PEL."""
+    notifications: list[tuple[str, dict[str, Any], str]] = []
+
+    async def noop(_msg: RetryTestMessage, _rc: int, _is_last: bool) -> None:
+        return None
+
+    async def on_terminal_failure(
+        msg_id: str, fields: dict[str, Any], reason: str
+    ) -> None:
+        notifications.append((msg_id, dict(fields), reason))
+
+    consumer = AsyncIoConsumer[RetryTestMessage](
+        consumer_name="c-ambiguous-down",
+        consumer_group="g1",
+        stream_name="s1",
+        batch_size=1,
+        block_time=10,
+        message_class=RetryTestMessage,
+        process_message_callable=noop,
+        max_retry_number=4,
+        retry_backoff_delays_s=(0.0, 1.0, 10.0),
+        on_terminal_failure=on_terminal_failure,
+    )
+    consumer.delivery.schedule_delayed_retry = AsyncMock(  # type: ignore[method-assign]
+        side_effect=ConnectionError("Redis disconnected")
+    )
+    consumer.delivery.has_scheduled_retry = AsyncMock(  # type: ignore[method-assign]
+        side_effect=ConnectionError("Redis still disconnected")
+    )
+    consumer._send_to_dlq = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    consumer.delivery.ack = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+    fut.set_exception(RetryableException("HTTP 429"))
+
+    msg_id = "1700000000104-0"
+    fields = {
+        "data": json.dumps({"workflow_execution_id": "exec-redis-down"}),
+        "retries": "1",
+    }
+    await consumer._handle_finished_future(fut, msg_id, fields, AsyncMock())
+    await consumer._drain_terminal_failure_tasks()
+
+    assert consumer._send_to_dlq.await_count == 0
+    assert consumer.delivery.ack.await_count == 0
+    assert notifications == []

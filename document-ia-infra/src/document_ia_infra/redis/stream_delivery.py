@@ -120,6 +120,28 @@ end
 return promoted
 """
 
+_HAS_SCHEDULED_RETRY_LUA = """
+local delayed_key = KEYS[1]
+local stream = KEYS[2]
+local orig = ARGV[1]
+local min_id = string.match(orig, '^%d+%-%d+$') and ('(' .. orig) or '-'
+
+if redis.call('ZSCORE', delayed_key, orig) ~= false then
+  return 1
+end
+
+local existing = redis.call('XRANGE', stream, min_id, '+')
+for _, e in ipairs(existing) do
+  local f = e[2]
+  for i = 1, #f, 2 do
+    if f[i] == 'original_id' and f[i+1] == orig then
+      return 1
+    end
+  end
+end
+return 0
+"""
+
 _RENEW_LEASE_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('PEXPIRE', KEYS[1], ARGV[2])
@@ -331,6 +353,17 @@ class StreamDelivery:
         if promoted_count > 0:
             delivery_metric(self.stream, "retry_promoted", "success", promoted_count)
         return promoted_count
+
+    async def has_scheduled_retry(self, redis: Redis, entry_id: str) -> bool:
+        """Atomically verify whether a retry copy exists in the delayed ZSET or main stream."""
+        result = await redis.eval(
+            _HAS_SCHEDULED_RETRY_LUA,
+            2,
+            self.delayed_retry_key,
+            self.stream,
+            str(entry_id),
+        )
+        return bool(result == 1)
 
     async def retain(self, redis: Redis, entry_id: str, fields: dict[str, Any]) -> bool:
         return await self.copy_once(redis, f"{self.stream}:dlq", entry_id, fields)
