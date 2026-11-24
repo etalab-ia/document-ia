@@ -183,6 +183,64 @@ class TestWorkflowManager:
             mock_db_manager.return_value.dispose_async.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_start_initial_db_slot_timeout_remains_retryable(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        """An initial DB-slot timeout must not trigger terminal cleanup."""
+        from contextlib import asynccontextmanager
+
+        manager = WorkflowManager(
+            mock_workflow_message, retry_count=0, is_last_retry=False
+        )
+        slot_acquisitions = 0
+
+        @asynccontextmanager
+        async def acquire_slot():
+            nonlocal slot_acquisitions
+            slot_acquisitions += 1
+            if slot_acquisitions == 1:
+                raise RetryableException("initial DB slot timeout")
+            yield
+
+        event_repository = MagicMock()
+        event_repository.get_last_event_by_execution_id = AsyncMock(
+            return_value=None
+        )
+        event_repository.get_started_event_by_execution_id = AsyncMock(
+            return_value=None
+        )
+
+        with (
+            patch(
+                "document_ia_worker.workflow.workflow_manager.acquire_worker_db_slot",
+                new=acquire_slot,
+            ),
+            patch(
+                "document_ia_worker.workflow.workflow_manager.EventRepository",
+                return_value=event_repository,
+            ),
+            patch.object(
+                manager, "_prepare_workflow", new_callable=AsyncMock
+            ) as mock_prepare,
+            patch.object(
+                manager, "_save_failure_event", new_callable=AsyncMock
+            ) as mock_save_fail,
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
+        ):
+            with pytest.raises(RetryableException, match="initial DB slot timeout"):
+                await manager.start()
+
+            mock_prepare.assert_not_awaited()
+            mock_save_fail.assert_not_awaited()
+            mock_purge_s3.assert_not_awaited()
+            mock_notify.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_start_preserves_terminal_error_when_failure_slot_times_out(
         self, mock_workflow_message, mock_db_manager, mock_dependencies
     ):
