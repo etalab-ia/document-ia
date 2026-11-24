@@ -63,7 +63,12 @@ async def stream(redis_client: Redis) -> AsyncGenerator[str, None]:
     try:
         yield name
     finally:
-        await redis_client.delete(name, f"{name}:dlq", f"{name}:retry_delayed")
+        await redis_client.delete(
+            name,
+            f"{name}:dlq",
+            f"{name}:retry_delayed",
+            f"{name}:retry_delayed:payloads",
+        )
 
 
 def _make_redis_manager(client: Redis) -> RedisManager:
@@ -396,6 +401,7 @@ async def test_redis_schedule_delayed_retry_idempotence_and_requeue_guard(
     )
     assert promoted == 1
     assert await redis_client.zcard(delivery.delayed_retry_key) == 0
+    assert await redis_client.hlen(delivery.delayed_retry_payloads_key) == 0
     assert await redis_client.xlen(stream) == 1
 
     # 4. Calling schedule_delayed_retry again after promotion is a no-op (already in stream)
@@ -557,11 +563,7 @@ async def test_redis_cross_worker_lease_handoff_on_immediate_retry(
         await asyncio.wait_for(completed.wait(), timeout=3.0)
         # Wait briefly for final ACK to settle
         await _wait_until(
-            lambda: (
-                redis_client.xpending(stream, group).then(None)
-                if False
-                else _pending_count_zero(redis_client, stream, group)
-            ),
+            lambda: _pending_count_zero(redis_client, stream, group),
             timeout=3.0,
         )
     finally:
@@ -654,3 +656,51 @@ async def test_redis_delayed_retry_survives_worker_stop_and_restart(
         await c2.stop()
 
     assert await redis_client.zcard(f"{stream}:retry_delayed") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_batch_size", [0, -1, -100])
+async def test_promote_due_retries_rejects_non_positive_batch_size(
+    invalid_batch_size: int,
+) -> None:
+    delivery = StreamDelivery("s-bounds", "g-bounds", "c-bounds")
+    with pytest.raises(ValueError, match="batch_size must be >= 1"):
+        await delivery.promote_due_retries(
+            AsyncMock(), now_ms=1000, batch_size=invalid_batch_size
+        )
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_retry_backoff_rejects_non_finite_values(bad_value: float) -> None:
+    with pytest.raises(ValidationError):
+        RedisSettings(WORKFLOW_RETRY_BACKOFF_DELAYS_S=[0.0, bad_value])
+
+    with pytest.raises(ValidationError):
+        RedisSettings(RETRY_DELAYED_POLL_INTERVAL_S=bad_value)
+
+    async def noop(_msg: RetryTestMessage, _rc: int, _is_last: bool) -> None:
+        return None
+
+    with pytest.raises(ValueError, match="retry_backoff_delays_s"):
+        AsyncIoConsumer[RetryTestMessage](
+            consumer_name="c-nan",
+            consumer_group="g-nan",
+            stream_name="s-nan",
+            batch_size=1,
+            block_time=10,
+            message_class=RetryTestMessage,
+            process_message_callable=noop,
+            retry_backoff_delays_s=(0.0, bad_value),
+        )
+
+    with pytest.raises(ValueError, match="delayed_retry_poll_interval_s"):
+        AsyncIoConsumer[RetryTestMessage](
+            consumer_name="c-nan2",
+            consumer_group="g-nan",
+            stream_name="s-nan",
+            batch_size=1,
+            block_time=10,
+            message_class=RetryTestMessage,
+            process_message_callable=noop,
+            delayed_retry_poll_interval_s=bad_value,
+        )

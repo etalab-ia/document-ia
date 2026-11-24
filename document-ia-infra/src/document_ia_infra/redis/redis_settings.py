@@ -1,4 +1,5 @@
 import json
+import math
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -68,10 +69,17 @@ class RedisSettings(BaseDocumentIaSettings):
     @classmethod
     def validate_retry_backoff_delays(cls, value: list[float]) -> list[float]:
         for delay in value:
-            if delay < 0.0:
+            if not math.isfinite(delay) or delay < 0.0:
                 raise ValueError(
-                    "WORKFLOW_RETRY_BACKOFF_DELAYS_S elements must be >= 0.0"
+                    "WORKFLOW_RETRY_BACKOFF_DELAYS_S elements must be finite and >= 0.0"
                 )
+        return value
+
+    @field_validator("RETRY_DELAYED_POLL_INTERVAL_S")
+    @classmethod
+    def validate_delayed_retry_poll_interval(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("RETRY_DELAYED_POLL_INTERVAL_S must be finite")
         return value
 
     @model_validator(mode="after")

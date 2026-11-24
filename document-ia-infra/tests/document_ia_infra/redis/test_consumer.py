@@ -45,6 +45,7 @@ class MockRedis:
         self.xrange_calls: list[tuple[str, str, str]] = []  # (stream, min, max)
         self.xclaim_calls: list[tuple[str, str, str, int, list[str], bool]] = []
         self.delayed_zsets: dict[str, dict[str, float]] = {}
+        self.delayed_payloads: dict[str, dict[str, str]] = {}
         self.groups_created: set[tuple[str, str]] = set()
         self.groups_created_ids: dict[tuple[str, str], str] = {}
         self._id_state: dict[str, tuple[int, int]] = {}  # per-stream (ms, seq)
@@ -158,20 +159,23 @@ class MockRedis:
         keys = args[:numkeys]
         argv = args[numkeys:]
         if "ZRANGEBYSCORE" in script:
-            delayed_key, stream = keys[0], keys[1]
+            delayed_key, stream, payloads_key = keys[0], keys[1], keys[2]
             now_ms = float(argv[0])
             batch_size = int(argv[1])
             zset = self.delayed_zsets.setdefault(delayed_key, {})
-            due_members = [
-                member
-                for member, score in sorted(zset.items(), key=lambda kv: kv[1])
+            payloads = self.delayed_payloads.setdefault(payloads_key, {})
+            due_ids = [
+                orig_id
+                for orig_id, score in sorted(zset.items(), key=lambda kv: kv[1])
                 if score <= now_ms
             ][:batch_size]
             promoted = 0
-            for member in due_members:
-                zset.pop(member, None)
-                decoded = json.loads(member)
-                orig_id = decoded.get("original_id")
+            for orig_id in due_ids:
+                zset.pop(orig_id, None)
+                payload_json = payloads.pop(orig_id, None)
+                if payload_json is None:
+                    continue
+                decoded = json.loads(payload_json)
                 already = any(
                     recorded_stream == stream
                     and str(fields.get("original_id", "")) == str(orig_id)
@@ -185,7 +189,7 @@ class MockRedis:
             return promoted
 
         if "ZADD" in script:
-            delayed_key, stream = keys[0], keys[1]
+            delayed_key, stream, payloads_key = keys[0], keys[1], keys[2]
             orig, _minimum, due_at_ms, payload_json = (
                 argv[0],
                 argv[1],
@@ -200,11 +204,10 @@ class MockRedis:
                 ) == str(orig):
                     return [0, msg_id]
             zset = self.delayed_zsets.setdefault(delayed_key, {})
-            for member in zset:
-                decoded = json.loads(member)
-                if str(decoded.get("original_id", "")) == str(orig):
-                    return [0, orig]
-            zset[payload_json] = due_at_ms
+            if orig in zset:
+                return [0, orig]
+            self.delayed_payloads.setdefault(payloads_key, {})[orig] = payload_json
+            zset[orig] = due_at_ms
             return [1, orig]
 
         stream = keys[0]
@@ -218,10 +221,8 @@ class MockRedis:
                 return [0, msg_id]
         if len(keys) >= 2:
             zset = self.delayed_zsets.get(keys[1], {})
-            for member in zset:
-                decoded = json.loads(member)
-                if str(decoded.get("original_id", "")) == str(orig):
-                    return [0, orig]
+            if orig in zset:
+                return [0, orig]
         # Shared copy primitive: original_id, scan minimum, then field pairs.
         # Both requeue and DLQ now use the same wire contract.
         fields = dict(zip(argv[2::2], argv[3::2]))

@@ -29,12 +29,8 @@ for _, e in ipairs(existing) do
   end
 end
 if #KEYS >= 2 then
-  local delayed_members = redis.call('ZRANGE', KEYS[2], 0, -1)
-  for _, member in ipairs(delayed_members) do
-    local ok, decoded = pcall(cjson.decode, member)
-    if ok and type(decoded) == 'table' and decoded['original_id'] == orig then
-      return {0, orig}
-    end
+  if redis.call('ZSCORE', KEYS[2], orig) ~= false then
+    return {0, orig}
   end
 end
 local args = {}
@@ -46,6 +42,7 @@ return {1, id}
 _SCHEDULE_DELAYED_RETRY_LUA = """
 local delayed_key = KEYS[1]
 local stream = KEYS[2]
+local payloads_key = KEYS[3]
 local orig = ARGV[1]
 local minimum = ARGV[2]
 local due_at_ms = tonumber(ARGV[3])
@@ -61,35 +58,34 @@ for _, e in ipairs(existing) do
   end
 end
 
-local delayed_members = redis.call('ZRANGE', delayed_key, 0, -1)
-for _, member in ipairs(delayed_members) do
-  local ok, decoded = pcall(cjson.decode, member)
-  if ok and type(decoded) == 'table' and decoded['original_id'] == orig then
-    return {0, orig}
-  end
+if redis.call('ZSCORE', delayed_key, orig) ~= false then
+  return {0, orig}
 end
 
-redis.call('ZADD', delayed_key, due_at_ms, payload_json)
+redis.call('HSET', payloads_key, orig, payload_json)
+redis.call('ZADD', delayed_key, due_at_ms, orig)
 return {1, orig}
 """
 
 _PROMOTE_DUE_RETRIES_LUA = """
 local delayed_key = KEYS[1]
 local stream = KEYS[2]
+local payloads_key = KEYS[3]
 local now_ms = ARGV[1]
 local batch_size = tonumber(ARGV[2])
 
 local due = redis.call('ZRANGEBYSCORE', delayed_key, '-inf', now_ms, 'LIMIT', 0, batch_size)
 local promoted = 0
 
-for _, member in ipairs(due) do
-  local removed = redis.call('ZREM', delayed_key, member)
+for _, orig_id in ipairs(due) do
+  local removed = redis.call('ZREM', delayed_key, orig_id)
   if removed == 1 then
-    local ok, decoded = pcall(cjson.decode, member)
-    if ok and type(decoded) == 'table' then
-      local orig_id = decoded['original_id']
-      local already_in_stream = false
-      if orig_id then
+    local payload_json = redis.call('HGET', payloads_key, orig_id)
+    redis.call('HDEL', payloads_key, orig_id)
+    if payload_json then
+      local ok, decoded = pcall(cjson.decode, payload_json)
+      if ok and type(decoded) == 'table' then
+        local already_in_stream = false
         local existing = redis.call('XRANGE', stream, orig_id, '+')
         for _, e in ipairs(existing) do
           local f = e[2]
@@ -103,16 +99,16 @@ for _, member in ipairs(due) do
             break
           end
         end
-      end
-      if not already_in_stream then
-        local args = {}
-        for k, v in pairs(decoded) do
-          table.insert(args, tostring(k))
-          table.insert(args, tostring(v))
-        end
-        if #args > 0 then
-          redis.call('XADD', stream, '*', unpack(args))
-          promoted = promoted + 1
+        if not already_in_stream then
+          local args = {}
+          for k, v in pairs(decoded) do
+            table.insert(args, tostring(k))
+            table.insert(args, tostring(v))
+          end
+          if #args > 0 then
+            redis.call('XADD', stream, '*', unpack(args))
+            promoted = promoted + 1
+          end
         end
       end
     end
@@ -150,6 +146,10 @@ class StreamDelivery:
     @property
     def delayed_retry_key(self) -> str:
         return f"{self.stream}:retry_delayed"
+
+    @property
+    def delayed_retry_payloads_key(self) -> str:
+        return f"{self.stream}:retry_delayed:payloads"
 
     @staticmethod
     def _normalize_fields(fields: dict[Any, Any]) -> dict[str, str]:
@@ -251,9 +251,7 @@ class StreamDelivery:
         operation = "dlq" if target == f"{self.stream}:dlq" else "retry"
         keys = [target] if delayed_key is None else [target, delayed_key]
         try:
-            result = await cast(
-                Awaitable[Any], redis.eval(_COPY_ONCE_LUA, len(keys), *keys, *argv)
-            )
+            result = await redis.eval(_COPY_ONCE_LUA, len(keys), *keys, *argv)
         except Exception:
             delivery_metric(self.stream, operation, "error")
             raise
@@ -287,18 +285,16 @@ class StreamDelivery:
         }
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         try:
-            result = await cast(
-                Awaitable[Any],
-                redis.eval(
-                    _SCHEDULE_DELAYED_RETRY_LUA,
-                    2,
-                    self.delayed_retry_key,
-                    self.stream,
-                    str(entry_id),
-                    str(entry_id),
-                    str(due_at_ms),
-                    serialized,
-                ),
+            result = await redis.eval(
+                _SCHEDULE_DELAYED_RETRY_LUA,
+                3,
+                self.delayed_retry_key,
+                self.stream,
+                self.delayed_retry_payloads_key,
+                str(entry_id),
+                str(entry_id),
+                str(due_at_ms),
+                serialized,
             )
         except Exception:
             delivery_metric(self.stream, "retry_delayed", "error")
@@ -314,17 +310,17 @@ class StreamDelivery:
         now_ms: int,
         batch_size: int = 100,
     ) -> int:
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
         try:
-            promoted = await cast(
-                Awaitable[Any],
-                redis.eval(
-                    _PROMOTE_DUE_RETRIES_LUA,
-                    2,
-                    self.delayed_retry_key,
-                    self.stream,
-                    str(now_ms),
-                    str(batch_size),
-                ),
+            promoted = await redis.eval(
+                _PROMOTE_DUE_RETRIES_LUA,
+                3,
+                self.delayed_retry_key,
+                self.stream,
+                self.delayed_retry_payloads_key,
+                str(now_ms),
+                str(batch_size),
             )
             promoted_count = int(promoted or 0)
         except Exception:
