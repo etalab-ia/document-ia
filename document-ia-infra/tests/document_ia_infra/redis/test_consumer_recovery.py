@@ -435,7 +435,7 @@ async def test_requeue_after_crash_creates_copy_no_message_loss(
 
     async def fail_first_eval(script: str, numkeys: int, *args: Any) -> Any:
         nonlocal attempts
-        if numkeys == 1 and args and args[0] == stream:
+        if numkeys >= 1 and args and args[0] == stream:
             attempts += 1
             if attempts == 1:
                 raise ConnectionError("simulated crash during requeue")
@@ -550,7 +550,7 @@ async def test_cancellation_keeps_heartbeat_until_handlers_drain(
         release.set()
         try:
             await task
-        except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError, Exception:
             pass
         if consumer.executor is not None:
             consumer.executor.shutdown(wait=False)

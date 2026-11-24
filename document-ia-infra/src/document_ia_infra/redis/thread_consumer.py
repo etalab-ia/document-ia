@@ -5,7 +5,7 @@ Consommateur Redis Stream multi-thread (ThreadConsumer).
 import asyncio
 import functools
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
@@ -67,6 +67,8 @@ class ThreadConsumer(BaseConsumer[T]):
         on_terminal_failure: (
             Callable[[str, dict[str, Any], str], Coroutine[Any, Any, None]] | None
         ) = None,
+        retry_backoff_delays_s: Sequence[float] = (0.0, 1.0, 10.0),
+        delayed_retry_poll_interval_s: float = 0.5,
     ) -> None:
         if worker_number < 1:
             raise ValueError("worker_number must be >= 1")
@@ -96,6 +98,8 @@ class ThreadConsumer(BaseConsumer[T]):
             use_execution_lease=use_execution_lease,
             lease_ttl_ms=lease_ttl_ms,
             on_terminal_failure=on_terminal_failure,
+            retry_backoff_delays_s=retry_backoff_delays_s,
+            delayed_retry_poll_interval_s=delayed_retry_poll_interval_s,
         )
 
     @property

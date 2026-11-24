@@ -12,7 +12,7 @@ import socket
 import time
 from abc import ABC, abstractmethod
 from asyncio import Task
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Generic, TypeVar, cast
@@ -122,6 +122,8 @@ class BaseConsumer(ABC, Generic[T]):
         on_terminal_failure: (
             Callable[[str, dict[str, Any], str], Coroutine[Any, Any, None]] | None
         ) = None,
+        retry_backoff_delays_s: Sequence[float] = (0.0, 1.0, 10.0),
+        delayed_retry_poll_interval_s: float = 0.5,
     ) -> None:
         if max_retry_number < 1:
             raise ValueError("max_retry_number must be >= 1")
@@ -139,12 +141,20 @@ class BaseConsumer(ABC, Generic[T]):
             raise ValueError("step_progress_timeout_s must be > 0")
         if lease_ttl_ms is not None and lease_ttl_ms <= 0:
             raise ValueError("lease_ttl_ms must be > 0")
+        if delayed_retry_poll_interval_s <= 0:
+            raise ValueError("delayed_retry_poll_interval_s must be > 0")
+        validated_backoff_delays: list[float] = []
+        for delay in retry_backoff_delays_s:
+            if delay < 0.0:
+                raise ValueError("retry_backoff_delays_s elements must be >= 0.0")
+            validated_backoff_delays.append(float(delay))
 
         self.redis: Redis | None = None
         self._custom_redis_manager = current_redis_manager
         self.listener_task: Task[Any] | None = None
         self.reclaimer_task: Task[Any] | None = None
         self.heartbeat_task: Task[Any] | None = None
+        self.delayed_retry_task: Task[Any] | None = None
         self.stop_flag = asyncio.Event()
 
         self.consumer_name = consumer_name
@@ -157,6 +167,8 @@ class BaseConsumer(ABC, Generic[T]):
         self.block_time = block_time  # en ms pour xreadgroup
         self.max_in_flight = max_in_flight
         self.max_retry_number = max_retry_number
+        self.retry_backoff_delays_s: tuple[float, ...] = tuple(validated_backoff_delays)
+        self.delayed_retry_poll_interval_s = float(delayed_retry_poll_interval_s)
         self.start_from = start_from
         self._reclaim_idle_ms_override = reclaim_idle_ms
         self.reclaim_batch_size = (
@@ -267,10 +279,15 @@ class BaseConsumer(ABC, Generic[T]):
         self._heartbeat_interval_s_override = value
 
     def is_healthy(self) -> bool:
-        """Indique si les trois tâches de fond du consommateur sont actives."""
+        """Indique si les quatre tâches de fond du consommateur sont actives."""
         if self.stop_flag.is_set():
             return False
-        tasks = (self.listener_task, self.reclaimer_task, self.heartbeat_task)
+        tasks = (
+            self.listener_task,
+            self.reclaimer_task,
+            self.heartbeat_task,
+            self.delayed_retry_task,
+        )
         return all(t is not None and not t.done() for t in tasks)
 
     def _prepare_execution_resources(self) -> None:
@@ -325,7 +342,12 @@ class BaseConsumer(ABC, Generic[T]):
             return
         if any(
             t is not None and not t.done()
-            for t in (self.listener_task, self.reclaimer_task, self.heartbeat_task)
+            for t in (
+                self.listener_task,
+                self.reclaimer_task,
+                self.heartbeat_task,
+                self.delayed_retry_task,
+            )
         ):
             await self._stop_tasks_only()
 
@@ -360,6 +382,10 @@ class BaseConsumer(ABC, Generic[T]):
             self._heartbeat_in_flight_entries(),
             name=f"consumer-heartbeat:{self.stream_name}",
         )
+        self.delayed_retry_task = asyncio.create_task(
+            self._delayed_retry_promotion_loop(),
+            name=f"consumer-delayed-retry:{self.stream_name}",
+        )
         logger.info(
             "%s started in background (stream='%s', group='%s', consumer='%s', max_in_flight=%d)",
             type(self).__name__,
@@ -375,7 +401,11 @@ class BaseConsumer(ABC, Generic[T]):
 
         worker_tasks = [
             t
-            for t in (self.listener_task, self.reclaimer_task)
+            for t in (
+                self.listener_task,
+                self.reclaimer_task,
+                self.delayed_retry_task,
+            )
             if t is not None and not t.done()
         ]
         if worker_tasks:
@@ -434,6 +464,7 @@ class BaseConsumer(ABC, Generic[T]):
         self.listener_task = None
         self.reclaimer_task = None
         self.heartbeat_task = None
+        self.delayed_retry_task = None
 
     async def stop(self) -> None:
         """Arrête proprement les tâches de fond en maintenant le battement pendant la vidange."""
@@ -473,6 +504,10 @@ class BaseConsumer(ABC, Generic[T]):
                 self.reclaimer_task = tg.create_task(
                     self._reclaim_pending_messages(),
                     name=f"reclaimer-{self.consumer_name}",
+                )
+                self.delayed_retry_task = tg.create_task(
+                    self._delayed_retry_promotion_loop(),
+                    name=f"delayed-retry-{self.consumer_name}",
                 )
                 self.listener_task = tg.create_task(
                     self._start_listening_messages(),
@@ -610,33 +645,10 @@ class BaseConsumer(ABC, Generic[T]):
 
                 # 1. Nettoyage des tâches terminées (ACK/DLQ)
                 done_futures = [f for f in active_futures if f.done()]
-
-                for fut in done_futures:
-                    msg_id, fields = active_futures.pop(fut)
-                    self._processing_futures.discard(fut)
-                    ctx = self._in_flight_contexts.pop(msg_id, None)
-                    # Un tracker avorté (bail expiré, arrêt) ne doit jamais être
-                    # acquitté comme un succès : la tentative a été fencée, sa
-                    # persistance sautée. La laisser dans la PEL la rend récupérable.
-                    if ctx is not None and (ctx.handled or ctx.tracker.is_aborted):
-                        self._in_flight_ids.discard(msg_id)
-                        continue
-                    try:
-                        await self._handle_finished_future(
-                            fut, msg_id, fields, redis_conn
-                        )
-                    finally:
-                        if (
-                            self.use_execution_lease
-                            and ctx is not None
-                            and ctx.execution_id
-                            and ctx.lease_token
-                        ):
-                            with contextlib.suppress(Exception):
-                                await self.delivery.release_lease(
-                                    redis_conn, ctx.execution_id, ctx.lease_token
-                                )
-                        self._in_flight_ids.discard(msg_id)
+                if done_futures:
+                    await self._finalize_done_futures(
+                        done_futures, active_futures, redis_conn
+                    )
 
                 # 2. Calcul de la capacité restante
                 running_count = len(active_futures)
@@ -920,15 +932,30 @@ class BaseConsumer(ABC, Generic[T]):
                 continue
             msg_id, fields = popped
             ctx = self._in_flight_contexts.pop(msg_id, None)
-            # Idem dans le drain : un tracker avorté n'est jamais acquitté en succès.
+            # Un tracker avorté (bail expiré, arrêt) ne doit jamais être
+            # acquitté comme un succès : la tentative a été fencée, sa
+            # persistance sautée. La laisser dans la PEL la rend récupérable.
             if ctx is not None and (ctx.handled or ctx.tracker.is_aborted):
                 self._in_flight_ids.discard(msg_id)
                 continue
+            lease_released = False
             try:
+                if (
+                    self.use_execution_lease
+                    and ctx is not None
+                    and ctx.execution_id
+                    and ctx.lease_token
+                ):
+                    with contextlib.suppress(Exception):
+                        await self.delivery.release_lease(
+                            redis_conn, ctx.execution_id, ctx.lease_token
+                        )
+                    lease_released = True
                 await self._handle_finished_future(fut, msg_id, fields, redis_conn)
             finally:
                 if (
-                    self.use_execution_lease
+                    not lease_released
+                    and self.use_execution_lease
                     and ctx is not None
                     and ctx.execution_id
                     and ctx.lease_token
@@ -1146,14 +1173,22 @@ class BaseConsumer(ABC, Generic[T]):
             )
             return False
 
+    def _get_retry_backoff_delay_s(self, attempts: int) -> float:
+        if not self.retry_backoff_delays_s:
+            return 0.0
+        index = min(max(attempts - 1, 0), len(self.retry_backoff_delays_s) - 1)
+        return float(self.retry_backoff_delays_s[index])
+
     async def _requeue_once(
         self,
         redis_connection: Redis,
         msg_id: str,
         data_or_fields: str | dict[str, Any],
         attempts: int,
+        *,
+        immediate: bool = False,
     ) -> bool:
-        """Remet une entrée en file de façon atomique et idempotente via Lua.
+        """Remet une entrée en file (immédiate ou différée via ZSET) de façon atomique et idempotente via Lua.
 
         Retourne True si l'opération a réussi (copie créée ou déjà présente) ;
         lève une exception sur erreur Redis afin que l'appelant laisse l'entrée
@@ -1166,8 +1201,61 @@ class BaseConsumer(ABC, Generic[T]):
         else:
             fields = data_or_fields
         requeued_fields = self._build_requeue_fields(fields, msg_id, attempts)
-        return await self.delivery.requeue(
-            redis_connection, msg_id, requeued_fields, attempts
+        delay_s = 0.0 if immediate else self._get_retry_backoff_delay_s(attempts)
+        if delay_s <= 0.0:
+            return await self.delivery.requeue(
+                redis_connection, msg_id, requeued_fields, attempts
+            )
+        due_at_ms = int(time.time() * 1000) + int(delay_s * 1000)
+        execution_id = self._extract_execution_id(None, requeued_fields)
+        scheduled = await self.delivery.schedule_delayed_retry(
+            redis_connection, msg_id, requeued_fields, attempts, due_at_ms
+        )
+        logger.info(
+            "Scheduled delayed retry stream='%s' msg_id=%s execution_id=%s retries=%d delay_s=%.3f",
+            self.stream_name,
+            msg_id,
+            execution_id or "unknown",
+            attempts,
+            delay_s,
+        )
+        return scheduled
+
+    async def _delayed_retry_promotion_loop(self) -> None:
+        """Promeut périodiquement les messages arrivés à échéance depuis le ZSET de retry différé."""
+        logger.info(
+            "Delayed retry promoter task started (stream='%s', poll_interval=%.3fs)",
+            self.stream_name,
+            self.delayed_retry_poll_interval_s,
+        )
+        while not self.stop_flag.is_set():
+            try:
+                redis_conn = await self._ensure_connection()
+                if redis_conn is None:
+                    await self._sleep_unless_stopped(2.0)
+                    continue
+                now_ms = int(time.time() * 1000)
+                promoted_count = await self.delivery.promote_due_retries(
+                    redis_conn, now_ms=now_ms, batch_size=100
+                )
+                if promoted_count > 0:
+                    logger.info(
+                        "Promoted delayed retries stream='%s' promoted_count=%d",
+                        self.stream_name,
+                        promoted_count,
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self._invalidate_connection_on_transport_error(exc)
+                logger.warning(
+                    "Delayed retry promotion failed for stream='%s': %s",
+                    self.stream_name,
+                    type(exc).__name__,
+                )
+            await self._sleep_unless_stopped(self.delayed_retry_poll_interval_s)
+        logger.info(
+            "Delayed retry promoter task stopped (stream='%s')", self.stream_name
         )
 
     def _worker_tasks_done(self) -> bool:
@@ -1444,7 +1532,7 @@ class BaseConsumer(ABC, Generic[T]):
             )
             try:
                 requeued = await self._requeue_once(
-                    redis_conn, msg_id, ctx.fields, attempts
+                    redis_conn, msg_id, ctx.fields, attempts, immediate=True
                 )
                 if requeued:
                     await self.delivery.ack(redis_conn, msg_id)
@@ -1676,7 +1764,9 @@ class BaseConsumer(ABC, Generic[T]):
             return
 
         try:
-            await self._requeue_once(redis_connection, msg_id, fields, attempts)
+            await self._requeue_once(
+                redis_connection, msg_id, fields, attempts, immediate=True
+            )
             try:
                 await self.delivery.ack(redis_connection, msg_id)
                 logger.info("Acknowledged reclaimed message %s", msg_id)
