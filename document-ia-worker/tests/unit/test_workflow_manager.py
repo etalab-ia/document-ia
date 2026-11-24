@@ -600,3 +600,51 @@ class TestWorkflowManager:
 
             mock_notify.assert_not_awaited()
             mock_purge_s3.assert_not_awaited()
+
+    def test_worker_db_semaphore_defaults_to_redis_worker_number_and_respects_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from document_ia_infra.data.data_settings import database_settings
+        from document_ia_infra.redis.redis_settings import redis_settings
+        from document_ia_worker.core.db_semaphore import (
+            _get_worker_db_semaphore,
+            get_effective_worker_db_max_connections,
+            reset_worker_db_semaphore,
+        )
+
+        try:
+            # Case 1: WORKER_DB_MAX_CONNECTIONS is None -> falls back to REDIS_WORKER_NUMBER
+            monkeypatch.setattr(database_settings, "WORKER_DB_MAX_CONNECTIONS", None)
+            monkeypatch.setattr(redis_settings, "REDIS_WORKER_NUMBER", 7)
+            reset_worker_db_semaphore()
+
+            assert get_effective_worker_db_max_connections() == 7
+            sem_default = _get_worker_db_semaphore()
+            acquired = 0
+            try:
+                for _ in range(7):
+                    assert sem_default.acquire(blocking=False) is True
+                    acquired += 1
+                assert sem_default.acquire(blocking=False) is False
+            finally:
+                for _ in range(acquired):
+                    sem_default.release()
+
+            # Case 2: WORKER_DB_MAX_CONNECTIONS is explicitly set -> takes precedence
+            monkeypatch.setattr(database_settings, "WORKER_DB_MAX_CONNECTIONS", 2)
+            monkeypatch.setattr(redis_settings, "REDIS_WORKER_NUMBER", 10)
+            reset_worker_db_semaphore()
+
+            assert get_effective_worker_db_max_connections() == 2
+            sem_override = _get_worker_db_semaphore()
+            acquired = 0
+            try:
+                for _ in range(2):
+                    assert sem_override.acquire(blocking=False) is True
+                    acquired += 1
+                assert sem_override.acquire(blocking=False) is False
+            finally:
+                for _ in range(acquired):
+                    sem_override.release()
+        finally:
+            reset_worker_db_semaphore()
