@@ -412,6 +412,9 @@ class WorkflowManager:
             workflow_version = (
                 workflow_version_raw if isinstance(workflow_version_raw, int) else 1
             )
+            if self.main_workflow_context is not None:
+                self.main_workflow_context.organization_id = event_dto.organization_id
+                self.main_workflow_context.workflow_version = workflow_version
 
             workflow_v1: Optional[WorkflowDTO] = None
             workflow_v2 = None
@@ -429,9 +432,6 @@ class WorkflowManager:
                 raise WorkflowNotFoundException(self.message.workflow_execution_id)
 
             self.workflow = workflow_v1
-
-            if self.main_workflow_context is not None:
-                self.main_workflow_context.organization_id = event_dto.organization_id
 
             return False
         except Exception as e:
@@ -673,6 +673,27 @@ class WorkflowManager:
             else self.event_dto.workflow_id
         )
 
+        raw_version = self.event_dto.event.get("version")
+        fallback_version = (
+            raw_version
+            if (
+                isinstance(raw_version, int)
+                and not isinstance(raw_version, bool)
+                and raw_version in (1, 2)
+            )
+            else 1
+        )
+        workflow_version = (
+            self.main_workflow_context.workflow_version
+            if (
+                self.main_workflow_context is not None
+                and isinstance(self.main_workflow_context.workflow_version, int)
+                and not isinstance(self.main_workflow_context.workflow_version, bool)
+                and self.main_workflow_context.workflow_version in (1, 2)
+            )
+            else fallback_version
+        )
+
         await EventStoreService(db).emit_workflow_failed(
             workflow_id=workflow_id,
             execution_id=self.event_dto.execution_id,
@@ -681,6 +702,7 @@ class WorkflowManager:
             error_message=final_error_message,
             failed_step=final_failed_step,
             retry_count=self.retry_count,
+            workflow_version=workflow_version,
         )
 
     def _cleanup_execution_sandbox(self, context_label: str) -> bool:
