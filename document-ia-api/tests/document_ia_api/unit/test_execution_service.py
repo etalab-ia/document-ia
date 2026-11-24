@@ -671,3 +671,169 @@ async def test_get_execution_route_raises_503_on_retryable_db_error(
 
     assert exc_info.value.status_code == 503
     assert exc_info.value.headers == {"Retry-After": "5"}
+
+
+@pytest.mark.asyncio
+async def test_get_execution_does_not_return_503_on_non_transient_or_local_file_errors(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import HTTPException
+    from sqlalchemy.exc import DataError, ProgrammingError
+    from document_ia_api.api.routes.v1 import executions as executions_route
+    from document_ia_infra.data.organization.dto.organization_dto import (
+        OrganizationDTO,
+    )
+    from document_ia_infra.data.organization.enum.platform_role import PlatformRole
+
+    # 1. ApiKeyService must NOT return 503 on DataError / ProgrammingError
+    monkeypatch.setattr(
+        ApiKeyService, "get_from_presented_key", _REAL_GET_FROM_PRESENTED_KEY
+    )
+    api_key_service = ApiKeyService(db_session)
+    api_key_service.api_key_helper.get_key_prefix = MagicMock(return_value="ABCDEFGH")
+    presented_key = "dia_dev_2_ABCDEFGH_" + "A" * 44 + "_AAAA"
+
+    for non_transient_exc in (
+        DataError("SELECT 1", {}, ValueError("invalid UTF-8 byte sequence")),
+        ProgrammingError("SELECT bad_col", {}, RuntimeError("undefined column")),
+    ):
+        api_key_service.api_key_repository.get_by_prefix_with_relation = AsyncMock(
+            side_effect=non_transient_exc
+        )
+        result = await api_key_service.get_from_presented_key(presented_key)
+        assert result is None
+
+    # 2. get_execution must NOT return 503 on DataError / ProgrammingError (and must not leak str(e))
+    org = OrganizationDTO(
+        id=uuid4(),
+        name="Test Org",
+        contact_email="test@example.com",
+        platform_role=PlatformRole.STANDARD,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    for non_transient_exc in (
+        DataError("SELECT 1", {"secret": "LEAK"}, ValueError("invalid byte sequence")),
+        ProgrammingError("SELECT bad_col", {}, RuntimeError("undefined column")),
+    ):
+
+        class _NonTransientEventStoreService:
+            def __init__(self, _session: Any) -> None:
+                pass
+
+            async def get_last_event_for_execution_id(
+                self, _exec_id: str, exc: Exception = non_transient_exc
+            ) -> Any:
+                raise exc
+
+        monkeypatch.setattr(
+            executions_route, "EventStoreService", _NonTransientEventStoreService
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            await executions_route.get_execution(
+                execution_id="exec-123",
+                organization=org,
+                db_session=db_session,
+                is_debug_mode=False,
+            )
+
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.detail == "Internal server error"
+
+    # 3. get_execution must NOT return 503 on local FileNotFoundError (OSError) from workflow_repository
+    started_dto = EventDTO(
+        id=uuid4(),
+        workflow_id="wf-1",
+        execution_id="exec-123",
+        organization_id=org.id,
+        created_at=datetime.now(UTC),
+        event_type=EventType.WORKFLOW_EXECUTION_STARTED,
+        event={"version": 1},
+    )
+
+    class _OkEventStoreService:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_last_event_for_execution_id(self, _exec_id: str) -> EventDTO:
+            return started_dto
+
+    monkeypatch.setattr(executions_route, "EventStoreService", _OkEventStoreService)
+    monkeypatch.setattr(
+        executions_route.workflow_repository,
+        "get_workflow_by_id",
+        AsyncMock(side_effect=FileNotFoundError("workflows.json missing")),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await executions_route.get_execution(
+            execution_id="exec-123",
+            organization=org,
+            db_session=db_session,
+            is_debug_mode=False,
+        )
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Internal server error"
+
+
+@pytest.mark.asyncio
+async def test_verify_api_key_returns_rfc7807_503_problem_detail_on_db_outage(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from sqlalchemy.exc import OperationalError
+
+    from document_ia_api.api.exceptions.handler.exception_handlers import (
+        setup_exception_handlers,
+    )
+    from document_ia_api.api.routes.v1 import executions as executions_route
+    import inspect
+    from document_ia_api.api.auth import verify_api_key
+
+    monkeypatch.setattr(
+        ApiKeyService, "get_from_presented_key", _REAL_GET_FROM_PRESENTED_KEY
+    )
+
+    failing_session = AsyncMock(spec=AsyncSession)
+    failing_session.execute = AsyncMock(
+        side_effect=OperationalError("SELECT 1", {}, Exception("db unreachable"))
+    )
+    failing_session.rollback = AsyncMock()
+
+    async def _override_get_db():
+        yield failing_session
+
+    db_dep = (
+        inspect.signature(verify_api_key).parameters["db_session"].default.dependency
+    )
+    test_app = FastAPI()
+    setup_exception_handlers(test_app)
+    test_app.include_router(executions_route.router, prefix="/api/v1")
+    test_app.dependency_overrides[db_dep] = _override_get_db
+
+    # Valid v2 key format so ApiKeyHelper.get_key_prefix succeeds and hits the DB
+    monkeypatch.setattr(
+        "document_ia_api.application.services.api_key.api_key_helper.ApiKeyHelper.get_key_prefix",
+        lambda _self, _key: "ABCDEFGH",
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=test_app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/api/v1/executions/exec-123",
+            headers={"X-API-KEY": "dia_dev_2_ABCDEFGH_" + "A" * 44 + "_AAAA"},
+        )
+
+    assert response.status_code == 503
+    assert response.headers.get("retry-after") == "5"
+    body = response.json()
+    assert body["status"] == 503
+    assert isinstance(body["type"], str) and len(body["type"]) > 0
+    assert "code" in body
+    assert "title" in body
+    assert body["instance"] == "/api/v1/executions/exec-123"

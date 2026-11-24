@@ -1,5 +1,3 @@
-import contextlib
-import inspect
 import logging
 from datetime import datetime, UTC
 from typing import Optional, Any
@@ -11,7 +9,10 @@ from document_ia_infra.data.event.schema.workflow.workflow_execution_completed_e
     CompletedEventResult,
 )
 from document_ia_infra.service.event_store_service import EventStoreService
-from document_ia_worker.core.db_semaphore import acquire_worker_db_slot
+from document_ia_worker.core.db_semaphore import (
+    acquire_worker_db_slot,
+    close_session_safely,
+)
 from document_ia_worker.workflow.main_workflow_context import (
     MainWorkflowContext,
     StepMetadata,
@@ -104,13 +105,12 @@ class SaveWorkflowResultStep(BaseStep[None]):
                         ),
                     )
                 finally:
-                    close_fn = getattr(self.database_session, "close", None)
-                    if callable(close_fn):
-                        with contextlib.suppress(Exception):
-                            maybe_coro = close_fn()
-                            if inspect.isawaitable(maybe_coro):
-                                await maybe_coro
+                    await close_session_safely(self.database_session)
             return None, None
         except Exception as e:
-            logger.error(f"Error during saving workflow result: {e}")
+            logger.error(
+                "Error during saving workflow result for execution %s: %s",
+                self.execution_id,
+                type(e).__name__,
+            )
             raise

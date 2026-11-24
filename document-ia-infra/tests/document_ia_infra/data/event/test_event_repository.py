@@ -785,3 +785,173 @@ class TestGetCreatedEventIfExecutionNotCompletedOrFailed:
             assert isinstance(dbm.async_engine.pool, NullPool)
         finally:
             await dbm.dispose_async()
+
+
+class TestEventRepositoryResilienceAndSecurity:
+    """Security and resilience tests for EventRepository and DatabaseSettings."""
+
+    async def test_transient_db_error_does_not_leak_sql_parameters_in_logs_or_exception(
+        self, event_repository, mock_session, caplog
+    ):
+        import logging
+        from sqlalchemy.exc import DataError, IntegrityError, OperationalError
+
+        pii_sample = "jean-dupont-pii-sample"
+        secret_s3 = "s3://bucket/private/secret_cni.pdf"
+        params = {"event": {"pii": pii_sample, "s3_key": secret_s3}}
+
+        op_exc = OperationalError(
+            "INSERT INTO event_store (event) VALUES (%(event)s)",
+            params,
+            Exception("connection lost"),
+        )
+        assert pii_sample in str(op_exc)
+
+        mock_session.flush.side_effect = op_exc
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(RetryableException) as exc_info:
+                await event_repository.put_event(
+                    workflow_id="wf_1",
+                    organization_id=uuid4(),
+                    execution_id="exec_pii_1",
+                    event_type=EventType.WORKFLOW_EXECUTION_COMPLETED.value,
+                    event_data={"pii": pii_sample},
+                )
+
+        assert pii_sample not in str(exc_info.value)
+        assert secret_s3 not in str(exc_info.value)
+        assert pii_sample not in caplog.text
+        assert secret_s3 not in caplog.text
+        assert "OperationalError" in str(exc_info.value)
+
+        # Also verify IntegrityError and non-transient DataError do not leak SQL params in logs
+        caplog.clear()
+        mock_session.flush.side_effect = IntegrityError(
+            "INSERT INTO event_store (event) VALUES (%(event)s)",
+            params,
+            Exception("duplicate key"),
+        )
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(IntegrityError):
+                await event_repository.put_event(
+                    workflow_id="wf_1",
+                    organization_id=uuid4(),
+                    execution_id="exec_pii_2",
+                    event_type=EventType.WORKFLOW_EXECUTION_STARTED.value,
+                    event_data={"pii": pii_sample},
+                )
+        assert pii_sample not in caplog.text
+        assert secret_s3 not in caplog.text
+
+        caplog.clear()
+        mock_session.execute.side_effect = DataError(
+            "SELECT * FROM event_store WHERE execution_id = %(id)s",
+            {"id": pii_sample},
+            Exception("invalid byte sequence for encoding UTF8"),
+        )
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(DataError):
+                await event_repository.get_last_event_by_execution_id("exec_pii_3")
+        assert pii_sample not in caplog.text
+
+    async def test_non_transient_db_errors_are_not_wrapped_as_retryable(
+        self, event_repository, mock_session
+    ):
+        from sqlalchemy.exc import (
+            DBAPIError,
+            DataError,
+            OperationalError,
+            ProgrammingError,
+        )
+        from document_ia_infra.data.event.repository.event import is_transient_db_error
+
+        data_err = DataError("SELECT 1", {}, ValueError("invalid input syntax"))
+        prog_err = ProgrammingError("SELECT bad_col", {}, RuntimeError("undefined col"))
+        non_transient_dbapi = DBAPIError(
+            "SELECT bad_col",
+            {},
+            RuntimeError("syntax error"),
+            connection_invalidated=False,
+        )
+
+        for non_transient in (data_err, prog_err, non_transient_dbapi):
+            assert is_transient_db_error(non_transient) is False
+            mock_session.execute.side_effect = non_transient
+            with pytest.raises(type(non_transient)):
+                await event_repository.get_last_event_by_execution_id("exec_non_trans")
+
+        # DBAPIError with connection_invalidated=True IS transient
+        invalidated_dbapi = DBAPIError(
+            "SELECT 1",
+            {},
+            RuntimeError("connection dropped"),
+            connection_invalidated=True,
+        )
+        assert is_transient_db_error(invalidated_dbapi) is True
+
+        # Recursive inspection through __cause__ and PostgreSQL transient SQLSTATEs
+        wrapped = RetryableException("outer")
+        wrapped.__cause__ = OperationalError("SELECT 1", {}, Exception("down"))
+        assert is_transient_db_error(wrapped) is True
+
+        class _PgSqlStateError(Exception):
+            def __init__(self, sqlstate: str) -> None:
+                super().__init__("pg error")
+                self.sqlstate = sqlstate
+
+        for code in ("08006", "53300", "57P01", "40001", "40P01"):
+            assert (
+                is_transient_db_error(
+                    DBAPIError(
+                        "SELECT 1",
+                        {},
+                        _PgSqlStateError(code),
+                        connection_invalidated=False,
+                    )
+                )
+                is True
+            )
+
+        assert (
+            is_transient_db_error(
+                DBAPIError(
+                    "SELECT 1",
+                    {},
+                    _PgSqlStateError("22P02"),
+                    connection_invalidated=False,
+                )
+            )
+            is False
+        )
+
+        # Anti-cycle guard
+        cycle_a = RuntimeError("a")
+        cycle_b = RuntimeError("b")
+        cycle_a.__cause__ = cycle_b
+        cycle_b.__cause__ = cycle_a
+        assert is_transient_db_error(cycle_a) is False
+
+    def test_database_settings_pool_bounds_validation(self):
+        from pydantic import ValidationError
+        from document_ia_infra.data.data_settings import DatabaseSettings
+
+        valid = DatabaseSettings(
+            DB_POOL_SIZE=1,
+            DB_MAX_OVERFLOW=0,
+            WORKER_DB_MAX_CONNECTIONS=None,
+        )
+        assert valid.DB_POOL_SIZE == 1
+        assert valid.DB_MAX_OVERFLOW == 0
+        assert valid.WORKER_DB_MAX_CONNECTIONS is None
+
+        valid_override = DatabaseSettings(WORKER_DB_MAX_CONNECTIONS=4)
+        assert valid_override.WORKER_DB_MAX_CONNECTIONS == 4
+
+        with pytest.raises(ValidationError):
+            DatabaseSettings(DB_POOL_SIZE=0)
+
+        with pytest.raises(ValidationError):
+            DatabaseSettings(DB_MAX_OVERFLOW=-1)
+
+        with pytest.raises(ValidationError):
+            DatabaseSettings(WORKER_DB_MAX_CONNECTIONS=0)

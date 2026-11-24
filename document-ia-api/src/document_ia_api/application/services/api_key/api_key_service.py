@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 from pydantic import SecretStr
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from document_ia_api.api.contracts.api_key.api_key import (
@@ -14,6 +14,9 @@ from document_ia_api.api.contracts.api_key.api_key import (
 )
 from document_ia_api.api.exceptions.entity_not_found_exception import (
     HttpEntityNotFoundException,
+)
+from document_ia_api.api.exceptions.service_unavailable_exception import (
+    database_unavailable,
 )
 from document_ia_api.application.services.api_key.api_key_helper import ApiKeyHelper
 from document_ia_api.application.services.api_key.mapper import (
@@ -130,33 +133,14 @@ class ApiKeyService:
             return None
         except HTTPException:
             raise
-        except (SQLAlchemyError, RetryableException, OSError, TimeoutError) as e:
-            logger.error("Database error while verifying API key: %s", type(e).__name__)
-            with contextlib.suppress(Exception):
-                await self.db_session.rollback()
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": "database_unavailable",
-                    "message": "Database temporarily unavailable",
-                },
-                headers={"Retry-After": "5"},
-            ) from e
         except Exception as e:
-            if is_transient_db_error(e):
+            if isinstance(e, RetryableException) or is_transient_db_error(e):
                 logger.error(
                     "Transient database error while verifying API key: %s",
                     type(e).__name__,
                 )
                 with contextlib.suppress(Exception):
                     await self.db_session.rollback()
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "error": "database_unavailable",
-                        "message": "Database temporarily unavailable",
-                    },
-                    headers={"Retry-After": "5"},
-                ) from e
+                raise database_unavailable() from e
             logger.error("Error verifying API key: %s", type(e).__name__)
             return None

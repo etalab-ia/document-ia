@@ -13,7 +13,6 @@ from document_ia_infra.exception.entity_not_found_exception import (
 from document_ia_infra.exception.retryable_exception import RetryableException
 from document_ia_infra.service.event_store_service import EventStoreService
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from document_ia_api.api.auth import verify_api_key, get_current_organization
@@ -30,6 +29,9 @@ from document_ia_api.api.contracts.execution.success import (
 )
 from document_ia_api.api.exceptions.entity_not_found_exception import (
     HttpEntityNotFoundException,
+)
+from document_ia_api.api.exceptions.service_unavailable_exception import (
+    database_unavailable,
 )
 from document_ia_api.application.services.execution_service import ExecutionService
 
@@ -203,6 +205,25 @@ router = APIRouter(prefix="/executions")
                 }
             },
         },
+        503: {
+            "model": ProblemDetail,
+            "description": "Service Unavailable (ProblemDetail) — database temporarily unavailable",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "type": "about:blank",
+                        "title": "Service Unavailable",
+                        "status": 503,
+                        "code": "http.service_unavailable",
+                        "detail": {
+                            "error": "database_unavailable",
+                            "message": "Database temporarily unavailable",
+                        },
+                        "instance": "/api/v1/executions/{execution_id}",
+                    }
+                }
+            },
+        },
     },
     tags=["Executions"],
 )
@@ -220,9 +241,23 @@ async def get_execution(
     event_store_service = EventStoreService(db_session)
     execution_service = ExecutionService()
     try:
-        last_event = await event_store_service.get_last_event_for_execution_id(
-            execution_id
-        )
+        try:
+            last_event = await event_store_service.get_last_event_for_execution_id(
+                execution_id
+            )
+        except Exception as e:
+            if isinstance(e, RetryableException) or is_transient_db_error(e):
+                logger.error(
+                    "Database unavailable while retrieving execution events",
+                    extra={
+                        "endpoint": "get_execution",
+                        "execution_id": execution_id,
+                        "error": type(e).__name__,
+                    },
+                )
+                raise database_unavailable() from e
+            raise
+
         if last_event.organization_id != organization.id:
             raise HTTPException(status_code=403, detail="Forbidden access to execution")
         workflow_version_raw = last_event.event.get("version")
@@ -257,47 +292,13 @@ async def get_execution(
         )
     except (HttpEntityNotFoundException, HTTPException) as e:
         raise e
-    except (RetryableException, SQLAlchemyError, OSError, TimeoutError) as e:
+    except Exception as e:
         logger.error(
-            "Database unavailable while retrieving execution events",
+            "Error retrieving execution events",
             extra={
                 "endpoint": "get_execution",
                 "execution_id": execution_id,
                 "error": type(e).__name__,
             },
         )
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "database_unavailable",
-                "message": "Database temporarily unavailable",
-            },
-            headers={"Retry-After": "5"},
-        ) from e
-    except Exception as e:
-        if is_transient_db_error(e):
-            logger.error(
-                "Transient database error while retrieving execution events",
-                extra={
-                    "endpoint": "get_execution",
-                    "execution_id": execution_id,
-                    "error": type(e).__name__,
-                },
-            )
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": "database_unavailable",
-                    "message": "Database temporarily unavailable",
-                },
-                headers={"Retry-After": "5"},
-            ) from e
-        logger.error(
-            "Error retrieving execution events",
-            extra={
-                "endpoint": "get_execution",
-                "execution_id": execution_id,
-                "error": str(e),
-            },
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
