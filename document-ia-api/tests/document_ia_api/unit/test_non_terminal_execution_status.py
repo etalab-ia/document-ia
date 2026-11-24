@@ -284,7 +284,7 @@ async def test_wait_for_execution_result_continues_polling_on_non_terminal_failu
     assert isinstance(result, ExecutionSuccessModel)
     assert result.status == ExecutionStatus.SUCCESS
     assert get_last_mock.await_count == 3
-    assert get_started_mock.await_count == 1
+    assert get_started_mock.await_count == 0
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import secrets
 import socket
@@ -141,12 +142,17 @@ class BaseConsumer(ABC, Generic[T]):
             raise ValueError("step_progress_timeout_s must be > 0")
         if lease_ttl_ms is not None and lease_ttl_ms <= 0:
             raise ValueError("lease_ttl_ms must be > 0")
-        if delayed_retry_poll_interval_s <= 0:
-            raise ValueError("delayed_retry_poll_interval_s must be > 0")
+        if (
+            not math.isfinite(delayed_retry_poll_interval_s)
+            or delayed_retry_poll_interval_s <= 0
+        ):
+            raise ValueError("delayed_retry_poll_interval_s must be finite and > 0")
         validated_backoff_delays: list[float] = []
         for delay in retry_backoff_delays_s:
-            if delay < 0.0:
-                raise ValueError("retry_backoff_delays_s elements must be >= 0.0")
+            if not math.isfinite(delay) or delay < 0.0:
+                raise ValueError(
+                    "retry_backoff_delays_s elements must be finite and >= 0.0"
+                )
             validated_backoff_delays.append(float(delay))
 
         self.redis: Redis | None = None

@@ -2,6 +2,7 @@ import logging
 from typing import Any, Optional
 
 from fastapi import HTTPException
+from pydantic import SecretStr
 
 from document_ia_api.api.contracts.execution.failed import (
     ExecutionFailedData,
@@ -73,7 +74,11 @@ class ExecutionService:
             data=ExecutionStartedData(
                 created_at=event_dto.created_at,
                 s3_file_info=file_info,
-                file_url=event_data.file_url,
+                file_url=(
+                    SecretStr(event_data.file_url)
+                    if event_data.file_url is not None
+                    else None
+                ),
             ),
             purged=is_purged,
         )

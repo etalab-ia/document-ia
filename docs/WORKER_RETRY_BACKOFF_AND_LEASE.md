@@ -75,17 +75,17 @@ In `BaseConsumer._finalize_done_futures`, the handler's `Future` has already com
 ### 4.2 Atomic Lua Scripts (`StreamDelivery`)
 
 1. **`schedule_delayed_retry` (`_SCHEDULE_DELAYED_RETRY_LUA`)**:
-   - **Keys**: `KEYS[1] = {stream}:retry_delayed`, `KEYS[2] = {stream}`.
-   - **Idempotence Guard**:
+   - **Keys**: `KEYS[1] = {stream}:retry_delayed` (ZSET of `original_id` scored by `due_at_ms`), `KEYS[2] = {stream}`, `KEYS[3] = {stream}:retry_delayed:payloads` (companion HASH mapping `original_id -> JSON fields`).
+   - **Idempotence Guard ($O(1)$ ZSET lookup)**:
      - Scans `KEYS[2]` (`XRANGE` from `original_id` to `+`) to verify the message has not already been promoted to the main stream.
-     - Scans `KEYS[1]` (`ZRANGE 0 -1`) to verify no entry with the same `original_id` is already scheduled in the ZSET.
-     - If absent from both, inserts the JSON-encoded payload into `KEYS[1]` with `score = due_at_ms` via `ZADD`.
+     - Checks `ZSCORE KEYS[1] original_id` in **$O(1)$** to verify no entry with the same `original_id` is already scheduled in the ZSET.
+     - If absent from both, writes `HSET KEYS[3] original_id payload_json` and `ZADD KEYS[1] due_at_ms original_id`.
    - Protects against duplicate scheduling if `XACK` fails after `schedule_delayed_retry` and the message is subsequently re-processed.
 
 2. **`promote_due_retries` (`_PROMOTE_DUE_RETRIES_LUA`)**:
-   - **Keys**: `KEYS[1] = {stream}:retry_delayed`, `KEYS[2] = {stream}`.
-   - Atomically queries `ZRANGEBYSCORE KEYS[1] -inf now_ms LIMIT 0 batch_size`, removes each due entry via `ZREM`, verifies no duplicate `original_id` exists in `KEYS[2]`, and appends the entry to `KEYS[2]` via `XADD`.
-   - Executed periodically (every `RETRY_DELAYED_POLL_INTERVAL_S = 0.5s`) by `_delayed_retry_promotion_loop` on all active consumers. Because the ZSET resides in Redis and promotion is atomic, delayed retries survive individual worker restarts without loss or duplication.
+   - **Keys**: `KEYS[1] = {stream}:retry_delayed`, `KEYS[2] = {stream}`, `KEYS[3] = {stream}:retry_delayed:payloads`.
+   - Atomically queries `ZRANGEBYSCORE KEYS[1] -inf now_ms LIMIT 0 batch_size`, removes each due `original_id` via `ZREM`, retrieves and deletes its JSON payload via `HGET`/`HDEL KEYS[3] original_id`, verifies no duplicate `original_id` exists in `KEYS[2]`, and appends the entry to `KEYS[2]` via `XADD`.
+   - Executed periodically (every `RETRY_DELAYED_POLL_INTERVAL_S = 0.5s`) by `_delayed_retry_promotion_loop` on all active consumers. Because the ZSET and companion HASH reside in Redis and promotion is atomic, delayed retries survive individual worker restarts without loss or duplication.
 
 ### 4.3 Configuration Settings (`RedisSettings`)
 
@@ -116,7 +116,7 @@ is_terminal: bool = Field(
 ### 5.2 API Status Resolution (`ExecutionService`, `executions.py`, `workflow_service.py`)
 
 - When the latest event in PostgreSQL is `WorkflowExecutionFailedEvent(is_terminal=False)`:
-  - `GET /api/v1/executions/{execution_id}` and `WorkflowService.wait_for_execution_completion` load the execution's `WorkflowExecutionStartedEvent` via `EventStoreService.get_workflow_started_event(execution_id)` and return `ExecutionStartedModel` (`status: "STARTED"`).
+  - `GET /api/v1/executions/{execution_id}` loads the execution's `WorkflowExecutionStartedEvent` via `EventStoreService.get_workflow_started_event(execution_id)` and returns `ExecutionStartedModel` (`status: "STARTED"`). `WorkflowService.wait_for_execution_result` projects the non-terminal failure directly as `ExecutionStartedModel` (`status: "STARTED"`) without an extra SQL lookup and keeps polling.
   - The public API contract (`STARTED | SUCCESS | FAILED`) remains 100% backward-compatible with zero breaking changes.
 - When `WorkflowExecutionFailedEvent(is_terminal=True)` is recorded (non-retryable error, exhausted retries `is_last_retry=True`, or watchdog terminal timeout):
   - S3 temporary files are purged, organization webhooks are notified, and the API returns `ExecutionFailedModel` (`status: "FAILED"`).
