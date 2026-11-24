@@ -98,6 +98,7 @@ async def test_event_store_service_propagates_is_terminal() -> None:
         error_message="429",
         is_terminal=False,
     )
+    assert service.store_event.await_args is not None
     stored_arg = service.store_event.await_args.args[0]
     assert isinstance(stored_arg, WorkflowExecutionFailedEvent)
     assert stored_arg.is_terminal is False
@@ -130,6 +131,8 @@ def _make_entity(
         ({"error_type": "ValueError", "is_terminal": True}, False),
         # Legacy without is_terminal + RetryableException -> resumable
         ({"error_type": "RetryableException"}, True),
+        # Null is_terminal + RetryableException -> resumable (aligned with WorkflowManager._is_terminal_event)
+        ({"error_type": "RetryableException", "is_terminal": None}, True),
         # Legacy without is_terminal + non-retryable -> NOT resumable
         ({"error_type": "ValueError"}, False),
     ],

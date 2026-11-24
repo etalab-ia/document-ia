@@ -203,9 +203,7 @@ class TestWorkflowManager:
             yield
 
         event_repository = MagicMock()
-        event_repository.get_last_event_by_execution_id = AsyncMock(
-            return_value=None
-        )
+        event_repository.get_last_event_by_execution_id = AsyncMock(return_value=None)
         event_repository.get_started_event_by_execution_id = AsyncMock(
             return_value=None
         )
@@ -377,11 +375,11 @@ class TestWorkflowManager:
                     "_prepare_workflow",
                     side_effect=ValueError("terminal failure"),
                 ),
+                patch.object(manager, "_save_failure_event", new_callable=AsyncMock),
                 patch.object(
-                    manager, "_save_failure_event", new_callable=AsyncMock
-                ),
-                patch.object(
-                    manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+                    manager,
+                    "_notify_webhook_execution_finished",
+                    new_callable=AsyncMock,
                 ),
                 patch.object(
                     manager, "_purge_s3_file_for_execution", new_callable=AsyncMock

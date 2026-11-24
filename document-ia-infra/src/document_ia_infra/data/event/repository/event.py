@@ -288,7 +288,7 @@ class EventRepository:
             elif last_event.event_type == EventType.WORKFLOW_EXECUTION_FAILED and (
                 last_event.event.get("is_terminal") is False
                 or (
-                    "is_terminal" not in last_event.event
+                    not isinstance(last_event.event.get("is_terminal"), bool)
                     and last_event.event.get("error_type")
                     == RetryableException.__name__
                 )

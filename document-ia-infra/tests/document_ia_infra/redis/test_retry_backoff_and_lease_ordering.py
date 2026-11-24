@@ -412,6 +412,32 @@ async def test_redis_schedule_delayed_retry_idempotence_and_requeue_guard(
 
 
 @pytest.mark.asyncio
+async def test_redis_promote_due_retries_with_non_stream_id_format(
+    redis_client: Redis, stream: str
+) -> None:
+    """QUAL-02: promote_due_retries promotes without error even if entry_id is not '<ms>-<seq>'."""
+    delivery = StreamDelivery(stream, "grp-non-stream-id", "c1")
+    synthetic_id = "synthetic-entry-id-not-ms-seq"
+    fields = {
+        "data": json.dumps({"workflow_execution_id": "exec-synthetic"}),
+    }
+    due_at_ms = int(time.time() * 1000) - 10
+
+    assert await delivery.schedule_delayed_retry(
+        redis_client, synthetic_id, fields, retries=2, due_at_ms=due_at_ms
+    )
+    assert await redis_client.zcard(delivery.delayed_retry_key) == 1
+
+    promoted = await delivery.promote_due_retries(
+        redis_client, now_ms=due_at_ms + 20, batch_size=10
+    )
+    assert promoted == 1
+    assert await redis_client.zcard(delivery.delayed_retry_key) == 0
+    assert await redis_client.hlen(delivery.delayed_retry_payloads_key) == 0
+    assert await redis_client.xlen(stream) == 1
+
+
+@pytest.mark.asyncio
 async def test_redis_promote_due_retries_concurrent_multi_worker_atomicity(
     redis_client: Redis, stream: str
 ) -> None:

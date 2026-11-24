@@ -19,10 +19,14 @@ from document_ia_infra.data.event.schema.mappers.event_mapper import decode_even
 from document_ia_infra.data.event.schema.workflow.workflow_execution_started_event import (
     WorkflowExecutionStartedEvent,
 )
+from document_ia_infra.exception.retryable_exception import RetryableException
 
 
 def _started_event_dto(
-    execution_id: str, organization_id: UUID, workflow_id: str = "wf-1"
+    execution_id: str,
+    organization_id: UUID,
+    workflow_id: str = "wf-1",
+    anonymization_status: AnonymizationStatus = AnonymizationStatus.PENDING,
 ) -> EventDTO:
     now = datetime(2026, 11, 24, 12, 0, 0, tzinfo=UTC)
     return EventDTO(
@@ -52,7 +56,7 @@ def _started_event_dto(
             "classification_parameters": {},
             "extraction_parameters": {},
         },
-        anonymization_status=AnonymizationStatus.PENDING,
+        anonymization_status=anonymization_status,
     )
 
 
@@ -144,6 +148,32 @@ def test_execution_service_non_terminal_failed_with_started_event_returns_starte
     assert model.data.created_at == started_dto.created_at
     assert model.data.s3_file_info is not None
     assert model.data.s3_file_info.file_name == "invoice.pdf"
+    assert model.purged is False
+
+
+def test_execution_service_non_terminal_failed_propagates_started_event_purged_flag() -> (
+    None
+):
+    service = ExecutionService()
+    org_id = uuid4()
+    exec_id = "exec-non-terminal-purged"
+    started_dto = _started_event_dto(
+        exec_id,
+        org_id,
+        anonymization_status=AnonymizationStatus.DONE,
+    )
+    failed_dto = _failed_event_dto(exec_id, org_id, is_terminal=False)
+
+    model = service.get_event_model(
+        failed_dto,
+        exec_id,
+        is_debug_mode=False,
+        started_event_dto=started_dto,
+    )
+
+    assert isinstance(model, ExecutionStartedModel)
+    assert model.status == ExecutionStatus.STARTED
+    assert model.purged is True
 
 
 def test_execution_service_non_terminal_failed_without_started_event_fallback() -> None:
@@ -216,6 +246,37 @@ def test_get_execution_route_projects_non_terminal_failure_as_started(
     assert body["status"] == "STARTED"
     assert body["id"] == exec_id
     assert body["data"]["s3_file_info"]["file_name"] == "invoice.pdf"
+
+
+def test_get_execution_route_returns_503_when_started_event_lookup_fails_transiently(
+    monkeypatch: pytest.MonkeyPatch,
+    client_with_api_key_standard,
+    standard_api_key_value: str,
+    organization_id: UUID,
+) -> None:
+    exec_id = "exec-route-503-started-lookup"
+    failed_dto = _failed_event_dto(exec_id, organization_id, is_terminal=False)
+
+    monkeypatch.setattr(
+        "document_ia_api.api.routes.v1.executions.EventStoreService.get_last_event_for_execution_id",
+        AsyncMock(return_value=failed_dto),
+    )
+    monkeypatch.setattr(
+        "document_ia_api.api.routes.v1.executions.EventStoreService.get_workflow_started_event",
+        AsyncMock(side_effect=RetryableException("DB pool exhausted")),
+    )
+    monkeypatch.setattr(
+        "document_ia_api.api.routes.v1.executions.workflow_repository.get_workflow_by_id",
+        AsyncMock(return_value={"id": "wf-1"}),
+    )
+
+    response = client_with_api_key_standard.get(
+        f"/api/v1/executions/{exec_id}",
+        headers={"X-API-KEY": standard_api_key_value},
+    )
+    assert response.status_code == 503
+    body = response.json()
+    assert body.get("errors", {}).get("code") == "database_unavailable"
 
 
 def test_get_execution_route_returns_failed_on_terminal_failure(

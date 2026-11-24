@@ -48,7 +48,8 @@ local minimum = ARGV[2]
 local due_at_ms = tonumber(ARGV[3])
 local payload_json = ARGV[4]
 
-local existing = redis.call('XRANGE', stream, minimum, '+')
+local min_id = string.match(minimum, '^%d+%-%d+$') and minimum or '-'
+local existing = redis.call('XRANGE', stream, min_id, '+')
 for _, e in ipairs(existing) do
   local f = e[2]
   for i = 1, #f, 2 do
@@ -86,7 +87,8 @@ for _, orig_id in ipairs(due) do
       local ok, decoded = pcall(cjson.decode, payload_json)
       if ok and type(decoded) == 'table' then
         local already_in_stream = false
-        local existing = redis.call('XRANGE', stream, orig_id, '+')
+        local min_id = string.match(orig_id, '^%d+%-%d+$') and orig_id or '-'
+        local existing = redis.call('XRANGE', stream, min_id, '+')
         for _, e in ipairs(existing) do
           local f = e[2]
           for i = 1, #f, 2 do
