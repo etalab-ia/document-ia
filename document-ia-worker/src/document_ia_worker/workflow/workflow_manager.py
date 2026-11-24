@@ -293,8 +293,8 @@ class WorkflowManager:
                     need_s3_purge = is_terminal_failure and not self._s3_cleaned_up
 
                     if self.event_dto is not None or is_terminal_failure:
-                        async with acquire_worker_db_slot():
-                            try:
+                        try:
+                            async with acquire_worker_db_slot():
                                 if self.event_dto is None and is_terminal_failure:
                                     with contextlib.suppress(Exception):
                                         self.event_dto = await EventRepository(
@@ -304,25 +304,24 @@ class WorkflowManager:
                                         )
 
                                 if self.event_dto is not None:
-                                    try:
-                                        await self._save_failure_event(session, e)
-                                    except Exception as save_err:
-                                        with contextlib.suppress(Exception):
-                                            await session.rollback()
-                                        tracker = get_current_progress_tracker()
-                                        if tracker is not None and tracker.is_aborted:
-                                            logger.warning(
-                                                "Workflow execution %s was aborted by watchdog during failure save; skipping S3 purge",
-                                                self.message.workflow_execution_id,
-                                            )
-                                            return
-                                        logger.warning(
-                                            "Could not save failure event for execution %s: %s",
-                                            self.message.workflow_execution_id,
-                                            type(save_err).__name__,
-                                        )
-                            finally:
-                                await close_session_safely(session)
+                                    await self._save_failure_event(session, e)
+                        except Exception as save_err:
+                            with contextlib.suppress(Exception):
+                                await session.rollback()
+                            tracker = get_current_progress_tracker()
+                            if tracker is not None and tracker.is_aborted:
+                                logger.warning(
+                                    "Workflow execution %s was aborted by watchdog during failure save; skipping S3 purge",
+                                    self.message.workflow_execution_id,
+                                )
+                                return
+                            logger.warning(
+                                "Could not save failure event for execution %s: %s",
+                                self.message.workflow_execution_id,
+                                type(save_err).__name__,
+                            )
+                        finally:
+                            await close_session_safely(session)
 
                     tracker = get_current_progress_tracker()
                     if tracker is not None and tracker.is_aborted:

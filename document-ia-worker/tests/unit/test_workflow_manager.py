@@ -183,6 +183,52 @@ class TestWorkflowManager:
             mock_db_manager.return_value.dispose_async.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_start_preserves_terminal_error_when_failure_slot_times_out(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        """A DB-slot timeout must not make a terminal workflow failure retryable."""
+        from contextlib import asynccontextmanager
+
+        manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        manager.event_dto = MagicMock()
+        slot_acquisitions = 0
+
+        @asynccontextmanager
+        async def acquire_slot():
+            nonlocal slot_acquisitions
+            slot_acquisitions += 1
+            if slot_acquisitions == 2:
+                raise RetryableException("DB slot timeout")
+            yield
+
+        with (
+            patch(
+                "document_ia_worker.workflow.workflow_manager.acquire_worker_db_slot",
+                new=acquire_slot,
+            ),
+            patch.object(
+                manager, "_prepare_workflow", side_effect=ValueError("terminal failure")
+            ),
+            patch.object(
+                manager, "_save_failure_event", new_callable=AsyncMock
+            ) as mock_save_fail,
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
+        ):
+            with pytest.raises(ValueError, match="terminal failure"):
+                await manager.start()
+
+            mock_save_fail.assert_not_awaited()
+            mock_purge_s3.assert_awaited_once()
+            mock_notify.assert_awaited_once()
+            mock_session = mock_db_manager.return_value.local_session.return_value.__aenter__.return_value
+            mock_session.rollback.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_start_workflow_step_exception_non_retryable(
         self, mock_workflow_message, mock_db_manager, mock_dependencies
     ):
