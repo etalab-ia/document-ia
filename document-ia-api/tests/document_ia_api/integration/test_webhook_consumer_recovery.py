@@ -662,7 +662,7 @@ async def test_requeue_guard_fails_closed_when_scan_fails(
 
     async def fail_second_guard_eval(script: str, numkeys: int, *args: Any) -> Any:
         nonlocal guard_scans
-        if numkeys == 1 and args and args[0] == stream:
+        if numkeys >= 1 and args and args[0] == stream:
             guard_scans += 1
             if guard_scans == 2:
                 raise ConnectionError("redis scan failed")

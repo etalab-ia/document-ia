@@ -550,7 +550,8 @@ async def test_consumer_terminal_http_error_requires_dlq_before_ack(
 
     async def record_dlq_eval(script: str, numkeys: int, *args: Any) -> Any:
         stream_name = args[0] if args else ""
-        operations.append(f"xadd:{stream_name}")
+        if stream_name in (stream, f"{stream}:dlq"):
+            operations.append(f"xadd:{stream_name}")
         if stream_name == f"{stream}:dlq":
             dlq_attempted.set()
             if not dlq_available:
