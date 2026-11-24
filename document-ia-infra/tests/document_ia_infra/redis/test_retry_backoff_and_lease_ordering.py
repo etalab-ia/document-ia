@@ -124,6 +124,27 @@ def test_redis_settings_retry_validation() -> None:
         RedisSettings(RETRY_DELAYED_POLL_INTERVAL_S=31.0)
 
 
+def test_redis_settings_retry_backoff_env_var_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORKFLOW_RETRY_BACKOFF_DELAYS_S", "0.0, 2.5, 15.0")
+    assert RedisSettings().WORKFLOW_RETRY_BACKOFF_DELAYS_S == [0.0, 2.5, 15.0]
+
+    monkeypatch.setenv("WORKFLOW_RETRY_BACKOFF_DELAYS_S", "[0.0, 0.5]")
+    assert RedisSettings().WORKFLOW_RETRY_BACKOFF_DELAYS_S == [0.0, 0.5]
+
+    monkeypatch.setenv("WORKFLOW_RETRY_BACKOFF_DELAYS_S", "   ")
+    assert RedisSettings().WORKFLOW_RETRY_BACKOFF_DELAYS_S == []
+
+    monkeypatch.setenv("WORKFLOW_RETRY_BACKOFF_DELAYS_S", "0.0, -1.0")
+    with pytest.raises(ValidationError):
+        RedisSettings()
+
+    monkeypatch.setenv("WORKFLOW_RETRY_BACKOFF_DELAYS_S", "0.0, not-a-float")
+    with pytest.raises(ValidationError):
+        RedisSettings()
+
+
 def test_consumer_backoff_delay_lookup_and_validation() -> None:
     async def noop(_msg: RetryTestMessage, _rc: int, _is_last: bool) -> None:
         return None
@@ -730,3 +751,207 @@ def test_retry_backoff_rejects_non_finite_values(bad_value: float) -> None:
             process_message_callable=noop,
             delayed_retry_poll_interval_s=bad_value,
         )
+
+
+@pytest.mark.asyncio
+async def test_retry_scheduling_failure_notifies_terminal_failure_after_dlq_retention() -> (
+    None
+):
+    """When retry scheduling fails and message is retained in DLQ, on_terminal_failure must run."""
+    notifications: list[tuple[str, dict[str, Any], str]] = []
+
+    async def noop(_msg: RetryTestMessage, _rc: int, _is_last: bool) -> None:
+        return None
+
+    async def on_terminal_failure(
+        msg_id: str, fields: dict[str, Any], reason: str
+    ) -> None:
+        notifications.append((msg_id, dict(fields), reason))
+
+    consumer = AsyncIoConsumer[RetryTestMessage](
+        consumer_name="c-sched-fail",
+        consumer_group="g1",
+        stream_name="s1",
+        batch_size=1,
+        block_time=10,
+        message_class=RetryTestMessage,
+        process_message_callable=noop,
+        max_retry_number=4,
+        retry_backoff_delays_s=(0.0, 1.0, 10.0),
+        on_terminal_failure=on_terminal_failure,
+    )
+    consumer.delivery.schedule_delayed_retry = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("Redis ZSET write failed")
+    )
+    consumer._send_to_dlq = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    consumer.delivery.ack = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+    fut.set_exception(RetryableException("HTTP 429"))
+
+    msg_id = "1700000000100-0"
+    fields = {
+        "data": json.dumps({"workflow_execution_id": "exec-sched-fail-1"}),
+        "retries": "1",
+    }
+    await consumer._handle_finished_future(fut, msg_id, fields, AsyncMock())
+    await consumer._drain_terminal_failure_tasks()
+
+    assert len(notifications) == 1
+    assert notifications[0][0] == msg_id
+    assert notifications[0][2] == "error_requeueing_message"
+    assert consumer.delivery.ack.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_scheduling_failure_notifies_terminal_failure_even_when_ack_fails() -> (
+    None
+):
+    """Once DLQ retention succeeds, reclaim will only ACK (never requeue), so finalization must still run."""
+    notifications: list[tuple[str, dict[str, Any], str]] = []
+
+    async def noop(_msg: RetryTestMessage, _rc: int, _is_last: bool) -> None:
+        return None
+
+    async def on_terminal_failure(
+        msg_id: str, fields: dict[str, Any], reason: str
+    ) -> None:
+        notifications.append((msg_id, dict(fields), reason))
+
+    consumer = AsyncIoConsumer[RetryTestMessage](
+        consumer_name="c-sched-fail-ack",
+        consumer_group="g1",
+        stream_name="s1",
+        batch_size=1,
+        block_time=10,
+        message_class=RetryTestMessage,
+        process_message_callable=noop,
+        max_retry_number=4,
+        retry_backoff_delays_s=(0.0, 1.0, 10.0),
+        on_terminal_failure=on_terminal_failure,
+    )
+    consumer.delivery.requeue = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("Redis XADD failed")
+    )
+    consumer._send_to_dlq = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    consumer.delivery.ack = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("Redis XACK failed")
+    )
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+    fut.set_exception(RetryableException("HTTP 429"))
+
+    msg_id = "1700000000101-0"
+    fields = {
+        "data": json.dumps({"workflow_execution_id": "exec-sched-fail-2"}),
+        "retries": "0",
+    }
+    await consumer._handle_finished_future(fut, msg_id, fields, AsyncMock())
+    await consumer._drain_terminal_failure_tasks()
+
+    assert len(notifications) == 1
+    assert notifications[0][0] == msg_id
+    assert notifications[0][2] == "error_requeueing_message"
+
+
+@pytest.mark.asyncio
+async def test_retry_scheduling_failure_does_not_notify_when_dlq_retention_fails() -> (
+    None
+):
+    """If DLQ retention also fails, the entry stays pending in PEL for reclaim recovery."""
+    notifications: list[tuple[str, dict[str, Any], str]] = []
+
+    async def noop(_msg: RetryTestMessage, _rc: int, _is_last: bool) -> None:
+        return None
+
+    async def on_terminal_failure(
+        msg_id: str, fields: dict[str, Any], reason: str
+    ) -> None:
+        notifications.append((msg_id, dict(fields), reason))
+
+    consumer = AsyncIoConsumer[RetryTestMessage](
+        consumer_name="c-sched-fail-no-dlq",
+        consumer_group="g1",
+        stream_name="s1",
+        batch_size=1,
+        block_time=10,
+        message_class=RetryTestMessage,
+        process_message_callable=noop,
+        max_retry_number=4,
+        retry_backoff_delays_s=(0.0, 1.0, 10.0),
+        on_terminal_failure=on_terminal_failure,
+    )
+    consumer.delivery.requeue = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("Redis down")
+    )
+    consumer._send_to_dlq = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    consumer.delivery.ack = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+    fut.set_exception(RetryableException("HTTP 429"))
+
+    msg_id = "1700000000102-0"
+    fields = {
+        "data": json.dumps({"workflow_execution_id": "exec-sched-fail-3"}),
+        "retries": "0",
+    }
+    await consumer._handle_finished_future(fut, msg_id, fields, AsyncMock())
+    await consumer._drain_terminal_failure_tasks()
+
+    assert notifications == []
+    assert consumer.delivery.ack.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exc", "retries"),
+    [
+        (RetryableException("HTTP 429"), "3"),  # max_retries_exceeded
+        (ValueError("bad input"), "0"),  # not_retryable_error
+    ],
+)
+async def test_handler_finalized_errors_do_not_double_notify_terminal_failure(
+    exc: Exception, retries: str
+) -> None:
+    """When the handler already recorded terminal failure, WorkerErrorPolicy must not re-notify."""
+    notifications: list[tuple[str, dict[str, Any], str]] = []
+
+    async def noop(_msg: RetryTestMessage, _rc: int, _is_last: bool) -> None:
+        return None
+
+    async def on_terminal_failure(
+        msg_id: str, fields: dict[str, Any], reason: str
+    ) -> None:
+        notifications.append((msg_id, dict(fields), reason))
+
+    consumer = AsyncIoConsumer[RetryTestMessage](
+        consumer_name="c-no-dup",
+        consumer_group="g1",
+        stream_name="s1",
+        batch_size=1,
+        block_time=10,
+        message_class=RetryTestMessage,
+        process_message_callable=noop,
+        max_retry_number=4,
+        on_terminal_failure=on_terminal_failure,
+    )
+    consumer._send_to_dlq = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    consumer.delivery.ack = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+    fut.set_exception(exc)
+
+    msg_id = "1700000000103-0"
+    fields = {
+        "data": json.dumps({"workflow_execution_id": "exec-no-dup"}),
+        "retries": retries,
+    }
+    await consumer._handle_finished_future(fut, msg_id, fields, AsyncMock())
+    await consumer._drain_terminal_failure_tasks()
+
+    assert notifications == []
+    assert consumer.delivery.ack.await_count == 1

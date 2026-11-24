@@ -1,9 +1,10 @@
 import json
 import math
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import NoDecode
 
 from document_ia_infra.core.BaseDocumentIaSettings import BaseDocumentIaSettings
 
@@ -29,7 +30,7 @@ class RedisSettings(BaseDocumentIaSettings):
 
     # Worker retry & backoff configuration
     WORKFLOW_MAX_RETRY_NUMBER: int = Field(default=4, ge=1)
-    WORKFLOW_RETRY_BACKOFF_DELAYS_S: list[float] = Field(
+    WORKFLOW_RETRY_BACKOFF_DELAYS_S: Annotated[list[float], NoDecode] = Field(
         default=[0.0, 1.0, 10.0],
     )
     RETRY_DELAYED_POLL_INTERVAL_S: float = Field(default=0.5, gt=0.0, le=30.0)

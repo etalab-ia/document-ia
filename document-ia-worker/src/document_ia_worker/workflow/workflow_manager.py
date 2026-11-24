@@ -853,21 +853,43 @@ class WorkflowManager:
                                 steps_metadata=[],
                             )
 
-                            logger.warning(
-                                "Recording terminal watchdog failure for execution %s (reason=%s)",
-                                last_event.execution_id,
-                                reason,
-                            )
+                            if reason == "error_requeueing_message":
+                                terminal_error_type = "RetrySchedulingError"
+                                terminal_error_message = (
+                                    "Failed to schedule retry and no attempt is left: "
+                                    f"{reason}"
+                                )
+                                raw_failed_step = last_event.event.get("failed_step")
+                                terminal_failed_step = (
+                                    raw_failed_step
+                                    if isinstance(raw_failed_step, str)
+                                    and raw_failed_step
+                                    else "retry_scheduler"
+                                )
+                                logger.warning(
+                                    "Recording terminal retry-scheduling failure for execution %s (reason=%s)",
+                                    last_event.execution_id,
+                                    reason,
+                                )
+                            else:
+                                terminal_error_type = "WatchdogTimeout"
+                                terminal_error_message = (
+                                    "The watchdog stopped the execution and no attempt is left: "
+                                    f"{reason}"
+                                )
+                                terminal_failed_step = "watchdog"
+                                logger.warning(
+                                    "Recording terminal watchdog failure for execution %s (reason=%s)",
+                                    last_event.execution_id,
+                                    reason,
+                                )
                             await event_service.emit_workflow_failed(
                                 workflow_id=last_event.workflow_id,
                                 execution_id=last_event.execution_id,
                                 organization_id=last_event.organization_id,
-                                error_type="WatchdogTimeout",
-                                error_message=(
-                                    "The watchdog stopped the execution and no attempt is left: "
-                                    f"{reason}"
-                                ),
-                                failed_step="watchdog",
+                                error_type=terminal_error_type,
+                                error_message=terminal_error_message,
+                                failed_step=terminal_failed_step,
                                 retry_count=self.retry_count,
                                 workflow_version=workflow_version,
                                 is_terminal=True,

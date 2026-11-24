@@ -32,6 +32,7 @@ class WorkerErrorPolicy:
         delivery: StreamDelivery,
         requeue: Callable[..., Awaitable[bool]],
         retain: Callable[..., Awaitable[bool]],
+        on_terminal_failure: Callable[[str, dict[str, Any], str], None] | None = None,
     ) -> None:
         reason = ""
         error = ""
@@ -74,3 +75,5 @@ class WorkerErrorPolicy:
             await delivery.ack(redis, entry_id)
         except Exception as exc:
             logger.error("ACK failed for message %s: %s", entry_id, type(exc).__name__)
+        if reason == "error_requeueing_message" and on_terminal_failure is not None:
+            on_terminal_failure(entry_id, fields, reason)
