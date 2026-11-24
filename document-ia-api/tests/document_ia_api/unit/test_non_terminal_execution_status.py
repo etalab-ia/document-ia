@@ -276,7 +276,7 @@ def test_get_execution_route_returns_503_when_started_event_lookup_fails_transie
     )
     assert response.status_code == 503
     body = response.json()
-    assert body.get("errors", {}).get("code") == "database_unavailable"
+    assert body.get("errors", {}).get("error") == "database_unavailable"
 
 
 def test_get_execution_route_returns_failed_on_terminal_failure(
