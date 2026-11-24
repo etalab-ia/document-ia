@@ -159,12 +159,15 @@ async def run_consumer(stop_event: asyncio.Event | None = None) -> None:
         block_time=10000,
         message_class=WorkflowExecutionMessage,
         process_message_callable=process_message,
+        max_retry_number=redis_settings.WORKFLOW_MAX_RETRY_NUMBER,
         reclaim_poll_interval_s=5.0,
         current_redis_manager=redis_manager,
         max_processing_time_s=120.0,
         step_progress_timeout_s=90.0,
         use_execution_lease=True,
         on_terminal_failure=notify_watchdog_terminal_failure,
+        retry_backoff_delays_s=redis_settings.WORKFLOW_RETRY_BACKOFF_DELAYS_S,
+        delayed_retry_poll_interval_s=redis_settings.RETRY_DELAYED_POLL_INTERVAL_S,
     )
     if stop_event is not None and stop_event.is_set():
         _consumer.stop_flag.set()

@@ -6,6 +6,7 @@ Source entries and their copies must not be trimmed before pending recovery.
 """
 
 import asyncio
+import json
 from collections.abc import Awaitable
 from typing import Any, cast
 
@@ -27,10 +28,98 @@ for _, e in ipairs(existing) do
     end
   end
 end
+if #KEYS >= 2 then
+  local delayed_members = redis.call('ZRANGE', KEYS[2], 0, -1)
+  for _, member in ipairs(delayed_members) do
+    local ok, decoded = pcall(cjson.decode, member)
+    if ok and type(decoded) == 'table' and decoded['original_id'] == orig then
+      return {0, orig}
+    end
+  end
+end
 local args = {}
 for i = 3, #ARGV do table.insert(args, ARGV[i]) end
 local id = redis.call('XADD', target, '*', unpack(args))
 return {1, id}
+"""
+
+_SCHEDULE_DELAYED_RETRY_LUA = """
+local delayed_key = KEYS[1]
+local stream = KEYS[2]
+local orig = ARGV[1]
+local minimum = ARGV[2]
+local due_at_ms = tonumber(ARGV[3])
+local payload_json = ARGV[4]
+
+local existing = redis.call('XRANGE', stream, minimum, '+')
+for _, e in ipairs(existing) do
+  local f = e[2]
+  for i = 1, #f, 2 do
+    if f[i] == 'original_id' and f[i+1] == orig then
+      return {0, e[1]}
+    end
+  end
+end
+
+local delayed_members = redis.call('ZRANGE', delayed_key, 0, -1)
+for _, member in ipairs(delayed_members) do
+  local ok, decoded = pcall(cjson.decode, member)
+  if ok and type(decoded) == 'table' and decoded['original_id'] == orig then
+    return {0, orig}
+  end
+end
+
+redis.call('ZADD', delayed_key, due_at_ms, payload_json)
+return {1, orig}
+"""
+
+_PROMOTE_DUE_RETRIES_LUA = """
+local delayed_key = KEYS[1]
+local stream = KEYS[2]
+local now_ms = ARGV[1]
+local batch_size = tonumber(ARGV[2])
+
+local due = redis.call('ZRANGEBYSCORE', delayed_key, '-inf', now_ms, 'LIMIT', 0, batch_size)
+local promoted = 0
+
+for _, member in ipairs(due) do
+  local removed = redis.call('ZREM', delayed_key, member)
+  if removed == 1 then
+    local ok, decoded = pcall(cjson.decode, member)
+    if ok and type(decoded) == 'table' then
+      local orig_id = decoded['original_id']
+      local already_in_stream = false
+      if orig_id then
+        local existing = redis.call('XRANGE', stream, orig_id, '+')
+        for _, e in ipairs(existing) do
+          local f = e[2]
+          for i = 1, #f, 2 do
+            if f[i] == 'original_id' and f[i+1] == orig_id then
+              already_in_stream = true
+              break
+            end
+          end
+          if already_in_stream then
+            break
+          end
+        end
+      end
+      if not already_in_stream then
+        local args = {}
+        for k, v in pairs(decoded) do
+          table.insert(args, tostring(k))
+          table.insert(args, tostring(v))
+        end
+        if #args > 0 then
+          redis.call('XADD', stream, '*', unpack(args))
+          promoted = promoted + 1
+        end
+      end
+    end
+  end
+end
+
+return promoted
 """
 
 _RENEW_LEASE_LUA = """
@@ -57,6 +146,21 @@ class StreamDelivery:
         self.stream = stream
         self.group = group
         self.consumer = consumer
+
+    @property
+    def delayed_retry_key(self) -> str:
+        return f"{self.stream}:retry_delayed"
+
+    @staticmethod
+    def _normalize_fields(fields: dict[Any, Any]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for key, value in fields.items():
+            if value is None:
+                continue
+            str_key = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+            str_val = value.decode("utf-8") if isinstance(value, bytes) else str(value)
+            normalized[str_key] = str_val
+        return normalized
 
     async def ensure_group(self, redis: Redis, start: str) -> None:
         try:
@@ -138,15 +242,17 @@ class StreamDelivery:
         fields: dict[str, Any],
         *,
         minimum: str = "0-0",
+        delayed_key: str | None = None,
     ) -> bool:
-        payload = {**fields, "original_id": str(entry_id)}
+        payload = {**self._normalize_fields(fields), "original_id": str(entry_id)}
         argv = [str(entry_id), minimum]
         for key, value in payload.items():
-            argv.extend((str(key), str(value)))
+            argv.extend((key, value))
         operation = "dlq" if target == f"{self.stream}:dlq" else "retry"
+        keys = [target] if delayed_key is None else [target, delayed_key]
         try:
             result = await cast(
-                Awaitable[Any], redis.eval(_COPY_ONCE_LUA, 1, target, *argv)
+                Awaitable[Any], redis.eval(_COPY_ONCE_LUA, len(keys), *keys, *argv)
             )
         except Exception:
             delivery_metric(self.stream, operation, "error")
@@ -163,7 +269,70 @@ class StreamDelivery:
             entry_id,
             {**fields, "retries": str(retries)},
             minimum=str(entry_id),
+            delayed_key=self.delayed_retry_key,
         )
+
+    async def schedule_delayed_retry(
+        self,
+        redis: Redis,
+        entry_id: str,
+        fields: dict[str, Any],
+        retries: int,
+        due_at_ms: int,
+    ) -> bool:
+        payload = {
+            **self._normalize_fields(fields),
+            "retries": str(retries),
+            "original_id": str(entry_id),
+        }
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        try:
+            result = await cast(
+                Awaitable[Any],
+                redis.eval(
+                    _SCHEDULE_DELAYED_RETRY_LUA,
+                    2,
+                    self.delayed_retry_key,
+                    self.stream,
+                    str(entry_id),
+                    str(entry_id),
+                    str(due_at_ms),
+                    serialized,
+                ),
+            )
+        except Exception:
+            delivery_metric(self.stream, "retry_delayed", "error")
+            raise
+        delivery_metric(
+            self.stream, "retry_delayed", "created" if result[0] else "existing"
+        )
+        return True
+
+    async def promote_due_retries(
+        self,
+        redis: Redis,
+        now_ms: int,
+        batch_size: int = 100,
+    ) -> int:
+        try:
+            promoted = await cast(
+                Awaitable[Any],
+                redis.eval(
+                    _PROMOTE_DUE_RETRIES_LUA,
+                    2,
+                    self.delayed_retry_key,
+                    self.stream,
+                    str(now_ms),
+                    str(batch_size),
+                ),
+            )
+            promoted_count = int(promoted or 0)
+        except Exception:
+            delivery_metric(self.stream, "retry_promoted", "error")
+            raise
+        if promoted_count > 0:
+            delivery_metric(self.stream, "retry_promoted", "success", promoted_count)
+        return promoted_count
 
     async def retain(self, redis: Redis, entry_id: str, fields: dict[str, Any]) -> bool:
         return await self.copy_once(redis, f"{self.stream}:dlq", entry_id, fields)
