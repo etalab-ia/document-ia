@@ -18,6 +18,7 @@ from document_ia_infra.redis.model.workflow_execution_message import (
 from document_ia_infra.redis.publisher import PublishFailedError, Publisher
 from document_ia_infra.redis.redis_manager import RedisManager
 from document_ia_infra.redis.redis_settings import RedisSettings, redis_settings
+from document_ia_infra.redis.stream_delivery import StreamDelivery
 
 pytestmark = pytest.mark.asyncio
 
@@ -302,3 +303,102 @@ async def test_shared_manager_allows_idle_worker_block_longer_than_five_seconds(
 async def test_invalid_thresholds_rejected(values):
     with pytest.raises(ValidationError):
         RedisSettings(**values)
+
+
+async def test_delayed_retries_count_toward_admission_outstanding_and_hysteresis(
+    queues,
+):
+    stream = redis_settings.EVENT_STREAM_NAME
+    group = redis_settings.EVENT_CONSUMER_GROUP
+    delivery = StreamDelivery(stream, group, "worker-delayed")
+
+    ids = [await publish(queues) for _ in range(4)]
+    await queues.xreadgroup(group, "worker-delayed", {stream: ">"}, count=4)
+
+    seconds, micros = await queues.time()
+    now_ms = seconds * 1000 + micros // 1000
+    for idx, entry_id in enumerate(ids):
+        await delivery.schedule_delayed_retry(
+            queues,
+            entry_id,
+            {"data": f"job-{idx}"},
+            retries=1,
+            due_at_ms=now_ms + 30_000 + idx * 1000,
+        )
+        await queues.xack(stream, group, entry_id)
+
+    # Stream lag and PEL are now both 0, but all 4 executions remain outstanding in backoff.
+    info = (await queues.xinfo_groups(stream))[0]
+    assert info["lag"] == 0
+    assert info["pending"] == 0
+    assert await queues.zcard(delivery.delayed_retry_key) == 4
+
+    with pytest.raises(PublishFailedError):
+        await publish(queues)
+
+    # Promote and ACK 2 delayed retries -> 2 still delayed (> resume watermark 1): stays closed.
+    promoted = await delivery.promote_due_retries(queues, now_ms=now_ms + 31_500)
+    assert promoted == 2
+    promoted_entries = await queues.xreadgroup(
+        group, "worker-delayed", {stream: ">"}, count=2
+    )
+    for entry_id, _ in promoted_entries[0][1]:
+        await queues.xack(stream, group, entry_id)
+    assert await queues.zcard(delivery.delayed_retry_key) == 2
+
+    with pytest.raises(PublishFailedError):
+        await publish(queues)
+
+    # Promote and ACK 1 more -> 1 delayed (<= resume watermark 1): admission reopens.
+    promoted = await delivery.promote_due_retries(queues, now_ms=now_ms + 32_500)
+    assert promoted == 1
+    promoted_entries = await queues.xreadgroup(
+        group, "worker-delayed", {stream: ">"}, count=1
+    )
+    for entry_id, _ in promoted_entries[0][1]:
+        await queues.xack(stream, group, entry_id)
+    assert await queues.zcard(delivery.delayed_retry_key) == 1
+
+    assert await publish(queues)
+
+
+@pytest.mark.parametrize("queue", ["work", "hooks"])
+async def test_oldest_delayed_retry_closes_admission_even_when_due_later(queues, queue):
+    stream = (
+        redis_settings.EVENT_STREAM_NAME
+        if queue == "work"
+        else redis_settings.WEBHOOK_STREAM_NAME
+    )
+    group = (
+        redis_settings.EVENT_CONSUMER_GROUP
+        if queue == "work"
+        else redis_settings.WEBHOOK_CONSUMER_GROUP
+    )
+    delivery = StreamDelivery(stream, group, "worker-age")
+
+    seconds, micros = await queues.time()
+    now_ms = seconds * 1000 + micros // 1000
+    old_id = await queues.xadd(stream, {"data": "old"}, id=f"{now_ms - 61_000}-0")
+    recent_id = await queues.xadd(stream, {"data": "recent"}, id=f"{now_ms - 1_000}-0")
+    await queues.xreadgroup(group, "worker-age", {stream: ">"}, count=2)
+
+    # Older entry has a longer backoff (higher score) than the newer entry:
+    # admission must inspect all delayed members, not just the lowest ZSET score.
+    await delivery.schedule_delayed_retry(
+        queues, old_id, {"data": "old"}, retries=2, due_at_ms=now_ms + 30_000
+    )
+    await delivery.schedule_delayed_retry(
+        queues, recent_id, {"data": "recent"}, retries=1, due_at_ms=now_ms + 1_000
+    )
+    await queues.xack(stream, group, old_id, recent_id)
+
+    with pytest.raises(AdmissionUnavailableError):
+        await admit_execution(queues)
+
+    # Promoting and ACKing both clears the old delayed entry and reopens admission.
+    await delivery.promote_due_retries(queues, now_ms=now_ms + 31_000)
+    entries = await queues.xreadgroup(group, "worker-age", {stream: ">"}, count=2)
+    for entry_id, _ in entries[0][1]:
+        await queues.xack(stream, group, entry_id)
+
+    assert await publish(queues)

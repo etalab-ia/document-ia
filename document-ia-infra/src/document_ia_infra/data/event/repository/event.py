@@ -285,9 +285,13 @@ class EventRepository:
                 event = last_event
             # The complicated case :
             # If the last event is a failed but the error is retryable we need to find the WORKFLOW_EXECUTION_STARTED event
-            elif (
-                last_event.event_type == EventType.WORKFLOW_EXECUTION_FAILED
-                and last_event.event.get("error_type") == RetryableException.__name__
+            elif last_event.event_type == EventType.WORKFLOW_EXECUTION_FAILED and (
+                last_event.event.get("is_terminal") is False
+                or (
+                    not isinstance(last_event.event.get("is_terminal"), bool)
+                    and last_event.event.get("error_type")
+                    == RetryableException.__name__
+                )
             ):
                 for e in events[1:]:
                     if e.event_type == EventType.WORKFLOW_EXECUTION_STARTED:

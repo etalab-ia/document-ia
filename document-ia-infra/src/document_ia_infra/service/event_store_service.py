@@ -293,6 +293,7 @@ class EventStoreService:
         failed_step: Optional[str] = None,
         retry_count: int = 0,
         workflow_version: int = 1,
+        is_terminal: bool = True,
     ) -> WorkflowExecutionFailedEvent:
         """Create a WorkflowExecutionFailedEvent.
 
@@ -311,6 +312,7 @@ class EventStoreService:
             error_message=error_message,
             failed_step=failed_step,
             retry_count=retry_count,
+            is_terminal=is_terminal,
         )
 
     # High-level workflow event orchestration methods
@@ -401,6 +403,7 @@ class EventStoreService:
         failed_step: Optional[str] = None,
         retry_count: int = 0,
         workflow_version: int = 1,
+        is_terminal: bool = True,
     ) -> EventStoreRecord:
         """Emit and store a workflow failed event."""
         event = self.create_workflow_failed_event(
@@ -412,5 +415,6 @@ class EventStoreService:
             failed_step=failed_step,
             retry_count=retry_count,
             workflow_version=workflow_version,
+            is_terminal=is_terminal,
         )
         return await self.store_event(event)

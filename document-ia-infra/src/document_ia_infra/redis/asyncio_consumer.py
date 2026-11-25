@@ -4,7 +4,7 @@ Consommateur Redis Stream asyncio natif (AsyncIoConsumer).
 
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from typing import Any, TypeVar
 
 from document_ia_infra.redis.base_consumer import BaseConsumer
@@ -67,6 +67,8 @@ class AsyncIoConsumer(BaseConsumer[T]):
         on_terminal_failure: (
             Callable[[str, dict[str, Any], str], Coroutine[Any, Any, None]] | None
         ) = None,
+        retry_backoff_delays_s: Sequence[float] = (0.0, 1.0, 10.0),
+        delayed_retry_poll_interval_s: float = 0.5,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
@@ -100,6 +102,8 @@ class AsyncIoConsumer(BaseConsumer[T]):
             use_execution_lease=use_execution_lease,
             lease_ttl_ms=lease_ttl_ms,
             on_terminal_failure=on_terminal_failure,
+            retry_backoff_delays_s=retry_backoff_delays_s,
+            delayed_retry_poll_interval_s=delayed_retry_poll_interval_s,
         )
 
     def _submit_message(

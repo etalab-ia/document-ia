@@ -1,5 +1,10 @@
-from pydantic import Field, SecretStr, model_validator
+import json
+import math
+from typing import Annotated, Any
 from urllib.parse import quote, urlsplit, urlunsplit
+
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import NoDecode
 
 from document_ia_infra.core.BaseDocumentIaSettings import BaseDocumentIaSettings
 
@@ -23,6 +28,13 @@ class RedisSettings(BaseDocumentIaSettings):
     DLQ_STREAM_MAXLEN: int = Field(default=100000)
     EVENT_CONSUMER_GROUP: str = Field(default="workflow_execution_consumer")
 
+    # Worker retry & backoff configuration
+    WORKFLOW_MAX_RETRY_NUMBER: int = Field(default=4, ge=1)
+    WORKFLOW_RETRY_BACKOFF_DELAYS_S: Annotated[list[float], NoDecode] = Field(
+        default=[0.0, 1.0, 10.0],
+    )
+    RETRY_DELAYED_POLL_INTERVAL_S: float = Field(default=0.5, gt=0.0, le=30.0)
+
     ADMISSION_MAX_OUTSTANDING: int = Field(default=2000, ge=2)
     ADMISSION_RESUME_OUTSTANDING: int = Field(default=1600, ge=0)
     ADMISSION_MAX_AGE_SECONDS: int = Field(default=600, ge=2)
@@ -41,6 +53,35 @@ class RedisSettings(BaseDocumentIaSettings):
     DEFAULT_MAX_PROCESSING_TIME_S: float = Field(default=120.0, ge=1.0)
     DEFAULT_STEP_PROGRESS_TIMEOUT_S: float = Field(default=90.0, ge=1.0)
     DEFAULT_LEASE_TTL_MS: int = Field(default=60000, ge=1000)
+
+    @field_validator("WORKFLOW_RETRY_BACKOFF_DELAYS_S", mode="before")
+    @classmethod
+    def parse_retry_backoff_delays(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("["):
+                return json.loads(stripped)
+            return [float(part.strip()) for part in stripped.split(",") if part.strip()]
+        return value
+
+    @field_validator("WORKFLOW_RETRY_BACKOFF_DELAYS_S")
+    @classmethod
+    def validate_retry_backoff_delays(cls, value: list[float]) -> list[float]:
+        for delay in value:
+            if not math.isfinite(delay) or delay < 0.0:
+                raise ValueError(
+                    "WORKFLOW_RETRY_BACKOFF_DELAYS_S elements must be finite and >= 0.0"
+                )
+        return value
+
+    @field_validator("RETRY_DELAYED_POLL_INTERVAL_S")
+    @classmethod
+    def validate_delayed_retry_poll_interval(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("RETRY_DELAYED_POLL_INTERVAL_S must be finite")
+        return value
 
     @model_validator(mode="after")
     def validate_admission_thresholds(self):

@@ -183,6 +183,9 @@ async def test_worker_requeue_and_dlq_failures_leave_message_pending(
     operations: list[str] = []
 
     async def fail_eval(script: str, numkeys: int, *args: Any) -> Any:
+        if "XADD" not in script and "ZSCORE" in script:
+            operations.append(f"verify:{args[0]}")
+            raise ConnectionError(f"Redis read unavailable for {args[0]}")
         operations.append(f"xadd:{args[0]}")
         raise ConnectionError(f"Redis write unavailable for {args[0]}")
 
@@ -193,9 +196,33 @@ async def test_worker_requeue_and_dlq_failures_leave_message_pending(
     monkeypatch.setattr(redis_client, "eval", fail_eval)
     monkeypatch.setattr(redis_client, "xack", record_ack)
 
+    # When verification itself fails (ambiguous Redis outage), fail closed without DLQ or ACK.
     await consumer._handle_finished_future(future, msg_id, fields, redis_client)
 
-    assert operations == [f"xadd:{stream}", f"xadd:{stream}:dlq"]
+    assert operations == [f"xadd:{stream}", f"verify:{stream}:retry_delayed"]
+    assert await pending_count(redis_client, stream, group) == 1
+    assert await redis_client.xlen(stream) == 1
+    assert await redis_client.xlen(f"{stream}:dlq") == 0
+
+    # When verification confirms no retry exists, DLQ retention is attempted and its failure still leaves entry pending.
+    operations.clear()
+
+    async def fail_writes_only(script: str, numkeys: int, *args: Any) -> Any:
+        if "XADD" not in script and "ZSCORE" in script:
+            operations.append(f"verify:{args[0]}")
+            return 0
+        operations.append(f"xadd:{args[0]}")
+        raise ConnectionError(f"Redis write unavailable for {args[0]}")
+
+    monkeypatch.setattr(redis_client, "eval", fail_writes_only)
+
+    await consumer._handle_finished_future(future, msg_id, fields, redis_client)
+
+    assert operations == [
+        f"xadd:{stream}",
+        f"verify:{stream}:retry_delayed",
+        f"xadd:{stream}:dlq",
+    ]
     assert await pending_count(redis_client, stream, group) == 1
     assert await redis_client.xlen(stream) == 1
     assert await redis_client.xlen(f"{stream}:dlq") == 0

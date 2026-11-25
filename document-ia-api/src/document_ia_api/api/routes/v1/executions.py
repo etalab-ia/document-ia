@@ -1,6 +1,8 @@
 import logging
 
 from document_ia_infra.data.database import database_manager
+from document_ia_infra.data.event.dto.event_dto import EventDTO
+from document_ia_infra.data.event.dto.event_type_enum import EventType
 from document_ia_infra.data.event.repository.event import is_transient_db_error
 from document_ia_infra.data.organization.dto.organization_dto import OrganizationDTO
 from document_ia_infra.data.workflow.repository.workflow import workflow_repository
@@ -282,6 +284,37 @@ async def get_execution(
         if not workflow_exists:
             raise EntityNotFoundException("Workflow", last_event.workflow_id)
 
+        started_event_dto: EventDTO | None = None
+        if (
+            getattr(last_event, "event_type", None)
+            == EventType.WORKFLOW_EXECUTION_FAILED
+            and last_event.event.get("is_terminal", True) is False
+        ):
+            try:
+                started_tuple = await event_store_service.get_workflow_started_event(
+                    execution_id
+                )
+            except Exception as e:
+                if isinstance(e, RetryableException) or is_transient_db_error(e):
+                    logger.error(
+                        "Database unavailable while retrieving started event",
+                        extra={
+                            "endpoint": "get_execution",
+                            "execution_id": execution_id,
+                            "error": type(e).__name__,
+                        },
+                    )
+                    raise database_unavailable() from e
+                raise
+            started_event_dto = started_tuple[0] if started_tuple else None
+
+        if started_event_dto is not None:
+            return execution_service.get_event_model(
+                last_event,
+                execution_id,
+                is_debug_mode,
+                started_event_dto=started_event_dto,
+            )
         return execution_service.get_event_model(
             last_event, execution_id, is_debug_mode
         )

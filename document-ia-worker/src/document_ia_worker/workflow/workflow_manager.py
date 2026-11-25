@@ -317,7 +317,9 @@ class WorkflowManager:
                                                 )
 
                                     if self.event_dto is not None:
-                                        await self._save_failure_event(session, e)
+                                        await self._save_failure_event(
+                                            session, e, is_terminal=is_terminal_failure
+                                        )
                                 finally:
                                     await close_session_safely(session)
                         except Exception as save_err:
@@ -706,7 +708,9 @@ class WorkflowManager:
             self.step_list.clear()
             _release_worker_memory()
 
-    async def _save_failure_event(self, db: AsyncSession, exception: Exception):
+    async def _save_failure_event(
+        self, db: AsyncSession, exception: Exception, *, is_terminal: bool = True
+    ):
         if self.event_dto is None:
             with contextlib.suppress(Exception):
                 self.event_dto = await EventRepository(
@@ -761,15 +765,6 @@ class WorkflowManager:
             )
             else 1
         )
-        fallback_version = (
-            raw_version
-            if (
-                isinstance(raw_version, int)
-                and not isinstance(raw_version, bool)
-                and raw_version in (1, 2)
-            )
-            else 1
-        )
         workflow_version = (
             self.main_workflow_context.workflow_version
             if (
@@ -790,6 +785,7 @@ class WorkflowManager:
             failed_step=final_failed_step,
             retry_count=self.retry_count,
             workflow_version=workflow_version,
+            is_terminal=is_terminal,
         )
 
     def _cleanup_execution_sandbox(self, context_label: str) -> bool:
@@ -857,23 +853,46 @@ class WorkflowManager:
                                 steps_metadata=[],
                             )
 
-                            logger.warning(
-                                "Recording terminal watchdog failure for execution %s (reason=%s)",
-                                last_event.execution_id,
-                                reason,
-                            )
+                            if reason == "error_requeueing_message":
+                                terminal_error_type = "RetrySchedulingError"
+                                terminal_error_message = (
+                                    "Failed to schedule retry and no attempt is left: "
+                                    f"{reason}"
+                                )
+                                raw_failed_step = last_event.event.get("failed_step")
+                                terminal_failed_step = (
+                                    raw_failed_step
+                                    if isinstance(raw_failed_step, str)
+                                    and raw_failed_step
+                                    else "retry_scheduler"
+                                )
+                                logger.warning(
+                                    "Recording terminal retry-scheduling failure for execution %s (reason=%s)",
+                                    last_event.execution_id,
+                                    reason,
+                                )
+                            else:
+                                terminal_error_type = "WatchdogTimeout"
+                                terminal_error_message = (
+                                    "The watchdog stopped the execution and no attempt is left: "
+                                    f"{reason}"
+                                )
+                                terminal_failed_step = "watchdog"
+                                logger.warning(
+                                    "Recording terminal watchdog failure for execution %s (reason=%s)",
+                                    last_event.execution_id,
+                                    reason,
+                                )
                             await event_service.emit_workflow_failed(
                                 workflow_id=last_event.workflow_id,
                                 execution_id=last_event.execution_id,
                                 organization_id=last_event.organization_id,
-                                error_type="WatchdogTimeout",
-                                error_message=(
-                                    "The watchdog stopped the execution and no attempt is left: "
-                                    f"{reason}"
-                                ),
-                                failed_step="watchdog",
+                                error_type=terminal_error_type,
+                                error_message=terminal_error_message,
+                                failed_step=terminal_failed_step,
                                 retry_count=self.retry_count,
                                 workflow_version=workflow_version,
+                                is_terminal=True,
                             )
                     finally:
                         await close_session_safely(session)
@@ -932,5 +951,8 @@ class WorkflowManager:
         if event.event_type == EventType.WORKFLOW_EXECUTION_COMPLETED.value:
             return True
         if event.event_type == EventType.WORKFLOW_EXECUTION_FAILED.value:
+            is_terminal = event.event.get("is_terminal")
+            if isinstance(is_terminal, bool):
+                return is_terminal
             return event.event.get("error_type") != RetryableException.__name__
         return False
