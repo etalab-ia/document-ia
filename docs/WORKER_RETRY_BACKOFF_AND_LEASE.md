@@ -4,11 +4,12 @@
 
 When processing document workflows at scale across multiple worker instances and threads, transient downstream failures (such as `HTTP 429 Too Many Requests` from OCR/LLM providers or temporary database connectivity blips) raise `RetryableException`.
 
-To ensure fast, deterministic recovery without false failure signals to API consumers, Document IA enforces three coordinated mechanisms across `document-ia-infra`, `document-ia-worker`, and `document-ia-api`:
+To ensure fast, deterministic recovery without false failure signals to API consumers, Document IA enforces four coordinated mechanisms across `document-ia-infra`, `document-ia-worker`, and `document-ia-api`:
 
 1. **Lease-Release-Before-Requeue Ordering**: A worker always releases its Redis execution lease (`lock:workflow_execution:{execution_id}`) **before** requeueing or scheduling a delayed retry, eliminating cross-worker lease contention on immediate retries.
 2. **Redis ZSET Delayed Retry Queue (`{stream}:retry_delayed`)**: Bounded retry attempts (`WORKFLOW_MAX_RETRY_NUMBER = 4`, i.e., 1 initial attempt + 3 retries) follow a configurable backoff schedule (`WORKFLOW_RETRY_BACKOFF_DELAYS_S = [0.0, 1.0, 10.0]`) managed via atomic Lua scripts.
-3. **Non-Terminal Failure Event Projection (`is_terminal: bool`)**: Intermediate failure events recorded in PostgreSQL (`WorkflowExecutionFailedEvent` with `is_terminal=False`) preserve full auditability in the Event Store while projecting as `ExecutionStatus.STARTED` (`ExecutionStartedModel`) on `GET /api/v1/executions/{execution_id}` and during synchronous execution polling.
+3. **Graceful Shutdown Immediate Requeue & 90s PEL Reclaim**: On `SIGTERM`/`SIGINT`, `document-ia-worker` drains in-flight work up to `WORKER_DRAIN_TIMEOUT_S = 20.0s`, then fences unfinished handlers, releases their execution lease, and immediately requeues them with an **unchanged `retries` counter** (`requeue_on_shutdown=True`) before acknowledging the original entry. On abrupt crashes (`SIGKILL`/OOM), surviving workers reclaim idle entries via `XAUTOCLAIM` after `EVENT_STREAM_RECLAIM_IDLE_MS = 90000` ms (90s) while keeping the heartbeat cadence at `30.0s`.
+4. **Non-Terminal Failure Event Projection (`is_terminal: bool`)**: Intermediate failure events recorded in PostgreSQL (`WorkflowExecutionFailedEvent` with `is_terminal=False`) preserve full auditability in the Event Store while projecting as `ExecutionStatus.STARTED` (`ExecutionStartedModel`) on `GET /api/v1/executions/{execution_id}` and during synchronous execution polling.
 
 ---
 
@@ -57,7 +58,7 @@ sequenceDiagram
 In `BaseConsumer._finalize_done_futures`, the handler's `Future` has already completed (`fut.done() == True`). Releasing the Redis execution lease (`lock:workflow_execution:{execution_id}`) **prior** to calling `_handle_finished_future` guarantees that:
 
 - When Retry #1 (`delay = 0.0s`) is immediately appended to `event_stream` via `XADD`, any peer worker reading the stream via `XREADGROUP` can immediately acquire the lease for `execution_id`.
-- No retry message is ever skipped and left stranded in a consumer's Pending Entries List (PEL) waiting for the 300-second `EVENT_STREAM_EXPIRATION` (`XAUTOCLAIM`) timeout due to a stale lease from the previous attempt.
+- No retry message is ever skipped and left stranded in a consumer's Pending Entries List (PEL) waiting for the `EVENT_STREAM_RECLAIM_IDLE_MS` (`XAUTOCLAIM`, 90s default for workflow workers) timeout due to a stale lease from the previous attempt.
 
 ---
 
@@ -94,12 +95,36 @@ In `BaseConsumer._finalize_done_futures`, the handler's `Future` has already com
 | `WORKFLOW_MAX_RETRY_NUMBER` | `4` | `>= 1` | Total execution attempts (1 initial + 3 retries) before routing to DLQ. |
 | `WORKFLOW_RETRY_BACKOFF_DELAYS_S` | `[0.0, 1.0, 10.0]` | Each element `>= 0.0` | Per-retry delay in seconds (`attempts - 1`, clamped to the last element). |
 | `RETRY_DELAYED_POLL_INTERVAL_S` | `0.5` | `> 0.0, <= 30.0` | Polling interval in seconds for promoting due entries from `{stream}:retry_delayed`. |
+| `EVENT_STREAM_RECLAIM_IDLE_MS` | `90000` | `>= 1000` | Idle threshold in milliseconds before `XAUTOCLAIM` reclaims abandoned workflow entries (keeps heartbeat interval unchanged at `30.0s`). |
+| `WORKER_DRAIN_TIMEOUT_S` | `20.0` | `>= 0.0, <= 300.0`, finite | Graceful drain window in seconds on shutdown before fencing and requeueing unfinished workflow handlers. |
+| `WORKER_SHUTDOWN_TIMEOUT_S` | `24.0` | `>= 1.0, <= 300.0`, finite, `>= WORKER_DRAIN_TIMEOUT_S` | Hard shutdown deadline in `document-ia-worker` `main()` before forcing exit on `SIGTERM`/`SIGINT`. |
 
 ---
 
-## 5. Non-Terminal Failure Event & API Status Projection
+## 5. Graceful Shutdown Immediate Requeue & 90s PEL Reclaim
 
-### 5.1 Event Store Schema (`WorkflowExecutionFailedEvent`)
+### 5.1 Graceful Shutdown Sequence (`requeue_on_shutdown=True`)
+
+`document-ia-worker` configures its `ThreadConsumer` with `reclaim_idle_ms=redis_settings.EVENT_STREAM_RECLAIM_IDLE_MS` (`90000`), `drain_timeout_s=redis_settings.WORKER_DRAIN_TIMEOUT_S` (`20.0`), and `requeue_on_shutdown=True` (default remains `False` on `BaseConsumer` / `ThreadConsumer` / `AsyncIoConsumer` for backward compatibility).
+
+When `SIGTERM` or `SIGINT` is received (e.g., during rolling deployments or container restarts with a 30s `SIGKILL` grace period):
+
+1. **Drain Window (`0s -> 20s`)**: The consumer stops reading new messages and waits up to `WORKER_DRAIN_TIMEOUT_S` (`20.0s`) for in-flight threads to finish naturally while the heartbeat task keeps renewing active execution leases and PEL idle timers.
+2. **Fence First (`BaseConsumer._abort_unfinished_futures`)**: For each in-flight context still unfinished after the drain timeout, `ctx.tracker.abort("shutdown")` is invoked **first** and `ctx.handled = True` is set immediately so the background thread skips persistence and cannot be acknowledged later as a success.
+3. **Release Lease Before Requeue**: When `use_execution_lease=True`, `delivery.release_lease(...)` is called. If lease release raises an exception, the consumer fails closed (logs a warning with `msg_id` and exception class name, skips requeue and `XACK`, leaving the entry in the PEL).
+4. **Immediate Requeue Without Incrementing `retries`**: With `requeue_on_shutdown=True` and the lease released, `_requeue_once(..., retry_count, immediate=True)` atomically appends the entry back onto `event_stream` with the **same `retries` value** (an infrastructure shutdown is not an application failure and must not consume a retry budget slot), then calls `delivery.ack(redis, msg_id)` and removes `msg_id` from `_in_flight_ids`. A surviving peer worker can pick up the execution within milliseconds.
+5. **Fail-Closed Guarantee**: If `_requeue_once` raises a Redis error, `delivery.ack` is **not** called and the original message remains pending in the PEL for `XAUTOCLAIM`.
+6. **Hard Shutdown Deadline (`24s`)**: `CONSUMER_SHUTDOWN_TIMEOUT_S` defaults to `WORKER_SHUTDOWN_TIMEOUT_S` (`24.0s`), giving `4.0s` of headroom after the `20.0s` drain window for lease release, requeue, ACK, and cleanup before forcing exit ahead of a 30s container `SIGKILL`.
+
+### 5.2 Abrupt Crash Recovery (`EVENT_STREAM_RECLAIM_IDLE_MS = 90000`)
+
+If a worker terminates abruptly (`SIGKILL`, OOM kill, host crash) without executing graceful shutdown, its pending entries are reclaimed by surviving workers after `90s` instead of `300s`. Because `BaseConsumer._heartbeat_interval_s` computes `min(reclaim_idle_ms / 3, lease_ttl_ms / 2, watchdog_ms / 2) / 1000`, setting `EVENT_STREAM_RECLAIM_IDLE_MS = 90000` alongside `DEFAULT_LEASE_TTL_MS = 60000`, `max_processing_time_s = 120.0`, and `step_progress_timeout_s = 90.0` keeps the heartbeat cadence strictly unchanged at `30.0s` (`min(30000, 30000, 45000) / 1000 = 30.0s`).
+
+---
+
+## 6. Non-Terminal Failure Event & API Status Projection
+
+### 6.1 Event Store Schema (`WorkflowExecutionFailedEvent`)
 
 `WorkflowExecutionFailedEvent` includes:
 
@@ -113,7 +138,7 @@ is_terminal: bool = Field(
 - **Backward Compatibility**: Historical `WorkflowExecutionFailed` rows stored in PostgreSQL without `is_terminal` deserialize with `is_terminal=True`.
 - **Event Repository & Watchdog Compatibility**: `EventRepository.get_created_event_if_execution_not_completed_or_failed` and `WorkflowManager._is_terminal_event` inspect `event.get("is_terminal")` when present, falling back to `error_type == "RetryableException"` for legacy records.
 
-### 5.2 API Status Resolution (`ExecutionService`, `executions.py`, `workflow_service.py`)
+### 6.2 API Status Resolution (`ExecutionService`, `executions.py`, `workflow_service.py`)
 
 - When the latest event in PostgreSQL is `WorkflowExecutionFailedEvent(is_terminal=False)`:
   - `GET /api/v1/executions/{execution_id}` loads the execution's `WorkflowExecutionStartedEvent` via `EventStoreService.get_workflow_started_event(execution_id)` and returns `ExecutionStartedModel` (`status: "STARTED"`). `WorkflowService.wait_for_execution_result` projects the non-terminal failure directly as `ExecutionStartedModel` (`status: "STARTED"`) without an extra SQL lookup and keeps polling.
@@ -123,9 +148,9 @@ is_terminal: bool = Field(
 
 ---
 
-## 6. Security & Observability Controls
+## 7. Security & Observability Controls
 
-- **Zero PII / Document Leakage in Logs**: Delayed retry scheduling and promotion logs strictly record operational metadata (`stream`, `msg_id`, `execution_id`, `retries`, `delay_s`, `promoted_count`). Document payloads, presigned URLs, and error stack traces are never logged by the ZSET scheduler or Lua promotion loop.
+- **Zero PII / Document Leakage in Logs**: Delayed retry scheduling, promotion, and graceful-shutdown requeue logs strictly record operational metadata (`stream`, `msg_id`, `execution_id`, `retries`, `delay_s`, `promoted_count`, exception class name). Document payloads, presigned URLs, and error stack traces are never logged by the ZSET scheduler, Lua promotion loop, or shutdown requeue path.
 - **Delivery Metrics**:
   - `delivery_metric(stream, "retry_delayed", "created" | "existing" | "error")`
   - `delivery_metric(stream, "retry_promoted", "success" | "error", count)`

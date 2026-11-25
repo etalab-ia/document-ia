@@ -69,6 +69,7 @@ class AsyncIoConsumer(BaseConsumer[T]):
         ) = None,
         retry_backoff_delays_s: Sequence[float] = (0.0, 1.0, 10.0),
         delayed_retry_poll_interval_s: float = 0.5,
+        requeue_on_shutdown: bool = False,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
@@ -104,6 +105,7 @@ class AsyncIoConsumer(BaseConsumer[T]):
             on_terminal_failure=on_terminal_failure,
             retry_backoff_delays_s=retry_backoff_delays_s,
             delayed_retry_poll_interval_s=delayed_retry_poll_interval_s,
+            requeue_on_shutdown=requeue_on_shutdown,
         )
 
     def _submit_message(

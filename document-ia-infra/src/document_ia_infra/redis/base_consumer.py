@@ -125,6 +125,7 @@ class BaseConsumer(ABC, Generic[T]):
         ) = None,
         retry_backoff_delays_s: Sequence[float] = (0.0, 1.0, 10.0),
         delayed_retry_poll_interval_s: float = 0.5,
+        requeue_on_shutdown: bool = False,
     ) -> None:
         if max_retry_number < 1:
             raise ValueError("max_retry_number must be >= 1")
@@ -189,6 +190,7 @@ class BaseConsumer(ABC, Generic[T]):
         self.max_processing_time_s = max_processing_time_s
         self.step_progress_timeout_s = step_progress_timeout_s
         self.use_execution_lease = use_execution_lease
+        self.requeue_on_shutdown = requeue_on_shutdown
         self.on_terminal_failure = on_terminal_failure
         self.lease_ttl_ms = (
             lease_ttl_ms
@@ -306,30 +308,79 @@ class BaseConsumer(ABC, Generic[T]):
         self, unfinished: list[asyncio.Future[Any]]
     ) -> None:
         """Hook appelé en sortie de boucle sur les futures non terminées après vidange."""
-        if not self.use_execution_lease:
+        if not self.use_execution_lease and not self.requeue_on_shutdown:
             return
         unfinished_futures = set(unfinished)
         for ctx in list(self._in_flight_contexts.values()):
-            if ctx.handled or not ctx.execution_id or not ctx.lease_token:
+            if ctx.handled:
                 continue
             if ctx.future is not None and ctx.future not in unfinished_futures:
                 continue
-            # Fencer le handler AVANT de libérer son bail : un handler threadé
-            # n'est pas interruptible et peut encore committer. Libérer le bail
-            # en premier laisserait une livraison concurrente démarrer pendant
-            # que l'ancien handler passe encore les gardes `is_aborted`.
+            # Fencer le handler AVANT de libérer son bail ou de remettre le message
+            # en file : un handler threadé n'est pas interruptible et peut encore
+            # committer. Libérer le bail en premier laisserait une livraison
+            # concurrente démarrer pendant que l'ancien handler passe encore les
+            # gardes `is_aborted`.
             if not ctx.tracker.is_aborted:
                 ctx.tracker.abort("shutdown")
             # Marquer la livraison comme traitée : le handler fencé peut revenir
             # « en succès » (il saute la persistance). Sans cette marque il serait
             # acquitté normalement et l'exécution resterait inachevée, sans message
-            # en attente ni reprise planifiée. La laisser dans la PEL permet à la
-            # récupération de la reprendre.
+            # en attente ni reprise planifiée.
             ctx.handled = True
-            if self.redis is not None:
-                with contextlib.suppress(Exception):
-                    await self.delivery.release_lease(
-                        self.redis, ctx.execution_id, ctx.lease_token
+
+            lease_released = not self.use_execution_lease
+            if self.use_execution_lease and ctx.execution_id and ctx.lease_token:
+                if self.redis is not None:
+                    try:
+                        lease_released = bool(
+                            await self.delivery.release_lease(
+                                self.redis, ctx.execution_id, ctx.lease_token
+                            )
+                        )
+                        if not lease_released:
+                            logger.warning(
+                                "Execution lease not owned on shutdown "
+                                "(msg_id=%s); skipping immediate requeue and leaving entry pending",
+                                ctx.msg_id,
+                            )
+                    except Exception as lease_err:
+                        lease_released = False
+                        logger.warning(
+                            "Failed to release execution lease on shutdown "
+                            "(msg_id=%s): %s; leaving entry pending",
+                            ctx.msg_id,
+                            type(lease_err).__name__,
+                        )
+
+            if self.requeue_on_shutdown and self.redis is not None and lease_released:
+                try:
+                    retry_count = self._parse_retry_count(ctx.fields)
+                except Exception:
+                    retry_count = 0
+                try:
+                    requeued = await self._requeue_once(
+                        self.redis,
+                        ctx.msg_id,
+                        ctx.fields,
+                        retry_count,
+                        immediate=True,
+                    )
+                    if requeued:
+                        await self.delivery.ack(self.redis, ctx.msg_id)
+                        self._in_flight_ids.discard(ctx.msg_id)
+                        logger.info(
+                            "Requeued unfinished message on graceful shutdown "
+                            "(msg_id=%s, retries=%d)",
+                            ctx.msg_id,
+                            retry_count,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to requeue unfinished message on shutdown "
+                        "(msg_id=%s): %s; leaving entry pending",
+                        ctx.msg_id,
+                        type(exc).__name__,
                     )
 
     @abstractmethod
