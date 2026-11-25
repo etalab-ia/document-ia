@@ -446,72 +446,80 @@ async def run_load_test(
         rec.request_index: rec for rec in records_to_poll
     }
     completed_polls = 0
+    completed_success = 0
+    completed_failed = 0
+    completed_other = 0
     poll_phase_start = time.perf_counter()
 
     async def _poll_one(record: LoadRequestRecord) -> None:
         nonlocal poll_http_500_count, completed_polls
+        nonlocal completed_success, completed_failed, completed_other
         if not record.execution_id:
             return
-        async with poll_semaphore:
-            stagger = ((record.request_index - 1) % 5) * min(
-                0.2, config.poll_interval_s / 5.0
-            )
-            outcome = await client.poll_execution(
-                record.execution_id,
-                poll_interval_s=config.poll_interval_s,
-                max_timeout_s=config.max_timeout_s,
-                stagger_s=stagger,
-            )
-            poll_http_500_count += outcome.http_500_errors
-            record.final_status = outcome.final_status
+        stagger = ((record.request_index - 1) % 10) * min(
+            0.2, config.poll_interval_s / 10.0
+        )
+        outcome = await client.poll_execution(
+            record.execution_id,
+            poll_interval_s=config.poll_interval_s,
+            max_timeout_s=config.max_timeout_s,
+            stagger_s=stagger,
+            request_semaphore=poll_semaphore,
+        )
+        poll_http_500_count += outcome.http_500_errors
+        record.final_status = outcome.final_status
 
-            now = time.perf_counter()
-            server_proc_ms = (
-                _extract_server_processing_ms(outcome.last_response.body_json)
-                if outcome.last_response is not None
-                else None
+        now = time.perf_counter()
+        server_proc_ms = (
+            _extract_server_processing_ms(outcome.last_response.body_json)
+            if outcome.last_response is not None
+            else None
+        )
+        submitted_at = submitted_at_by_index.get(record.request_index)
+        req_start = req_start_by_index.get(record.request_index)
+
+        if server_proc_ms is not None:
+            record.process_ms = round(server_proc_ms, 2)
+        elif submitted_at is not None:
+            record.process_ms = round((now - submitted_at) * 1000.0, 2)
+        else:
+            record.process_ms = round(outcome.elapsed_ms, 2)
+
+        if req_start is not None:
+            record.total_ms = round((now - req_start) * 1000.0, 2)
+        else:
+            record.total_ms = round(record.submit_ms + record.process_ms, 2)
+
+        if outcome.final_status == "TIMEOUT":
+            record.error_detail = (
+                f"Timed out after {config.max_timeout_s:.1f}s (still non-terminal)"
             )
-            submitted_at = submitted_at_by_index.get(record.request_index)
-            req_start = req_start_by_index.get(record.request_index)
 
-            if server_proc_ms is not None:
-                record.process_ms = round(server_proc_ms, 2)
-            elif submitted_at is not None:
-                record.process_ms = round((now - submitted_at) * 1000.0, 2)
-            else:
-                record.process_ms = round(outcome.elapsed_ms, 2)
-
-            if req_start is not None:
-                record.total_ms = round((now - req_start) * 1000.0, 2)
-            else:
-                record.total_ms = round(record.submit_ms + record.process_ms, 2)
-
-            if outcome.final_status == "TIMEOUT":
-                record.error_detail = (
-                    f"Timed out after {config.max_timeout_s:.1f}s (still non-terminal)"
-                )
-
-            completed_polls += 1
-            pending_by_index.pop(record.request_index, None)
-            bar = _format_progress_bar(completed_polls, total_to_poll)
-            pct = (
-                round((completed_polls / total_to_poll) * 100)
-                if total_to_poll > 0
-                else 100
+        completed_polls += 1
+        if record.final_status == "SUCCESS":
+            completed_success += 1
+        elif record.final_status == "FAILED":
+            completed_failed += 1
+        else:
+            completed_other += 1
+        pending_by_index.pop(record.request_index, None)
+        bar = _format_progress_bar(completed_polls, total_to_poll)
+        pct = (
+            round((completed_polls / total_to_poll) * 100) if total_to_poll > 0 else 100
+        )
+        _log_progress(
+            f"[POLL {bar} {completed_polls}/{total_to_poll} ({pct}%)] "
+            f"req=#{record.request_index:03d} execution_id={record.execution_id} "
+            f"-> {record.final_status} "
+            f"(process={record.process_ms:.0f}ms, total={record.total_ms:.0f}ms) "
+            f"| restant={len(pending_by_index)}"
+        )
+        if 0 < len(pending_by_index) <= 10:
+            pending_summary = ", ".join(
+                f"#{r.request_index:03d}:{r.execution_id}({r.fixture_name})"
+                for r in pending_by_index.values()
             )
-            _log_progress(
-                f"[POLL {bar} {completed_polls}/{total_to_poll} ({pct}%)] "
-                f"req=#{record.request_index:03d} execution_id={record.execution_id} "
-                f"-> {record.final_status} "
-                f"(process={record.process_ms:.0f}ms, total={record.total_ms:.0f}ms) "
-                f"| restant={len(pending_by_index)}"
-            )
-            if 0 < len(pending_by_index) <= 10:
-                pending_summary = ", ".join(
-                    f"#{r.request_index:03d}:{r.execution_id}({r.fixture_name})"
-                    for r in pending_by_index.values()
-                )
-                _log_progress(f"[PENDING ({len(pending_by_index)})] {pending_summary}")
+            _log_progress(f"[PENDING ({len(pending_by_index)})] {pending_summary}")
 
     heartbeat_interval_s = max(5.0, min(config.poll_interval_s, 15.0))
 
@@ -523,8 +531,17 @@ async def run_load_test(
                     break
                 elapsed = time.perf_counter() - poll_phase_start
                 pending_list = list(pending_by_index.values())
+                breakdown_suffix = ""
+                if completed_failed > 0 or completed_other > 0:
+                    parts = [f"SUCCESS={completed_success}"]
+                    if completed_failed > 0:
+                        parts.append(f"FAILED={completed_failed}")
+                    if completed_other > 0:
+                        parts.append(f"OTHER={completed_other}")
+                    breakdown_suffix = f" ({', '.join(parts)})"
                 _log_progress(
-                    f"[WAIT {elapsed:.0f}s] {completed_polls}/{total_to_poll} terminées, "
+                    f"[WAIT {elapsed:.0f}s] {completed_polls}/{total_to_poll} terminées"
+                    f"{breakdown_suffix}, "
                     f"{len(pending_list)} encore en cours (STARTED)..."
                 )
                 if len(pending_list) <= 15:

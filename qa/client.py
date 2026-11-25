@@ -401,10 +401,14 @@ class DocumentIAClient:
         poll_interval_s: float | None = None,
         max_timeout_s: float | None = None,
         stagger_s: float = 0.0,
+        request_semaphore: asyncio.Semaphore | None = None,
     ) -> PollOutcome:
         """Poll GET /api/v1/executions/{id} until terminal status or timeout.
 
         Resilient to transient 429/502/503/504 responses and httpx transport errors.
+        When ``request_semaphore`` is provided, it is acquired only around the
+        in-flight HTTP ``GET`` request and released before any backoff or sleep,
+        preventing head-of-line blocking across concurrent pollers.
         """
         interval = (
             poll_interval_s
@@ -441,7 +445,11 @@ class DocumentIAClient:
 
             polls += 1
             try:
-                resp = await self.get_execution(execution_id)
+                if request_semaphore is not None:
+                    async with request_semaphore:
+                        resp = await self.get_execution(execution_id)
+                else:
+                    resp = await self.get_execution(execution_id)
                 last_response = resp
                 if resp.status_code == 200 and isinstance(resp.body_json, dict):
                     status = str(resp.body_json.get("status", "")).upper()

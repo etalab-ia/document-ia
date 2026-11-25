@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import time
 import uuid
@@ -619,3 +620,193 @@ async def test_load_runner_emits_realtime_progress_logs(
     assert "[LOAD] Phase 1 terminée : 2/2 exécutions acceptées" in captured
     assert "[POLL [" in captured
     assert "[PENDING (1)]" in captured
+
+
+@pytest.mark.asyncio
+async def test_load_runner_polling_has_no_head_of_line_blocking(
+    tmp_path: Path,
+) -> None:
+    """Stuck STARTED executions (> poll_semaphore capacity) must not block polling of finished ones."""
+    post_counter = 0
+    stuck_ids = {f"exec-{i}" for i in range(1, 13)}
+    fast_ids = {"exec-13", "exec-14", "exec-15"}
+
+    in_flight_gets = 0
+    max_in_flight_gets = 0
+    polls_by_exec: dict[str, int] = {}
+    first_poll_started_at: float | None = None
+    success_completed_at: dict[str, float] = {}
+    last_stuck_poll_at: dict[str, float] = {}
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal post_counter, in_flight_gets, max_in_flight_gets, first_poll_started_at
+        if req.url.path == "/api/v1/health":
+            return httpx.Response(200, json={"status": "healthy"})
+        if req.method == "POST":
+            post_counter += 1
+            return httpx.Response(
+                200, json={"data": {"execution_id": f"exec-{post_counter}"}}
+            )
+        if req.method == "GET" and req.url.path.startswith("/api/v1/executions/"):
+            eid = req.url.path.rsplit("/", 1)[-1]
+            if first_poll_started_at is None:
+                first_poll_started_at = time.perf_counter()
+            in_flight_gets += 1
+            max_in_flight_gets = max(max_in_flight_gets, in_flight_gets)
+            try:
+                await asyncio.sleep(0.01)
+                polls_by_exec[eid] = polls_by_exec.get(eid, 0) + 1
+                if eid in stuck_ids:
+                    last_stuck_poll_at[eid] = time.perf_counter()
+                    return httpx.Response(
+                        200, json={"id": eid, "status": "STARTED", "data": {}}
+                    )
+                success_completed_at[eid] = time.perf_counter()
+                return httpx.Response(
+                    200, json={"id": eid, "status": "SUCCESS", "data": {}}
+                )
+            finally:
+                in_flight_gets -= 1
+        return httpx.Response(404)
+
+    cfg = LoadConfig(
+        requests=15,
+        concurrency=2,  # poll_semaphore limit = max(2, 10) = 10; 12 stuck > 10!
+        use_idempotency_key=False,
+        poll_interval_s=0.10,
+        max_timeout_s=0.45,
+        show_progress=False,
+    )
+
+    async with DocumentIAClient(
+        _make_env(), transport=httpx.MockTransport(handler)
+    ) as client:
+        report = await run_load_test(client, cfg, fixtures_dir=tmp_path)
+
+    assert report.accepted_count == 15
+    assert report.success_count == 3
+    assert report.timeout_count == 12
+    assert report.assertions.zero_drop is False
+    assert set(report.assertions.dropped_execution_ids) == stuck_ids
+
+    # In-flight GET concurrency never exceeds poll_semaphore = max(concurrency, 10)
+    assert 1 <= max_in_flight_gets <= 10
+
+    # All 3 fast executions were detected on their first polling cycle, well before stuck ones timed out
+    assert first_poll_started_at is not None
+    assert set(success_completed_at.keys()) == fast_ids
+    for eid in fast_ids:
+        assert polls_by_exec[eid] == 1
+        assert (success_completed_at[eid] - first_poll_started_at) < 0.25
+
+    assert max(success_completed_at.values()) < min(last_stuck_poll_at.values())
+
+    fast_records = [r for r in report.records if r.execution_id in fast_ids]
+    assert len(fast_records) == 3
+    for rec in fast_records:
+        assert rec.final_status == "SUCCESS"
+        assert rec.total_ms < 250.0
+
+    for eid in stuck_ids:
+        assert polls_by_exec[eid] >= 2
+
+
+@pytest.mark.asyncio
+async def test_load_runner_poll_http_concurrency_bounded_by_semaphore(
+    tmp_path: Path,
+) -> None:
+    """Simultaneous in-flight GET /api/v1/executions/{id} calls must stay bounded by max(concurrency, 10)."""
+    post_counter = 0
+    in_flight_gets = 0
+    max_in_flight_gets = 0
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal post_counter, in_flight_gets, max_in_flight_gets
+        if req.url.path == "/api/v1/health":
+            return httpx.Response(200, json={"status": "healthy"})
+        if req.method == "POST":
+            post_counter += 1
+            return httpx.Response(
+                200, json={"data": {"execution_id": f"exec-conc-{post_counter}"}}
+            )
+        if req.method == "GET" and req.url.path.startswith("/api/v1/executions/"):
+            eid = req.url.path.rsplit("/", 1)[-1]
+            in_flight_gets += 1
+            max_in_flight_gets = max(max_in_flight_gets, in_flight_gets)
+            try:
+                await asyncio.sleep(0.03)
+                return httpx.Response(
+                    200, json={"id": eid, "status": "SUCCESS", "data": {}}
+                )
+            finally:
+                in_flight_gets -= 1
+        return httpx.Response(404)
+
+    cfg = LoadConfig(
+        requests=25,
+        concurrency=2,  # poll_semaphore = max(2, 10) = 10
+        use_idempotency_key=False,
+        poll_interval_s=0.01,
+        max_timeout_s=2.0,
+        show_progress=False,
+    )
+
+    async with DocumentIAClient(
+        _make_env(), transport=httpx.MockTransport(handler)
+    ) as client:
+        report = await run_load_test(client, cfg, fixtures_dir=tmp_path)
+
+    assert report.accepted_count == 25
+    assert report.success_count == 25
+    assert report.assertions.all_passed is True
+    assert 2 <= max_in_flight_gets <= 10
+
+
+@pytest.mark.asyncio
+async def test_poll_execution_releases_request_semaphore_during_sleep() -> None:
+    """DocumentIAClient.poll_execution acquires request_semaphore only for the HTTP GET."""
+    in_flight_gets = 0
+    max_in_flight_gets = 0
+    stuck_ids = {"exec-1", "exec-2", "exec-3", "exec-4"}
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal in_flight_gets, max_in_flight_gets
+        if req.method == "GET" and req.url.path.startswith("/api/v1/executions/"):
+            eid = req.url.path.rsplit("/", 1)[-1]
+            in_flight_gets += 1
+            max_in_flight_gets = max(max_in_flight_gets, in_flight_gets)
+            try:
+                await asyncio.sleep(0.015)
+                status = "STARTED" if eid in stuck_ids else "SUCCESS"
+                return httpx.Response(
+                    200, json={"id": eid, "status": status, "data": {}}
+                )
+            finally:
+                in_flight_gets -= 1
+        return httpx.Response(404)
+
+    sem = asyncio.Semaphore(2)
+    async with DocumentIAClient(
+        _make_env(), transport=httpx.MockTransport(handler)
+    ) as client:
+        outcomes = await asyncio.gather(
+            *[
+                client.poll_execution(
+                    f"exec-{i}",
+                    poll_interval_s=0.08,
+                    max_timeout_s=0.35,
+                    request_semaphore=sem,
+                )
+                for i in range(1, 7)
+            ]
+        )
+
+    assert max_in_flight_gets == 2
+    by_id = {o.execution_id: o for o in outcomes}
+    for eid in stuck_ids:
+        assert by_id[eid].final_status == "TIMEOUT"
+        assert by_id[eid].polls >= 2
+    for eid in ("exec-5", "exec-6"):
+        assert by_id[eid].final_status == "SUCCESS"
+        assert by_id[eid].polls == 1
+        assert by_id[eid].elapsed_ms < 150.0
