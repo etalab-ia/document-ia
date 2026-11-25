@@ -732,11 +732,21 @@ async def test_graceful_shutdown_requeues_immediately_and_peer_resumes(
         assert len(copies) == 1
         assert copies[0][1]["retries"] == str(initial_retries)
 
+        # worker1.stop() must complete promptly BEFORE the blocked handler thread is released
+        # (no extra drain_timeout_s + 5s / heartbeat wait), while preserving has_running_handlers.
+        await asyncio.wait_for(stop_task, timeout=2.0)
+        stop_task = None
+        assert worker1.has_running_handlers is True
+
         # Release the fenced worker1 thread so it exits normally without double-ACKing or erroring.
         worker1_release.set()
-        await asyncio.wait_for(stop_task, timeout=5.0)
-        stop_task = None
-        assert worker1_saw_abort == ["shutdown"]
+        await _wait_until(
+            lambda: (
+                not worker1.has_running_handlers and worker1_saw_abort == ["shutdown"]
+            ),
+            timeout=3.0,
+        )
+        assert len(worker1._processing_futures) == 0
 
         # Start worker2: it must pick up the requeued message immediately (reclaim_idle_ms is 90s!).
         await worker2.start()
@@ -839,3 +849,320 @@ async def test_graceful_shutdown_fail_closed_in_redis_when_requeue_or_lease_rele
                 )
         finally:
             await redis_client.delete(sub_stream, f"{sub_stream}:dlq")
+
+
+@pytest.mark.asyncio
+async def test_abort_unfinished_futures_reconnects_when_redis_was_invalidated() -> None:
+    """If self.redis was invalidated (None) prior to shutdown abort, _ensure_connection() is used."""
+
+    async def noop(_msg: ShutdownTestMessage, _rc: int, _is_last: bool) -> None:
+        return None
+
+    reconnected_redis = AsyncMock()
+    reconnect_rm = LocalRedisManager(reconnected_redis)
+
+    consumer = ThreadConsumer[ShutdownTestMessage](
+        consumer_name="worker-1",
+        consumer_group="group-1",
+        stream_name="stream-1",
+        batch_size=1,
+        block_time=10,
+        message_class=ShutdownTestMessage,
+        process_message_callable=noop,
+        use_execution_lease=True,
+        requeue_on_shutdown=True,
+        current_redis_manager=reconnect_rm,
+    )
+    consumer.redis = None
+
+    fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    msg_id = "1700000000005-0"
+    exec_id = "exec-reconnect-1"
+    token = "worker-1:tok-reconnect"
+    fields = {"data": json.dumps({"workflow_execution_id": exec_id}), "retries": "1"}
+    tracker = ProgressTracker(msg_id=msg_id, execution_id=exec_id, lease_token=token)
+    ctx = InFlightContext(
+        msg_id=msg_id,
+        fields=fields,
+        tracker=tracker,
+        future=fut,
+        execution_id=exec_id,
+        lease_token=token,
+    )
+    consumer._in_flight_ids.add(msg_id)
+    consumer._in_flight_contexts[msg_id] = ctx
+
+    release_mock = AsyncMock(return_value=True)
+    requeue_mock = AsyncMock(return_value=True)
+    ack_mock = AsyncMock()
+    consumer.delivery.release_lease = release_mock  # type: ignore[method-assign]
+    consumer._requeue_once = requeue_mock  # type: ignore[method-assign]
+    consumer.delivery.ack = ack_mock  # type: ignore[method-assign]
+
+    await consumer._abort_unfinished_futures([fut])
+
+    assert tracker.is_aborted
+    assert tracker.abort_reason == "shutdown"
+    assert ctx.handled is True
+    release_mock.assert_awaited_once_with(reconnected_redis, exec_id, token)
+    requeue_mock.assert_awaited_once_with(
+        reconnected_redis, msg_id, fields, 1, immediate=True
+    )
+    ack_mock.assert_awaited_once_with(reconnected_redis, msg_id)
+    assert msg_id not in consumer._in_flight_ids
+
+
+@pytest.mark.asyncio
+async def test_abort_unfinished_futures_fail_closed_when_reconnect_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When self.redis is None and _ensure_connection() raises, fail closed without leaking secrets."""
+
+    async def noop(_msg: ShutdownTestMessage, _rc: int, _is_last: bool) -> None:
+        return None
+
+    class FailingRedisManager(RedisManager):
+        async def get_connection(self) -> Redis:
+            raise ConnectionError("redis://user:SECRET_REDIS_PASSWORD@host:6379/0")
+
+    consumer = ThreadConsumer[ShutdownTestMessage](
+        consumer_name="worker-1",
+        consumer_group="group-1",
+        stream_name="stream-1",
+        batch_size=1,
+        block_time=10,
+        message_class=ShutdownTestMessage,
+        process_message_callable=noop,
+        use_execution_lease=True,
+        requeue_on_shutdown=True,
+        current_redis_manager=FailingRedisManager(),
+    )
+    consumer.redis = None
+
+    fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    msg_id = "1700000000006-0"
+    secret_payload = "SENSITIVE_PAYLOAD_NO_REDIS"
+    fields = {
+        "data": json.dumps(
+            {"workflow_execution_id": "exec-reconnect-fail", "payload": secret_payload}
+        ),
+        "retries": "0",
+    }
+    tracker = ProgressTracker(
+        msg_id=msg_id, execution_id="exec-reconnect-fail", lease_token="tok-fail"
+    )
+    ctx = InFlightContext(
+        msg_id=msg_id,
+        fields=fields,
+        tracker=tracker,
+        future=fut,
+        execution_id="exec-reconnect-fail",
+        lease_token="tok-fail",
+    )
+    consumer._in_flight_ids.add(msg_id)
+    consumer._in_flight_contexts[msg_id] = ctx
+
+    release_mock = AsyncMock(return_value=True)
+    requeue_mock = AsyncMock(return_value=True)
+    ack_mock = AsyncMock()
+    consumer.delivery.release_lease = release_mock  # type: ignore[method-assign]
+    consumer._requeue_once = requeue_mock  # type: ignore[method-assign]
+    consumer.delivery.ack = ack_mock  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING):
+        await consumer._abort_unfinished_futures([fut])
+
+    assert tracker.is_aborted
+    assert tracker.abort_reason == "shutdown"
+    assert ctx.handled is True
+    release_mock.assert_not_awaited()
+    requeue_mock.assert_not_awaited()
+    ack_mock.assert_not_awaited()
+    assert msg_id in consumer._in_flight_ids
+    assert "SECRET_REDIS_PASSWORD" not in caplog.text
+    assert secret_payload not in caplog.text
+    assert any(
+        rec.levelno == logging.WARNING and "ConnectionError" in rec.message
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_thread_consumer_start_consumer_returns_promptly_after_drain_timeout_while_handler_blocked(
+    redis_client: Redis,
+    stream: str,
+) -> None:
+    """ThreadConsumer.start_consumer() (worker path) returns promptly after drain_timeout_s
+    even while a fenced handler thread is still blocked, keeping has_running_handlers True."""
+    group = f"group-start-consumer-{uuid4()}"
+    exec_id = f"exec-start-consumer-{uuid4()}"
+    original_msg_id = await redis_client.xadd(
+        stream,
+        {
+            "data": json.dumps({"workflow_execution_id": exec_id, "payload": "doc"}),
+            "retries": "0",
+        },
+    )
+
+    started = threading.Event()
+    release = threading.Event()
+    saw_abort: list[str | None] = []
+
+    async def blocking_handler(
+        _message: ShutdownTestMessage, _retry_count: int, _is_last: bool
+    ) -> None:
+        started.set()
+        await asyncio.to_thread(release.wait)
+        tracker = get_current_progress_tracker()
+        saw_abort.append(tracker.abort_reason if tracker is not None else None)
+
+    rm = LocalRedisManager(redis_client)
+    consumer = ThreadConsumer[ShutdownTestMessage](
+        consumer_name=f"worker-sc-{uuid4()}",
+        consumer_group=group,
+        stream_name=stream,
+        batch_size=1,
+        block_time=20,
+        drain_timeout_s=0.15,
+        message_class=ShutdownTestMessage,
+        process_message_callable=blocking_handler,
+        reclaim_idle_ms=90000,
+        lease_ttl_ms=60000,
+        step_progress_timeout_s=90.0,
+        max_processing_time_s=120.0,
+        use_execution_lease=True,
+        requeue_on_shutdown=True,
+        close_redis_on_stop=False,
+        current_redis_manager=rm,
+    )
+    consumer._heartbeat_interval_s = 0.05
+
+    consumer_task = asyncio.create_task(consumer.start_consumer())
+    lease_key = consumer.delivery.execution_lease_key(exec_id)
+    try:
+        await _wait_until(started.is_set, timeout=3.0)
+        assert await redis_client.get(lease_key) is not None
+
+        # Trigger graceful shutdown like document-ia-worker SIGTERM handler.
+        consumer.stop_flag.set()
+
+        # Must return well before drain_timeout_s + 5s (no _drain_pending / heartbeat stall).
+        await asyncio.wait_for(consumer_task, timeout=2.0)
+
+        assert consumer.has_running_handlers is True
+        assert consumer._draining is False
+        assert consumer.heartbeat_task is not None and consumer.heartbeat_task.done()
+        assert await redis_client.get(lease_key) is None
+        assert _pending_count(await redis_client.xpending(stream, group)) == 0
+        entries = await redis_client.xrange(stream)
+        copies = [
+            (eid, fields)
+            for eid, fields in entries
+            if eid != original_msg_id and fields.get("original_id") == original_msg_id
+        ]
+        assert len(copies) == 1
+        assert copies[0][1]["retries"] == "0"
+
+        release.set()
+        await _wait_until(
+            lambda: not consumer.has_running_handlers and saw_abort == ["shutdown"],
+            timeout=3.0,
+        )
+        assert len(consumer._processing_futures) == 0
+    finally:
+        release.set()
+        consumer.stop_flag.set()
+        if not consumer_task.done():
+            await asyncio.wait_for(consumer_task, timeout=5.0)
+        await redis_client.delete(lease_key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_retries", [0, 1])
+async def test_asyncio_consumer_requeue_on_shutdown_fences_releases_lease_requeues_and_acks(
+    redis_client: Redis,
+    stream: str,
+    initial_retries: int,
+) -> None:
+    """AsyncIoConsumer with use_execution_lease=True and requeue_on_shutdown=True fences
+    with abort_reason='shutdown', cancels the coroutine, releases lease, requeues immediately
+    with unchanged retries, and ACKs the original entry (pending==0)."""
+    group = f"group-asyncio-{uuid4()}"
+    exec_id = f"exec-asyncio-{uuid4()}"
+    original_msg_id = await redis_client.xadd(
+        stream,
+        {
+            "data": json.dumps({"workflow_execution_id": exec_id, "payload": "doc"}),
+            "retries": str(initial_retries),
+        },
+    )
+
+    started = asyncio.Event()
+    never_finishes = asyncio.Event()
+    observed_in_finally: list[tuple[bool, bool, str | None]] = []
+
+    async def blocking_coro_handler(
+        _message: ShutdownTestMessage, _retry_count: int, _is_last: bool
+    ) -> None:
+        started.set()
+        cancelled = False
+        try:
+            await never_finishes.wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            tracker = get_current_progress_tracker()
+            observed_in_finally.append(
+                (
+                    cancelled,
+                    tracker.is_aborted if tracker is not None else False,
+                    tracker.abort_reason if tracker is not None else None,
+                )
+            )
+
+    rm = LocalRedisManager(redis_client)
+    consumer = AsyncIoConsumer[ShutdownTestMessage](
+        consumer_name=f"api-asyncio-{uuid4()}",
+        consumer_group=group,
+        stream_name=stream,
+        batch_size=1,
+        block_time=20,
+        drain_timeout_s=0.15,
+        message_class=ShutdownTestMessage,
+        process_message_callable=blocking_coro_handler,
+        reclaim_idle_ms=90000,
+        lease_ttl_ms=60000,
+        use_execution_lease=True,
+        requeue_on_shutdown=True,
+        close_redis_on_stop=False,
+        current_redis_manager=rm,
+    )
+    consumer._heartbeat_interval_s = 0.05
+    lease_key = consumer.delivery.execution_lease_key(exec_id)
+
+    try:
+        await consumer.start()
+        await asyncio.wait_for(started.wait(), timeout=3.0)
+        assert await redis_client.get(lease_key) is not None
+
+        await asyncio.wait_for(consumer.stop(), timeout=2.0)
+
+        assert observed_in_finally == [(True, True, "shutdown")]
+        assert consumer.has_running_handlers is False
+        assert len(consumer._processing_futures) == 0
+        assert await redis_client.get(lease_key) is None
+        assert _pending_count(await redis_client.xpending(stream, group)) == 0
+
+        entries = await redis_client.xrange(stream)
+        copies = [
+            (eid, fields)
+            for eid, fields in entries
+            if eid != original_msg_id and fields.get("original_id") == original_msg_id
+        ]
+        assert len(copies) == 1
+        assert copies[0][1]["retries"] == str(initial_retries)
+    finally:
+        never_finishes.set()
+        await consumer.stop()
+        await redis_client.delete(lease_key)
