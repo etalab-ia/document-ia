@@ -1166,3 +1166,200 @@ async def test_asyncio_consumer_requeue_on_shutdown_fences_releases_lease_requeu
         never_finishes.set()
         await consumer.stop()
         await redis_client.delete(lease_key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_retry_number", "initial_retries"),
+    [(1, 0), (3, 1)],
+)
+async def test_asyncio_consumer_shutdown_cleanup_excluded_from_watchdog_when_requeuing(
+    redis_client: Redis,
+    stream: str,
+    max_retry_number: int,
+    initial_retries: int,
+) -> None:
+    """AsyncIoConsumer with requeue_on_shutdown=True must reserve contexts for shutdown
+    before awaiting cancellation cleanup so the heartbeat watchdog never intercepts them
+    (no retry increment, no DLQ on final attempt) and still releases lease + requeues."""
+    group = f"group-asyncio-wd-req-{uuid4()}"
+    exec_id = f"exec-asyncio-wd-req-{uuid4()}"
+    original_msg_id = await redis_client.xadd(
+        stream,
+        {
+            "data": json.dumps({"workflow_execution_id": exec_id, "payload": "doc"}),
+            "retries": str(initial_retries),
+        },
+    )
+
+    started = asyncio.Event()
+    never_finishes = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    heartbeat_cycle_done = asyncio.Event()
+    heartbeat_ticks_during_cleanup = 0
+    terminal_failures: list[tuple[str, str]] = []
+
+    async def on_terminal_failure(
+        msg_id: str, _fields: dict[str, Any], reason: str
+    ) -> None:
+        terminal_failures.append((msg_id, reason))
+
+    async def slow_cleanup_handler(
+        _message: ShutdownTestMessage, _retry_count: int, _is_last: bool
+    ) -> None:
+        started.set()
+        try:
+            await never_finishes.wait()
+        finally:
+            cleanup_entered.set()
+            await asyncio.wait_for(heartbeat_cycle_done.wait(), timeout=2.0)
+
+    rm = LocalRedisManager(redis_client)
+    consumer = AsyncIoConsumer[ShutdownTestMessage](
+        consumer_name=f"api-asyncio-wd-{uuid4()}",
+        consumer_group=group,
+        stream_name=stream,
+        batch_size=1,
+        block_time=20,
+        drain_timeout_s=0.1,
+        max_retry_number=max_retry_number,
+        message_class=ShutdownTestMessage,
+        process_message_callable=slow_cleanup_handler,
+        reclaim_idle_ms=90000,
+        lease_ttl_ms=60000,
+        use_execution_lease=True,
+        requeue_on_shutdown=True,
+        on_terminal_failure=on_terminal_failure,
+        close_redis_on_stop=False,
+        current_redis_manager=rm,
+    )
+    consumer._heartbeat_interval_s = 0.02
+    orig_fence = consumer._fence_expired_leases
+
+    def counting_fence(now: float) -> None:
+        nonlocal heartbeat_ticks_during_cleanup
+        if cleanup_entered.is_set():
+            heartbeat_ticks_during_cleanup += 1
+            if heartbeat_ticks_during_cleanup >= 2:
+                heartbeat_cycle_done.set()
+        orig_fence(now)
+
+    consumer._fence_expired_leases = counting_fence  # type: ignore[method-assign]
+    lease_key = consumer.delivery.execution_lease_key(exec_id)
+
+    try:
+        await consumer.start()
+        await asyncio.wait_for(started.wait(), timeout=3.0)
+        assert await redis_client.get(lease_key) is not None
+
+        await asyncio.wait_for(consumer.stop(), timeout=3.0)
+
+        assert terminal_failures == []
+        assert await redis_client.xlen(f"{stream}:dlq") == 0
+        assert await redis_client.get(lease_key) is None
+        assert _pending_count(await redis_client.xpending(stream, group)) == 0
+
+        entries = await redis_client.xrange(stream)
+        copies = [
+            (eid, fields)
+            for eid, fields in entries
+            if eid != original_msg_id and fields.get("original_id") == original_msg_id
+        ]
+        assert len(copies) == 1
+        assert copies[0][1]["retries"] == str(initial_retries)
+        # Positive plumbing check: a full heartbeat iteration ran during cleanup.
+        assert heartbeat_ticks_during_cleanup >= 2
+    finally:
+        never_finishes.set()
+        heartbeat_cycle_done.set()
+        await consumer.stop()
+        await redis_client.delete(lease_key)
+
+
+@pytest.mark.asyncio
+async def test_asyncio_consumer_shutdown_cleanup_excluded_from_watchdog_without_requeue(
+    redis_client: Redis,
+    stream: str,
+) -> None:
+    """AsyncIoConsumer with use_execution_lease=False and requeue_on_shutdown=False must
+    not trigger watchdog timeout handling during cancellation cleanup; entry stays pending
+    in PEL with no retry increment and no DLQ write."""
+    group = f"group-asyncio-wd-noreq-{uuid4()}"
+    exec_id = f"exec-asyncio-wd-noreq-{uuid4()}"
+    original_msg_id = await redis_client.xadd(
+        stream,
+        {
+            "data": json.dumps({"workflow_execution_id": exec_id, "payload": "doc"}),
+            "retries": "0",
+        },
+    )
+
+    started = asyncio.Event()
+    never_finishes = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    heartbeat_cycle_done = asyncio.Event()
+    heartbeat_ticks_during_cleanup = 0
+    terminal_failures: list[tuple[str, str]] = []
+
+    async def on_terminal_failure(
+        msg_id: str, _fields: dict[str, Any], reason: str
+    ) -> None:
+        terminal_failures.append((msg_id, reason))
+
+    async def slow_cleanup_handler(
+        _message: ShutdownTestMessage, _retry_count: int, _is_last: bool
+    ) -> None:
+        started.set()
+        try:
+            await never_finishes.wait()
+        finally:
+            cleanup_entered.set()
+            await asyncio.wait_for(heartbeat_cycle_done.wait(), timeout=2.0)
+
+    rm = LocalRedisManager(redis_client)
+    consumer = AsyncIoConsumer[ShutdownTestMessage](
+        consumer_name=f"api-asyncio-wd-nr-{uuid4()}",
+        consumer_group=group,
+        stream_name=stream,
+        batch_size=1,
+        block_time=20,
+        drain_timeout_s=0.1,
+        max_retry_number=1,
+        message_class=ShutdownTestMessage,
+        process_message_callable=slow_cleanup_handler,
+        reclaim_idle_ms=90000,
+        use_execution_lease=False,
+        requeue_on_shutdown=False,
+        on_terminal_failure=on_terminal_failure,
+        close_redis_on_stop=False,
+        current_redis_manager=rm,
+    )
+    consumer._heartbeat_interval_s = 0.02
+    orig_fence = consumer._fence_expired_leases
+
+    def counting_fence(now: float) -> None:
+        nonlocal heartbeat_ticks_during_cleanup
+        if cleanup_entered.is_set():
+            heartbeat_ticks_during_cleanup += 1
+            if heartbeat_ticks_during_cleanup >= 2:
+                heartbeat_cycle_done.set()
+        orig_fence(now)
+
+    consumer._fence_expired_leases = counting_fence  # type: ignore[method-assign]
+
+    try:
+        await consumer.start()
+        await asyncio.wait_for(started.wait(), timeout=3.0)
+
+        await asyncio.wait_for(consumer.stop(), timeout=3.0)
+
+        assert terminal_failures == []
+        assert await redis_client.xlen(f"{stream}:dlq") == 0
+        assert _pending_count(await redis_client.xpending(stream, group)) == 1
+        entries = await redis_client.xrange(stream)
+        assert [eid for eid, _ in entries] == [original_msg_id]
+        assert heartbeat_ticks_during_cleanup >= 2
+    finally:
+        never_finishes.set()
+        heartbeat_cycle_done.set()
+        await consumer.stop()

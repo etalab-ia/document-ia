@@ -304,12 +304,16 @@ class BaseConsumer(ABC, Generic[T]):
     async def _release_execution_resources(self) -> None:
         """Hook de libération des ressources propres au mode d'exécution."""
 
-    async def _abort_unfinished_futures(
+    def _reserve_unfinished_contexts_for_shutdown(
         self, unfinished: list[asyncio.Future[Any]]
-    ) -> None:
-        """Hook appelé en sortie de boucle sur les futures non terminées après vidange."""
-        if not self.use_execution_lease and not self.requeue_on_shutdown:
-            return
+    ) -> list[InFlightContext]:
+        """Fence et réserve les contextes en cours pour l'arrêt gracieux.
+
+        Doit être appelé de manière synchrone avant tout ``await`` (annulation de
+        tâches asyncio ou I/O Redis) afin d'empêcher ``_heartbeat_in_flight_entries``
+        de traiter ces entrées comme des timeouts watchdog (incrément de ``retries``
+        ou bascule en DLQ) pendant l'arrêt.
+        """
         unfinished_futures = set(unfinished)
         contexts_to_abort = [
             ctx
@@ -317,9 +321,6 @@ class BaseConsumer(ABC, Generic[T]):
             if not ctx.handled
             and (ctx.future is None or ctx.future in unfinished_futures)
         ]
-        if not contexts_to_abort:
-            return
-
         for ctx in contexts_to_abort:
             # Fencer le handler AVANT toute I/O Redis (reconnexion, libération de
             # bail ou remise en file) : un handler threadé n'est pas interruptible
@@ -330,9 +331,16 @@ class BaseConsumer(ABC, Generic[T]):
                 ctx.tracker.abort("shutdown")
             # Marquer la livraison comme traitée : le handler fencé peut revenir
             # « en succès » (il saute la persistance). Sans cette marque il serait
-            # acquitté normalement et l'exécution resterait inachevée, sans message
-            # en attente ni reprise planifiée.
+            # acquitté normalement ou intercepté par le watchdog de battement.
             ctx.handled = True
+        return contexts_to_abort
+
+    async def _release_and_requeue_shutdown_contexts(
+        self, contexts_to_abort: list[InFlightContext]
+    ) -> None:
+        """Libère les baux et remet optionnellement en file les contextes réservés."""
+        if not contexts_to_abort:
+            return
 
         redis_conn: Redis | None = self.redis
         if redis_conn is None:
@@ -415,6 +423,17 @@ class BaseConsumer(ABC, Generic[T]):
                         ctx.msg_id,
                         type(exc).__name__,
                     )
+
+    async def _abort_unfinished_futures(
+        self, unfinished: list[asyncio.Future[Any]]
+    ) -> None:
+        """Hook appelé en sortie de boucle sur les futures non terminées après vidange."""
+        if not self.use_execution_lease and not self.requeue_on_shutdown:
+            return
+        contexts_to_abort = self._reserve_unfinished_contexts_for_shutdown(unfinished)
+        if not contexts_to_abort:
+            return
+        await self._release_and_requeue_shutdown_contexts(contexts_to_abort)
 
     @abstractmethod
     def _submit_message(

@@ -132,14 +132,7 @@ class AsyncIoConsumer(BaseConsumer[T]):
     async def _abort_unfinished_futures(
         self, unfinished: list[asyncio.Future[Any]]
     ) -> None:
-        unfinished_set = set(unfinished)
-        for ctx in list(self._in_flight_contexts.values()):
-            if ctx.handled:
-                continue
-            if ctx.future is not None and ctx.future not in unfinished_set:
-                continue
-            if not ctx.tracker.is_aborted:
-                ctx.tracker.abort("shutdown")
+        contexts_to_abort = self._reserve_unfinished_contexts_for_shutdown(unfinished)
         for fut in unfinished:
             fut.cancel()
         try:
@@ -152,4 +145,5 @@ class AsyncIoConsumer(BaseConsumer[T]):
                 "Timeout waiting for %d aborted futures to exit during shutdown",
                 len(unfinished),
             )
-        await super()._abort_unfinished_futures(unfinished)
+        if contexts_to_abort and (self.use_execution_lease or self.requeue_on_shutdown):
+            await self._release_and_requeue_shutdown_contexts(contexts_to_abort)
