@@ -301,3 +301,46 @@ async def test_run_consumer_runs_crl_startup_refresh_before_consumer_and_cleans_
     assert events[:3] == ["startup_refresh", "start_consumer", "periodic_started"]
     assert periodic_finished.is_set()
     owner.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_consumer_passes_reclaim_drain_and_requeue_on_shutdown_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_consumer() doit transmettre reclaim_idle_ms, drain_timeout_s et
+    requeue_on_shutdown=True au ThreadConsumer et aligner CONSUMER_SHUTDOWN_TIMEOUT_S."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from document_ia_infra.redis.redis_settings import redis_settings
+    from document_ia_worker import main as worker_main
+
+    captured_kwargs: dict[str, Any] = {}
+
+    class CapturingConsumer[T]:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+            self.stop_flag = asyncio.Event()
+            self.has_running_handlers = False
+
+        async def start_consumer(self) -> None:
+            return None
+
+    owner = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setattr(worker_main, "_consumer", None)
+    monkeypatch.setattr(worker_main, "_prewarm_models_and_trust_store", lambda: None)
+    monkeypatch.setattr(worker_main, "RedisManager", lambda: owner)
+    monkeypatch.setattr(worker_main, "ThreadConsumer", CapturingConsumer)
+
+    await worker_main.run_consumer()
+
+    assert (
+        worker_main.CONSUMER_SHUTDOWN_TIMEOUT_S
+        == redis_settings.WORKER_SHUTDOWN_TIMEOUT_S
+    )
+    assert (
+        captured_kwargs["reclaim_idle_ms"]
+        == redis_settings.EVENT_STREAM_RECLAIM_IDLE_MS
+    )
+    assert captured_kwargs["drain_timeout_s"] == redis_settings.WORKER_DRAIN_TIMEOUT_S
+    assert captured_kwargs["requeue_on_shutdown"] is True

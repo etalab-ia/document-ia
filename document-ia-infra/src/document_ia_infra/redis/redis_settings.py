@@ -1,6 +1,6 @@
 import json
 import math
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -23,6 +23,7 @@ class RedisSettings(BaseDocumentIaSettings):
     WEBHOOK_STREAM_NAME: str = Field(default="webhook_stream")
     WEBHOOK_CONSUMER_GROUP: str = Field(default="webhook_consumer")
     EVENT_STREAM_EXPIRATION: int = Field(default=300)
+    EVENT_STREAM_RECLAIM_IDLE_MS: int = Field(default=90000, ge=1000)
     # Kept for configuration compatibility; publishers no longer trim streams.
     EVENT_STREAM_MAXLEN: int = Field(default=100000)
     DLQ_STREAM_MAXLEN: int = Field(default=100000)
@@ -34,6 +35,10 @@ class RedisSettings(BaseDocumentIaSettings):
         default=[0.0, 1.0, 10.0],
     )
     RETRY_DELAYED_POLL_INTERVAL_S: float = Field(default=0.5, gt=0.0, le=30.0)
+
+    # Worker graceful shutdown timeouts
+    WORKER_DRAIN_TIMEOUT_S: float = Field(default=20.0, ge=0.0, le=300.0)
+    WORKER_SHUTDOWN_TIMEOUT_S: float = Field(default=24.0, ge=1.0, le=300.0)
 
     ADMISSION_MAX_OUTSTANDING: int = Field(default=2000, ge=2)
     ADMISSION_RESUME_OUTSTANDING: int = Field(default=1600, ge=0)
@@ -83,8 +88,15 @@ class RedisSettings(BaseDocumentIaSettings):
             raise ValueError("RETRY_DELAYED_POLL_INTERVAL_S must be finite")
         return value
 
+    @field_validator("WORKER_DRAIN_TIMEOUT_S", "WORKER_SHUTDOWN_TIMEOUT_S")
+    @classmethod
+    def validate_worker_shutdown_timeout_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("Worker shutdown timeouts must be finite")
+        return value
+
     @model_validator(mode="after")
-    def validate_admission_thresholds(self):
+    def validate_admission_thresholds(self) -> Self:
         if self.ADMISSION_RESUME_OUTSTANDING >= self.ADMISSION_MAX_OUTSTANDING:
             raise ValueError("Admission resume count must be below the stop count")
         if self.ADMISSION_RESUME_AGE_SECONDS >= self.ADMISSION_MAX_AGE_SECONDS:
@@ -93,6 +105,14 @@ class RedisSettings(BaseDocumentIaSettings):
             raise ValueError("Admission resume history must be below the stop count")
         if self.EVENT_STREAM_NAME == self.WEBHOOK_STREAM_NAME:
             raise ValueError("Workflow and webhook streams must be distinct")
+        return self
+
+    @model_validator(mode="after")
+    def validate_worker_shutdown_timeouts(self) -> Self:
+        if self.WORKER_SHUTDOWN_TIMEOUT_S < self.WORKER_DRAIN_TIMEOUT_S:
+            raise ValueError(
+                "WORKER_SHUTDOWN_TIMEOUT_S must be >= WORKER_DRAIN_TIMEOUT_S"
+            )
         return self
 
     # Valeur du header `Retry-After` (en secondes) renvoyé quand une exécution ne

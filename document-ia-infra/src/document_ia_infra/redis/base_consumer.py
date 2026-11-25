@@ -125,6 +125,7 @@ class BaseConsumer(ABC, Generic[T]):
         ) = None,
         retry_backoff_delays_s: Sequence[float] = (0.0, 1.0, 10.0),
         delayed_retry_poll_interval_s: float = 0.5,
+        requeue_on_shutdown: bool = False,
     ) -> None:
         if max_retry_number < 1:
             raise ValueError("max_retry_number must be >= 1")
@@ -189,6 +190,7 @@ class BaseConsumer(ABC, Generic[T]):
         self.max_processing_time_s = max_processing_time_s
         self.step_progress_timeout_s = step_progress_timeout_s
         self.use_execution_lease = use_execution_lease
+        self.requeue_on_shutdown = requeue_on_shutdown
         self.on_terminal_failure = on_terminal_failure
         self.lease_ttl_ms = (
             lease_ttl_ms
@@ -302,35 +304,136 @@ class BaseConsumer(ABC, Generic[T]):
     async def _release_execution_resources(self) -> None:
         """Hook de libération des ressources propres au mode d'exécution."""
 
-    async def _abort_unfinished_futures(
+    def _reserve_unfinished_contexts_for_shutdown(
         self, unfinished: list[asyncio.Future[Any]]
-    ) -> None:
-        """Hook appelé en sortie de boucle sur les futures non terminées après vidange."""
-        if not self.use_execution_lease:
-            return
+    ) -> list[InFlightContext]:
+        """Fence et réserve les contextes en cours pour l'arrêt gracieux.
+
+        Doit être appelé de manière synchrone avant tout ``await`` (annulation de
+        tâches asyncio ou I/O Redis) afin d'empêcher ``_heartbeat_in_flight_entries``
+        de traiter ces entrées comme des timeouts watchdog (incrément de ``retries``
+        ou bascule en DLQ) pendant l'arrêt.
+        """
         unfinished_futures = set(unfinished)
-        for ctx in list(self._in_flight_contexts.values()):
-            if ctx.handled or not ctx.execution_id or not ctx.lease_token:
-                continue
-            if ctx.future is not None and ctx.future not in unfinished_futures:
-                continue
-            # Fencer le handler AVANT de libérer son bail : un handler threadé
-            # n'est pas interruptible et peut encore committer. Libérer le bail
-            # en premier laisserait une livraison concurrente démarrer pendant
-            # que l'ancien handler passe encore les gardes `is_aborted`.
+        contexts_to_abort = [
+            ctx
+            for ctx in list(self._in_flight_contexts.values())
+            if not ctx.handled
+            and (ctx.future is None or ctx.future in unfinished_futures)
+        ]
+        for ctx in contexts_to_abort:
+            # Fencer le handler AVANT toute I/O Redis (reconnexion, libération de
+            # bail ou remise en file) : un handler threadé n'est pas interruptible
+            # et peut encore committer. Libérer le bail en premier laisserait une
+            # livraison concurrente démarrer pendant que l'ancien handler passe
+            # encore les gardes `is_aborted`.
             if not ctx.tracker.is_aborted:
                 ctx.tracker.abort("shutdown")
             # Marquer la livraison comme traitée : le handler fencé peut revenir
             # « en succès » (il saute la persistance). Sans cette marque il serait
-            # acquitté normalement et l'exécution resterait inachevée, sans message
-            # en attente ni reprise planifiée. La laisser dans la PEL permet à la
-            # récupération de la reprendre.
+            # acquitté normalement ou intercepté par le watchdog de battement.
             ctx.handled = True
-            if self.redis is not None:
-                with contextlib.suppress(Exception):
-                    await self.delivery.release_lease(
-                        self.redis, ctx.execution_id, ctx.lease_token
+        return contexts_to_abort
+
+    async def _release_and_requeue_shutdown_contexts(
+        self, contexts_to_abort: list[InFlightContext]
+    ) -> None:
+        """Libère les baux et remet optionnellement en file les contextes réservés."""
+        if not contexts_to_abort:
+            return
+
+        redis_conn: Redis | None = self.redis
+        if redis_conn is None:
+            try:
+                redis_conn = await self._ensure_connection()
+            except Exception as conn_err:
+                logger.warning(
+                    "Failed to acquire Redis connection during shutdown abort: %s; "
+                    "leaving %d unfinished entry(ies) pending",
+                    type(conn_err).__name__,
+                    len(contexts_to_abort),
+                )
+                redis_conn = None
+
+        for ctx in contexts_to_abort:
+            lease_released = not self.use_execution_lease
+            if self.use_execution_lease and ctx.execution_id and ctx.lease_token:
+                if redis_conn is not None:
+                    try:
+                        lease_released = bool(
+                            await self.delivery.release_lease(
+                                redis_conn, ctx.execution_id, ctx.lease_token
+                            )
+                        )
+                        if not lease_released:
+                            logger.warning(
+                                "Execution lease not owned on shutdown "
+                                "(msg_id=%s); skipping immediate requeue and leaving entry pending",
+                                ctx.msg_id,
+                            )
+                    except Exception as lease_err:
+                        lease_released = False
+                        logger.warning(
+                            "Failed to release execution lease on shutdown "
+                            "(msg_id=%s): %s; leaving entry pending",
+                            ctx.msg_id,
+                            type(lease_err).__name__,
+                        )
+                else:
+                    lease_released = False
+                    logger.warning(
+                        "No Redis connection to release execution lease on shutdown "
+                        "(msg_id=%s); skipping immediate requeue and leaving entry pending",
+                        ctx.msg_id,
                     )
+
+            if self.requeue_on_shutdown and lease_released:
+                if redis_conn is None:
+                    logger.warning(
+                        "No Redis connection to requeue unfinished message on shutdown "
+                        "(msg_id=%s); leaving entry pending",
+                        ctx.msg_id,
+                    )
+                    continue
+                try:
+                    retry_count = self._parse_retry_count(ctx.fields)
+                except Exception:
+                    retry_count = 0
+                try:
+                    requeued = await self._requeue_once(
+                        redis_conn,
+                        ctx.msg_id,
+                        ctx.fields,
+                        retry_count,
+                        immediate=True,
+                    )
+                    if requeued:
+                        await self.delivery.ack(redis_conn, ctx.msg_id)
+                        self._in_flight_ids.discard(ctx.msg_id)
+                        logger.info(
+                            "Requeued unfinished message on graceful shutdown "
+                            "(msg_id=%s, retries=%d)",
+                            ctx.msg_id,
+                            retry_count,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to requeue unfinished message on shutdown "
+                        "(msg_id=%s): %s; leaving entry pending",
+                        ctx.msg_id,
+                        type(exc).__name__,
+                    )
+
+    async def _abort_unfinished_futures(
+        self, unfinished: list[asyncio.Future[Any]]
+    ) -> None:
+        """Hook appelé en sortie de boucle sur les futures non terminées après vidange."""
+        if not self.use_execution_lease and not self.requeue_on_shutdown:
+            return
+        contexts_to_abort = self._reserve_unfinished_contexts_for_shutdown(unfinished)
+        if not contexts_to_abort:
+            return
+        await self._release_and_requeue_shutdown_contexts(contexts_to_abort)
 
     @abstractmethod
     def _submit_message(
@@ -825,6 +928,7 @@ class BaseConsumer(ABC, Generic[T]):
                         ctx.future = fut
                         active_futures[fut] = (msg_id, fields)
                         self._processing_futures.add(fut)
+                        fut.add_done_callback(self._processing_futures.discard)
                     except Exception as submit_err:
                         logger.error(
                             "Failed to submit message %s for processing: %s",
@@ -879,6 +983,12 @@ class BaseConsumer(ABC, Generic[T]):
                         if unfinished:
                             await self._abort_unfinished_futures(unfinished)
                 finally:
+                    for f in list(active_futures):
+                        msg_id, _ = active_futures[f]
+                        ctx = self._in_flight_contexts.get(msg_id)
+                        if ctx is not None and ctx.handled:
+                            active_futures.pop(f, None)
+                            self._in_flight_contexts.pop(msg_id, None)
                     pending = {f for f in active_futures if not f.done()}
                     if pending:
                         pending_ids = {
@@ -891,7 +1001,9 @@ class BaseConsumer(ABC, Generic[T]):
                     else:
                         self._listener_done.set()
                         self._in_flight_ids.clear()
-                        self._processing_futures.clear()
+                        self._processing_futures.difference_update(
+                            {f for f in self._processing_futures if f.done()}
+                        )
                     self._listener_active = False
 
     async def _drain_pending(
@@ -1730,6 +1842,34 @@ class BaseConsumer(ABC, Generic[T]):
 
         attempts = retry_count + 1
         if attempts >= self.max_retry_number:
+            # Un arrêt gracieux peut avoir remis en file la dernière tentative en
+            # préservant `retries`, puis échoué sur l'ACK : si une copie existe déjà,
+            # acquitter l'original sans basculer en DLQ ni signaler un échec terminal.
+            try:
+                if await self.delivery.has_scheduled_retry(redis_connection, msg_id):
+                    logger.info(
+                        "Reclaimed message %s already has a replacement copy; "
+                        "acknowledging without DLQ",
+                        msg_id,
+                    )
+                    try:
+                        await self.delivery.ack(redis_connection, msg_id)
+                        logger.info(
+                            "Acknowledged reclaimed message %s (replacement already exists)",
+                            msg_id,
+                        )
+                    except Exception:
+                        logger.error("ACK failed for reclaimed message %s", msg_id)
+                    return
+            except Exception as check_err:
+                logger.error(
+                    "Failed to check existing replacement copy for reclaimed message %s: %s; "
+                    "leaving entry pending",
+                    msg_id,
+                    type(check_err).__name__,
+                )
+                return
+
             logger.error(
                 "Max attempts exceeded for reclaimed message %s. Moving to DLQ.",
                 msg_id,

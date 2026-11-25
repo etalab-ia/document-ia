@@ -44,7 +44,7 @@ except Exception:
     pass
 
 
-CONSUMER_SHUTDOWN_TIMEOUT_S = 22
+CONSUMER_SHUTDOWN_TIMEOUT_S: float = redis_settings.WORKER_SHUTDOWN_TIMEOUT_S
 CANCELLATION_CLEANUP_TIMEOUT_S = 3
 
 
@@ -160,11 +160,14 @@ async def run_consumer(stop_event: asyncio.Event | None = None) -> None:
         message_class=WorkflowExecutionMessage,
         process_message_callable=process_message,
         max_retry_number=redis_settings.WORKFLOW_MAX_RETRY_NUMBER,
+        reclaim_idle_ms=redis_settings.EVENT_STREAM_RECLAIM_IDLE_MS,
         reclaim_poll_interval_s=5.0,
+        drain_timeout_s=redis_settings.WORKER_DRAIN_TIMEOUT_S,
         current_redis_manager=redis_manager,
         max_processing_time_s=120.0,
         step_progress_timeout_s=90.0,
         use_execution_lease=True,
+        requeue_on_shutdown=True,
         on_terminal_failure=notify_watchdog_terminal_failure,
         retry_backoff_delays_s=redis_settings.WORKFLOW_RETRY_BACKOFF_DELAYS_S,
         delayed_retry_poll_interval_s=redis_settings.RETRY_DELAYED_POLL_INTERVAL_S,
