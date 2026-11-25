@@ -1842,6 +1842,34 @@ class BaseConsumer(ABC, Generic[T]):
 
         attempts = retry_count + 1
         if attempts >= self.max_retry_number:
+            # Un arrêt gracieux peut avoir remis en file la dernière tentative en
+            # préservant `retries`, puis échoué sur l'ACK : si une copie existe déjà,
+            # acquitter l'original sans basculer en DLQ ni signaler un échec terminal.
+            try:
+                if await self.delivery.has_scheduled_retry(redis_connection, msg_id):
+                    logger.info(
+                        "Reclaimed message %s already has a replacement copy; "
+                        "acknowledging without DLQ",
+                        msg_id,
+                    )
+                    try:
+                        await self.delivery.ack(redis_connection, msg_id)
+                        logger.info(
+                            "Acknowledged reclaimed message %s (replacement already exists)",
+                            msg_id,
+                        )
+                    except Exception:
+                        logger.error("ACK failed for reclaimed message %s", msg_id)
+                    return
+            except Exception as check_err:
+                logger.error(
+                    "Failed to check existing replacement copy for reclaimed message %s: %s; "
+                    "leaving entry pending",
+                    msg_id,
+                    type(check_err).__name__,
+                )
+                return
+
             logger.error(
                 "Max attempts exceeded for reclaimed message %s. Moving to DLQ.",
                 msg_id,

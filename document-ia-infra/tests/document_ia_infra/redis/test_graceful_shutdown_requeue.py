@@ -1363,3 +1363,160 @@ async def test_asyncio_consumer_shutdown_cleanup_excluded_from_watchdog_without_
         never_finishes.set()
         heartbeat_cycle_done.set()
         await consumer.stop()
+
+
+@pytest.mark.asyncio
+async def test_reclaim_final_attempt_after_shutdown_requeue_with_failed_ack_skips_dlq(
+    redis_client: Redis,
+    stream: str,
+) -> None:
+    """When graceful shutdown requeues a final-attempt entry (retries == max_retry_number - 1)
+    and the subsequent ACK fails, a peer reclaiming the original must detect the existing
+    replacement copy and ACK the original without writing to DLQ or notifying terminal failure."""
+    group = f"group-reclaim-final-dedup-{uuid4()}"
+    exec_id = f"exec-reclaim-final-dedup-{uuid4()}"
+    original_fields = {
+        "data": json.dumps({"workflow_execution_id": exec_id, "payload": "doc"}),
+        "retries": "2",
+    }
+    original_msg_id = await redis_client.xadd(stream, original_fields)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    async def blocking_handler(
+        _message: ShutdownTestMessage, _retry_count: int, _is_last: bool
+    ) -> None:
+        started.set()
+        await asyncio.to_thread(release.wait)
+
+    rm = LocalRedisManager(redis_client)
+    worker_a = ThreadConsumer[ShutdownTestMessage](
+        consumer_name=f"worker-a-{uuid4()}",
+        consumer_group=group,
+        stream_name=stream,
+        batch_size=1,
+        block_time=20,
+        drain_timeout_s=0.1,
+        max_retry_number=3,
+        message_class=ShutdownTestMessage,
+        process_message_callable=blocking_handler,
+        reclaim_idle_ms=90000,
+        lease_ttl_ms=60000,
+        use_execution_lease=True,
+        requeue_on_shutdown=True,
+        close_redis_on_stop=False,
+        current_redis_manager=rm,
+    )
+    worker_a._heartbeat_interval_s = 0.05
+    # Simulate ACK failure after shutdown's _requeue_once succeeds.
+    worker_a.delivery.ack = AsyncMock(  # type: ignore[method-assign]
+        side_effect=ConnectionError("ack lost during shutdown")
+    )
+
+    terminal_failures: list[tuple[str, str]] = []
+
+    async def on_terminal_failure(
+        msg_id: str, _fields: dict[str, Any], reason: str
+    ) -> None:
+        terminal_failures.append((msg_id, reason))
+
+    worker_b = ThreadConsumer[ShutdownTestMessage](
+        consumer_name=f"worker-b-{uuid4()}",
+        consumer_group=group,
+        stream_name=stream,
+        batch_size=1,
+        block_time=20,
+        max_retry_number=3,
+        message_class=ShutdownTestMessage,
+        process_message_callable=lambda _m, _r, _l: asyncio.sleep(0),
+        on_terminal_failure=on_terminal_failure,
+        close_redis_on_stop=False,
+        current_redis_manager=rm,
+    )
+
+    lease_key = worker_a.delivery.execution_lease_key(exec_id)
+    try:
+        await worker_a.start()
+        await _wait_until(started.is_set, timeout=3.0)
+        await asyncio.wait_for(worker_a.stop(), timeout=3.0)
+
+        # Original stays pending in PEL while its shutdown replacement copy is in the stream.
+        assert _pending_count(await redis_client.xpending(stream, group)) == 1
+        entries = await redis_client.xrange(stream)
+        copies = [
+            (eid, fields)
+            for eid, fields in entries
+            if eid != original_msg_id and fields.get("original_id") == original_msg_id
+        ]
+        assert len(copies) == 1
+        assert copies[0][1]["retries"] == "2"
+
+        # Peer reclaims the original entry; must NOT DLQ or notify terminal failure.
+        await worker_b._reclaim_entry(redis_client, original_msg_id, original_fields)
+        await worker_b._drain_terminal_failure_tasks()
+
+        assert terminal_failures == []
+        assert await redis_client.xlen(f"{stream}:dlq") == 0
+        assert _pending_count(await redis_client.xpending(stream, group)) == 0
+    finally:
+        release.set()
+        await worker_a.stop()
+        if worker_b.executor:
+            worker_b.executor.shutdown(wait=True)
+        await redis_client.delete(lease_key)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_final_attempt_fails_closed_when_replacement_check_errors(
+    redis_client: Redis,
+    stream: str,
+) -> None:
+    """If checking for an existing replacement copy fails on a final-attempt reclaim,
+    _reclaim_entry must fail closed: leave entry pending, no DLQ, no terminal failure."""
+    group = f"group-reclaim-final-err-{uuid4()}"
+    original_fields = {
+        "data": json.dumps(
+            {"workflow_execution_id": f"exec-{uuid4()}", "payload": "doc"}
+        ),
+        "retries": "2",
+    }
+    await redis_client.xgroup_create(stream, group, id="0-0", mkstream=True)
+    original_msg_id = await redis_client.xadd(stream, original_fields)
+    await redis_client.xreadgroup(group, "worker-a", {stream: ">"}, count=1)
+
+    terminal_failures: list[tuple[str, str]] = []
+
+    async def on_terminal_failure(
+        msg_id: str, _fields: dict[str, Any], reason: str
+    ) -> None:
+        terminal_failures.append((msg_id, reason))
+
+    rm = LocalRedisManager(redis_client)
+    worker_b = ThreadConsumer[ShutdownTestMessage](
+        consumer_name=f"worker-b-{uuid4()}",
+        consumer_group=group,
+        stream_name=stream,
+        batch_size=1,
+        block_time=20,
+        max_retry_number=3,
+        message_class=ShutdownTestMessage,
+        process_message_callable=lambda _m, _r, _l: asyncio.sleep(0),
+        on_terminal_failure=on_terminal_failure,
+        close_redis_on_stop=False,
+        current_redis_manager=rm,
+    )
+    worker_b.delivery.has_scheduled_retry = AsyncMock(  # type: ignore[method-assign]
+        side_effect=ConnectionError("redis check failed")
+    )
+
+    try:
+        await worker_b._reclaim_entry(redis_client, original_msg_id, original_fields)
+        await worker_b._drain_terminal_failure_tasks()
+
+        assert terminal_failures == []
+        assert await redis_client.xlen(f"{stream}:dlq") == 0
+        assert _pending_count(await redis_client.xpending(stream, group)) == 1
+    finally:
+        if worker_b.executor:
+            worker_b.executor.shutdown(wait=True)
