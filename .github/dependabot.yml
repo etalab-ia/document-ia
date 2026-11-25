@@ -1,0 +1,37 @@
+version: 2
+updates:
+  # Le monorepo est un unique workspace uv : un seul uv.lock à la racine, donc
+  # une seule entrée Dependabot. Les fichiers uv.lock des sous-projets sont des
+  # liens symboliques vers celui-ci ; les déclarer comme répertoires ferait
+  # travailler Dependabot sur six vues du même lock.
+  - package-ecosystem: "uv"
+    directory: "/"
+    # Le workspace uv n'a qu'un seul verrou, à la racine. Les six uv.lock des
+    # sous-projets sont des liens symboliques vers celui-ci : les laisser
+    # inspecter par Dependabot lui permettrait de les réécrire comme des
+    # fichiers ordinaires, ce qui dupliquerait le verrou en six copies
+    # divergentes et remplacerait silencieusement les liens.
+    exclude-paths:
+      - "document-ia-*/uv.lock"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    groups:
+      uv-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      # Pas de groupe pour les majeures : un groupe wildcard en `major` les
+      # regrouperait toutes dans une seule PR au lieu de les garder reviewables
+      # individuellement. Elles tombent donc en PR séparées.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]

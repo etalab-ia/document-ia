@@ -2,26 +2,32 @@ from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 
+from document_ia_infra.data.event.dto.event_type_enum import EventType
 from document_ia_infra.exception.retryable_exception import RetryableException
-from document_ia_infra.redis.model.workflow_execution_message import WorkflowExecutionMessage
+from document_ia_infra.redis.model.workflow_execution_message import (
+    WorkflowExecutionMessage,
+)
 from document_ia_worker.exception.workflow_step_exception import WorkflowStepException
 from document_ia_worker.workflow.workflow_manager import WorkflowManager
 
 
 class TestWorkflowManager:
-
     @pytest.fixture
     def mock_workflow_message(self):
         return WorkflowExecutionMessage(workflow_execution_id="exec-12345")
 
     @pytest.fixture
     def mock_db_manager(self):
-        with patch("document_ia_worker.workflow.workflow_manager.DatabaseManager") as MockDBManager:
+        with patch(
+            "document_ia_worker.workflow.workflow_manager.DatabaseManager"
+        ) as MockDBManager:
             mock_instance = MockDBManager.return_value
             mock_session = AsyncMock()
 
             # Setup async context manager for local_session
-            mock_instance.local_session.return_value.__aenter__.return_value = mock_session
+            mock_instance.local_session.return_value.__aenter__.return_value = (
+                mock_session
+            )
             mock_instance.local_session.return_value.__aexit__.return_value = None
 
             mock_instance.dispose_async = AsyncMock()
@@ -30,13 +36,30 @@ class TestWorkflowManager:
     @pytest.fixture
     def mock_dependencies(self):
         # Mocks for logging and context vars
-        with patch("document_ia_worker.workflow.workflow_manager.setup_logging_worker") as mock_setup_log, \
-                patch("document_ia_worker.workflow.workflow_manager.execution_id_var") as mock_exec_var, \
-                patch("document_ia_worker.workflow.workflow_manager.agg_buffer_var") as mock_agg_var, \
-                patch("document_ia_worker.workflow.workflow_manager.start_time_var") as mock_start_var, \
-                patch("document_ia_worker.workflow.workflow_manager.handle_finish_execution") as mock_handle_finish, \
-                patch("document_ia_worker.workflow.workflow_manager.Publisher") as mock_publisher, \
-                patch("document_ia_worker.workflow.workflow_manager.RedisManager"):
+        with (
+            patch(
+                "document_ia_worker.workflow.workflow_manager.setup_logging_worker"
+            ) as mock_setup_log,
+            patch(
+                "document_ia_worker.workflow.workflow_manager.execution_id_var"
+            ) as mock_exec_var,
+            patch(
+                "document_ia_worker.workflow.workflow_manager.agg_buffer_var"
+            ) as mock_agg_var,
+            patch(
+                "document_ia_worker.workflow.workflow_manager.start_time_var"
+            ) as mock_start_var,
+            patch(
+                "document_ia_worker.workflow.workflow_manager.handle_finish_execution"
+            ) as mock_handle_finish,
+            patch(
+                "document_ia_worker.workflow.workflow_manager.Publisher"
+            ) as mock_publisher,
+            patch(
+                "document_ia_worker.workflow.workflow_manager.RedisManager"
+            ) as mock_redis_manager,
+        ):
+            mock_redis_manager.return_value.close = AsyncMock()
             mock_publisher_instance = mock_publisher.return_value
             mock_publisher_instance.publish_message = AsyncMock()
 
@@ -47,22 +70,41 @@ class TestWorkflowManager:
                 "start_var": mock_start_var,
                 "handle_finish": mock_handle_finish,
                 "publisher": mock_publisher_instance,
+                "redis_manager": mock_redis_manager.return_value,
             }
+            # Success, fatal/retryable failure, duplicates and cancellation
+            # must all close the workflow-owned publisher manager.
+            mock_redis_manager.return_value.close.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_start_success(self, mock_workflow_message, mock_db_manager, mock_dependencies):
+    async def test_start_success(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
         """Test nominal : tout se passe bien."""
 
         manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        parsed_event = MagicMock(version=1)
 
         # Mock internal methods to simulate success without going into details
         # We want to test start() orchestration
-        with patch.object(manager, '_prepare_workflow', new_callable=AsyncMock) as mock_prepare, \
-                patch.object(manager, '_parse_start_event', return_value=MagicMock()) as mock_parse, \
-                patch.object(manager, '_prepare_executor') as mock_prepare_exec, \
-                patch.object(manager, '_execute_workflow', new_callable=AsyncMock) as mock_execute, \
-                patch.object(manager, '_notify_webhook_execution_finished', new_callable=AsyncMock) as mock_notify, \
-                patch.object(manager, '_save_failure_event', new_callable=AsyncMock) as mock_save_fail:
+        with (
+            patch.object(
+                manager, "_prepare_workflow", new_callable=AsyncMock
+            ) as mock_prepare,
+            patch.object(
+                manager, "_parse_start_event", return_value=parsed_event
+            ) as mock_parse,
+            patch.object(manager, "_prepare_executor") as mock_prepare_exec,
+            patch.object(
+                manager, "_execute_workflow", new_callable=AsyncMock
+            ) as mock_execute,
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_save_failure_event", new_callable=AsyncMock
+            ) as mock_save_fail,
+        ):
             await manager.start()
 
             # Verify orchestration
@@ -70,6 +112,7 @@ class TestWorkflowManager:
             mock_parse.assert_called_once()
             mock_prepare_exec.assert_called_once()
             mock_execute.assert_called_once()
+            assert manager.event_data is parsed_event
 
             # Commit should be called
             mock_session = mock_db_manager.return_value.local_session.return_value.__aenter__.return_value
@@ -93,13 +136,27 @@ class TestWorkflowManager:
             mock_save_fail.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_start_generic_exception(self, mock_workflow_message, mock_db_manager, mock_dependencies):
+    async def test_start_generic_exception(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
         """Test avec une exception générique non gérée (TypeError par ex)."""
         manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        manager.event_dto = MagicMock()
 
-        with patch.object(manager, '_prepare_workflow', side_effect=TypeError("Generic Error")), \
-                patch.object(manager, '_save_failure_event', new_callable=AsyncMock) as mock_save_fail, \
-                patch.object(manager, '_notify_webhook_execution_finished', new_callable=AsyncMock) as mock_notify:
+        with (
+            patch.object(
+                manager, "_prepare_workflow", side_effect=TypeError("Generic Error")
+            ),
+            patch.object(
+                manager, "_save_failure_event", new_callable=AsyncMock
+            ) as mock_save_fail,
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
+        ):
             with pytest.raises(TypeError, match="Generic Error"):
                 await manager.start()
 
@@ -109,6 +166,9 @@ class TestWorkflowManager:
 
             # Should save failure event
             mock_save_fail.assert_called_once()
+
+            # Terminal failure must purge S3
+            mock_purge_s3.assert_awaited_once()
 
             # Should handle finish execution with success=False
             mock_dependencies["handle_finish"].assert_called_once()
@@ -123,17 +183,238 @@ class TestWorkflowManager:
             mock_db_manager.return_value.dispose_async.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_start_workflow_step_exception_non_retryable(self, mock_workflow_message, mock_db_manager,
-                                                               mock_dependencies):
+    async def test_start_initial_db_slot_timeout_remains_retryable(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        """An initial DB-slot timeout must not trigger terminal cleanup."""
+        from contextlib import asynccontextmanager
+
+        manager = WorkflowManager(
+            mock_workflow_message, retry_count=0, is_last_retry=False
+        )
+        slot_acquisitions = 0
+
+        @asynccontextmanager
+        async def acquire_slot():
+            nonlocal slot_acquisitions
+            slot_acquisitions += 1
+            if slot_acquisitions == 1:
+                raise RetryableException("initial DB slot timeout")
+            yield
+
+        event_repository = MagicMock()
+        event_repository.get_last_event_by_execution_id = AsyncMock(return_value=None)
+        event_repository.get_started_event_by_execution_id = AsyncMock(
+            return_value=None
+        )
+
+        with (
+            patch(
+                "document_ia_worker.workflow.workflow_manager.acquire_worker_db_slot",
+                new=acquire_slot,
+            ),
+            patch(
+                "document_ia_worker.workflow.workflow_manager.EventRepository",
+                return_value=event_repository,
+            ),
+            patch.object(
+                manager, "_prepare_workflow", new_callable=AsyncMock
+            ) as mock_prepare,
+            patch.object(
+                manager, "_save_failure_event", new_callable=AsyncMock
+            ) as mock_save_fail,
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
+        ):
+            with pytest.raises(RetryableException, match="initial DB slot timeout"):
+                await manager.start()
+
+            mock_prepare.assert_not_awaited()
+            mock_save_fail.assert_not_awaited()
+            mock_purge_s3.assert_not_awaited()
+            mock_notify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_preserves_terminal_error_when_failure_slot_times_out(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        """A DB-slot timeout must not make a terminal workflow failure retryable."""
+        from contextlib import asynccontextmanager
+
+        manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        manager.event_dto = MagicMock()
+        slot_acquisitions = 0
+
+        @asynccontextmanager
+        async def acquire_slot():
+            nonlocal slot_acquisitions
+            slot_acquisitions += 1
+            if slot_acquisitions == 2:
+                raise RetryableException("DB slot timeout")
+            yield
+
+        with (
+            patch(
+                "document_ia_worker.workflow.workflow_manager.acquire_worker_db_slot",
+                new=acquire_slot,
+            ),
+            patch.object(
+                manager, "_prepare_workflow", side_effect=ValueError("terminal failure")
+            ),
+            patch.object(
+                manager, "_save_failure_event", new_callable=AsyncMock
+            ) as mock_save_fail,
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
+        ):
+            with pytest.raises(ValueError, match="terminal failure"):
+                await manager.start()
+
+            mock_save_fail.assert_not_awaited()
+            mock_purge_s3.assert_awaited_once()
+            mock_notify.assert_awaited_once()
+            mock_session = mock_db_manager.return_value.local_session.return_value.__aenter__.return_value
+            mock_session.rollback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_start_preserves_existing_terminal_event_on_redelivery(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        """A duplicate delivery must not replace the original terminal failure."""
+        from document_ia_worker.exception.no_event_attached_to_execution_exception import (
+            NoEventAttachedToExecutionException,
+        )
+
+        manager = WorkflowManager(
+            mock_workflow_message, retry_count=3, is_last_retry=True
+        )
+        terminal_event = MagicMock(
+            event_type=EventType.WORKFLOW_EXECUTION_FAILED.value,
+            event={"error_type": "ValueError", "error_message": "original failure"},
+        )
+        event_repository = MagicMock()
+        event_repository.get_last_event_by_execution_id = AsyncMock(
+            return_value=terminal_event
+        )
+        event_repository.get_started_event_by_execution_id = AsyncMock(
+            return_value=MagicMock()
+        )
+        delivery_error = NoEventAttachedToExecutionException(
+            mock_workflow_message.workflow_execution_id
+        )
+
+        with (
+            patch(
+                "document_ia_worker.workflow.workflow_manager.EventRepository",
+                return_value=event_repository,
+            ),
+            patch.object(manager, "_prepare_workflow", side_effect=delivery_error),
+            patch.object(
+                manager, "_save_failure_event", new_callable=AsyncMock
+            ) as mock_save_fail,
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ),
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ),
+        ):
+            with pytest.raises(NoEventAttachedToExecutionException):
+                await manager.start()
+
+            mock_save_fail.assert_not_awaited()
+            event_repository.get_last_event_by_execution_id.assert_awaited_once_with(
+                mock_workflow_message.workflow_execution_id
+            )
+            event_repository.get_started_event_by_execution_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_closes_failure_session_before_releasing_db_slot(
+        self,
+        mock_workflow_message,
+        mock_db_manager,
+        mock_dependencies,
+        monkeypatch,
+    ):
+        """Every workflow session close must happen while its DB slot is held."""
+        from document_ia_infra.data.data_settings import database_settings
+        from document_ia_worker.core.db_semaphore import (
+            _get_worker_db_semaphore,
+            reset_worker_db_semaphore,
+        )
+
+        monkeypatch.setattr(database_settings, "WORKER_DB_MAX_CONNECTIONS", 1)
+        reset_worker_db_semaphore()
+        manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        manager.event_dto = MagicMock()
+        close_slot_held = []
+
+        async def record_close_slot(_session):
+            semaphore = _get_worker_db_semaphore()
+            slot_available = semaphore.acquire(blocking=False)
+            close_slot_held.append(not slot_available)
+            if slot_available:
+                semaphore.release()
+
+        try:
+            with (
+                patch(
+                    "document_ia_worker.workflow.workflow_manager.close_session_safely",
+                    new=record_close_slot,
+                ),
+                patch.object(
+                    manager,
+                    "_prepare_workflow",
+                    side_effect=ValueError("terminal failure"),
+                ),
+                patch.object(manager, "_save_failure_event", new_callable=AsyncMock),
+                patch.object(
+                    manager,
+                    "_notify_webhook_execution_finished",
+                    new_callable=AsyncMock,
+                ),
+                patch.object(
+                    manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+                ),
+            ):
+                with pytest.raises(ValueError, match="terminal failure"):
+                    await manager.start()
+
+            assert close_slot_held == [True, True, True]
+        finally:
+            reset_worker_db_semaphore()
+
+    @pytest.mark.asyncio
+    async def test_start_workflow_step_exception_non_retryable(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
         """Test avec une WorkflowStepException (non retryable inner exception)."""
         manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        manager.event_dto = MagicMock()
 
         inner_error = ValueError("Bad value")
         step_error = WorkflowStepException("step_x", inner_error)
 
-        with patch.object(manager, '_prepare_workflow', side_effect=step_error), \
-                patch.object(manager, '_save_failure_event', new_callable=AsyncMock) as mock_save_fail, \
-                patch.object(manager, '_notify_webhook_execution_finished', new_callable=AsyncMock) as mock_notify:
+        with (
+            patch.object(manager, "_prepare_workflow", side_effect=step_error),
+            patch.object(
+                manager, "_save_failure_event", new_callable=AsyncMock
+            ) as mock_save_fail,
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
+        ):
             # Should raise the inner exception
             with pytest.raises(ValueError, match="Bad value"):
                 await manager.start()
@@ -143,27 +424,47 @@ class TestWorkflowManager:
 
             # Save failure with inner details
             mock_save_fail.assert_called_once_with(
-                mock_db_manager.return_value.local_session.return_value.__aenter__.return_value, step_error)
+                mock_db_manager.return_value.local_session.return_value.__aenter__.return_value,
+                step_error,
+                is_terminal=True,
+            )
+
+            # Non-retryable failure must purge S3
+            mock_purge_s3.assert_awaited_once()
 
             # Handle finish log
             mock_dependencies["handle_finish"].assert_called_once()
+
             args, _ = mock_dependencies["handle_finish"].call_args
             assert args[3] is False
             assert args[9] == "ValueError"
             assert args[11] == "step_x"  # failed_step
 
     @pytest.mark.asyncio
-    async def test_start_workflow_step_exception_retryable_not_last_retry(self, mock_workflow_message, mock_db_manager,
-                                                                          mock_dependencies):
+    async def test_start_workflow_step_exception_retryable_not_last_retry(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
         """Test avec une WorkflowStepException retryable, et il reste des retries."""
-        manager = WorkflowManager(mock_workflow_message, retry_count=0, is_last_retry=False)
+        manager = WorkflowManager(
+            mock_workflow_message, retry_count=0, is_last_retry=False
+        )
+        manager.event_dto = MagicMock()
 
         inner_error = RetryableException("Try again")
         step_error = WorkflowStepException("step_y", inner_error)
 
-        with patch.object(manager, '_prepare_workflow', side_effect=step_error), \
-                patch.object(manager, '_save_failure_event', new_callable=AsyncMock) as mock_save_fail, \
-                patch.object(manager, '_notify_webhook_execution_finished', new_callable=AsyncMock) as mock_notify:
+        with (
+            patch.object(manager, "_prepare_workflow", side_effect=step_error),
+            patch.object(
+                manager, "_save_failure_event", new_callable=AsyncMock
+            ) as mock_save_fail,
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
+        ):
             with pytest.raises(RetryableException, match="Try again"):
                 await manager.start()
 
@@ -172,6 +473,9 @@ class TestWorkflowManager:
 
             mock_save_fail.assert_called_once()
 
+            # Intermediate retryable failure must NOT purge S3
+            mock_purge_s3.assert_not_awaited()
+
             # Handle finish log
             mock_dependencies["handle_finish"].assert_called_once()
             args, _ = mock_dependencies["handle_finish"].call_args
@@ -179,17 +483,30 @@ class TestWorkflowManager:
             assert args[9] == "RetryableException"
 
     @pytest.mark.asyncio
-    async def test_start_workflow_step_exception_retryable_is_last_retry(self, mock_workflow_message, mock_db_manager,
-                                                                         mock_dependencies):
+    async def test_start_workflow_step_exception_retryable_is_last_retry(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
         """Test avec une WorkflowStepException retryable, mais c'est le dernier retry."""
-        manager = WorkflowManager(mock_workflow_message, retry_count=3, is_last_retry=True)
+        manager = WorkflowManager(
+            mock_workflow_message, retry_count=3, is_last_retry=True
+        )
+        manager.event_dto = MagicMock()
 
         inner_error = RetryableException("Give up")
         step_error = WorkflowStepException("step_z", inner_error)
 
-        with patch.object(manager, '_prepare_workflow', side_effect=step_error), \
-                patch.object(manager, '_save_failure_event', new_callable=AsyncMock) as mock_save_fail, \
-                patch.object(manager, '_notify_webhook_execution_finished', new_callable=AsyncMock) as mock_notify:
+        with (
+            patch.object(manager, "_prepare_workflow", side_effect=step_error),
+            patch.object(
+                manager, "_save_failure_event", new_callable=AsyncMock
+            ) as mock_save_fail,
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
+        ):
             with pytest.raises(RetryableException, match="Give up"):
                 await manager.start()
 
@@ -198,5 +515,641 @@ class TestWorkflowManager:
 
             mock_save_fail.assert_called_once()
 
+            # Last retry failure must purge S3
+            mock_purge_s3.assert_awaited_once()
+
             # Handle finish log
             mock_dependencies["handle_finish"].assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_completed_duplicate_returns_normally_without_execution(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        repository = MagicMock()
+        repository.get_created_event_if_execution_not_completed_or_failed = AsyncMock(
+            return_value=None
+        )
+        repository.get_last_event_by_execution_id = AsyncMock(
+            return_value=MagicMock(event_type=EventType.WORKFLOW_EXECUTION_COMPLETED)
+        )
+
+        with (
+            patch(
+                "document_ia_worker.workflow.workflow_manager.EventRepository",
+                return_value=repository,
+            ),
+            patch.object(manager, "_parse_start_event") as mock_parse,
+            patch.object(manager, "_prepare_executor") as mock_prepare_executor,
+            patch.object(
+                manager, "_execute_workflow", new_callable=AsyncMock
+            ) as mock_execute,
+            patch.object(
+                manager, "_save_failure_event", new_callable=AsyncMock
+            ) as mock_save_failure,
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+        ):
+            await manager.start()
+
+        repository.get_created_event_if_execution_not_completed_or_failed.assert_awaited_once_with(
+            "exec-12345"
+        )
+        repository.get_last_event_by_execution_id.assert_awaited_once_with("exec-12345")
+        mock_parse.assert_not_called()
+        mock_prepare_executor.assert_not_called()
+        mock_execute.assert_not_awaited()
+        mock_save_failure.assert_not_awaited()
+        mock_notify.assert_not_awaited()
+        mock_dependencies["handle_finish"].assert_not_called()
+        mock_db_manager.return_value.dispose_async.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_closes_workflow_owned_resources(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        import asyncio
+
+        manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        executing = asyncio.Event()
+
+        async def execute():
+            executing.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(
+                manager, "_prepare_workflow", new=AsyncMock(return_value=False)
+            ),
+            patch.object(manager, "_parse_start_event", return_value=MagicMock()),
+            patch.object(manager, "_prepare_executor"),
+            patch.object(manager, "_execute_workflow", new=execute),
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new=AsyncMock()
+            ),
+        ):
+            task = asyncio.create_task(manager.start())
+            await executing.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        mock_db_manager.return_value.dispose_async.assert_awaited_once()
+        mock_dependencies["redis_manager"].close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_aborted_tracker_fencing_skips_commit_and_webhooks(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        """Si le tracker de progression est avorté (timeout/watchdog), le commit et les webhooks sont ignorés."""
+        from document_ia_infra.redis.progress_tracker import (
+            ProgressTracker,
+            current_progress_tracker,
+        )
+
+        manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        parsed_event = MagicMock(version=1)
+
+        tracker = ProgressTracker("test-msg-1")
+        tracker.abort("step_timeout")
+        token = current_progress_tracker.set(tracker)
+
+        try:
+            with (
+                patch.object(
+                    manager, "_prepare_workflow", new_callable=AsyncMock
+                ) as mock_prepare,
+                patch.object(manager, "_parse_start_event", return_value=parsed_event),
+                patch.object(manager, "_prepare_executor"),
+                patch.object(
+                    manager, "_execute_workflow", new_callable=AsyncMock
+                ) as mock_execute,
+                patch.object(
+                    manager,
+                    "_notify_webhook_execution_finished",
+                    new_callable=AsyncMock,
+                ) as mock_notify,
+                patch.object(
+                    manager, "_save_failure_event", new_callable=AsyncMock
+                ) as mock_save_failure,
+            ):
+                mock_prepare.return_value = False
+                await manager.start()
+
+            # Vérifier qu'aucun commit, ni webhook, ni failure event n'a été émis
+            mock_execute.assert_not_awaited()
+            session = mock_db_manager.return_value.local_session.return_value.__aenter__.return_value
+            session.commit.assert_not_awaited()
+            mock_notify.assert_not_awaited()
+            mock_save_failure.assert_not_awaited()
+            mock_dependencies["handle_finish"].assert_not_called()
+        finally:
+            current_progress_tracker.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_execute_workflow_clears_context_and_steps_before_gc(
+        self, mock_workflow_message, mock_dependencies
+    ):
+        manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        manager.main_workflow_context = MagicMock()
+        mock_step = MagicMock()
+        mock_step.execute = AsyncMock(return_value=("result", MagicMock()))
+        mock_step.cleanup = AsyncMock()
+        mock_step.get_context_result_key.return_value = "StepResult"
+        manager.step_list = [mock_step]
+        manager.workflow_context = {"StepResult": "result", "huge_data": [1] * 1000}
+
+        cleared_before_release = False
+
+        def mock_release():
+            nonlocal cleared_before_release
+            if len(manager.workflow_context) == 0 and len(manager.step_list) == 0:
+                cleared_before_release = True
+
+        try:
+            with patch(
+                "document_ia_worker.workflow.workflow_manager._release_worker_memory",
+                side_effect=mock_release,
+            ) as mock_rel:
+                await manager._execute_workflow()
+
+                assert mock_rel.called
+                assert cleared_before_release is True
+                assert manager.workflow_context == {}
+                assert manager.step_list == []
+        finally:
+            await manager._webhook_redis_manager.close()
+
+    @pytest.mark.asyncio
+    async def test_execute_workflow_invokes_gc_and_malloc_trim_on_linux(
+        self, mock_workflow_message, mock_dependencies
+    ):
+        manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        manager.main_workflow_context = MagicMock()
+        mock_step = MagicMock()
+        mock_step.execute = AsyncMock(return_value=("result", MagicMock()))
+        mock_step.cleanup = AsyncMock()
+        mock_step.get_context_result_key.return_value = "StepResult"
+        manager.step_list = [mock_step]
+
+        mock_libc = MagicMock()
+        try:
+            with (
+                patch(
+                    "document_ia_worker.workflow.workflow_manager._LIBC",
+                    mock_libc,
+                ),
+                patch("gc.collect") as mock_gc,
+            ):
+                await manager._execute_workflow()
+
+                mock_gc.assert_called()
+                mock_libc.malloc_trim.assert_called_once_with(0)
+        finally:
+            # Satisfy mock_dependencies fixture teardown assertion
+            await manager._webhook_redis_manager.close()
+
+    @pytest.mark.asyncio
+    async def test_acquire_worker_db_slot_bounds_concurrency(self, monkeypatch):
+        import asyncio
+        from document_ia_infra.data.data_settings import database_settings
+        from document_ia_worker.core.db_semaphore import (
+            acquire_worker_db_slot,
+            reset_worker_db_semaphore,
+        )
+
+        monkeypatch.setattr(database_settings, "WORKER_DB_MAX_CONNECTIONS", 2)
+        reset_worker_db_semaphore()
+
+        active_count = 0
+        max_observed = 0
+
+        async def worker_task():
+            nonlocal active_count, max_observed
+            async with acquire_worker_db_slot():
+                active_count += 1
+                max_observed = max(max_observed, active_count)
+                await asyncio.sleep(0.02)
+                active_count -= 1
+
+        try:
+            await asyncio.gather(*(worker_task() for _ in range(6)))
+            assert max_observed == 2
+        finally:
+            reset_worker_db_semaphore()
+
+    @pytest.mark.asyncio
+    async def test_start_closes_session_before_execute_workflow(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        """La session DB doit être fermée dès la fin de _prepare_workflow avant _execute_workflow."""
+        manager = WorkflowManager(mock_workflow_message, retry_count=0)
+        parsed_event = MagicMock(version=1)
+        mock_session = mock_db_manager.return_value.local_session.return_value.__aenter__.return_value
+
+        closed_before_execute = False
+
+        async def fake_execute():
+            nonlocal closed_before_execute
+            closed_before_execute = mock_session.close.await_count >= 1
+
+        with (
+            patch.object(
+                manager,
+                "_prepare_workflow",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(manager, "_parse_start_event", return_value=parsed_event),
+            patch.object(manager, "_prepare_executor"),
+            patch.object(manager, "_execute_workflow", side_effect=fake_execute),
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ),
+        ):
+            await manager.start()
+
+        assert closed_before_execute is True
+        assert mock_session.close.await_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_start_dbapi_error_in_prepare_workflow_raises_retryable_exception(
+        self, mock_workflow_message, mock_db_manager, mock_dependencies
+    ):
+        """Un TooManyConnectionsError / DBAPIError dans _prepare_workflow remonte en RetryableException."""
+        from sqlalchemy.exc import DBAPIError
+
+        class TooManyConnectionsError(Exception):
+            pass
+
+        db_exc = DBAPIError.instance(
+            "SELECT 1",
+            {},
+            TooManyConnectionsError(
+                "remaining connection slots are reserved for roles with the SUPERUSER attribute"
+            ),
+            Exception,
+        )
+
+        manager = WorkflowManager(
+            mock_workflow_message, retry_count=0, is_last_retry=False
+        )
+        mock_session = mock_db_manager.return_value.local_session.return_value.__aenter__.return_value
+        mock_session.execute.side_effect = db_exc
+
+        with (
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
+        ):
+            with pytest.raises(RetryableException):
+                await manager.start()
+
+            mock_notify.assert_not_awaited()
+            mock_purge_s3.assert_not_awaited()
+
+    def test_worker_db_semaphore_defaults_to_redis_worker_number_and_respects_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from document_ia_infra.data.data_settings import database_settings
+        from document_ia_infra.redis.redis_settings import redis_settings
+        from document_ia_worker.core.db_semaphore import (
+            _get_worker_db_semaphore,
+            get_effective_worker_db_max_connections,
+            reset_worker_db_semaphore,
+        )
+
+        try:
+            # Case 1: WORKER_DB_MAX_CONNECTIONS is None -> falls back to REDIS_WORKER_NUMBER
+            monkeypatch.setattr(database_settings, "WORKER_DB_MAX_CONNECTIONS", None)
+            monkeypatch.setattr(redis_settings, "REDIS_WORKER_NUMBER", 7)
+            reset_worker_db_semaphore()
+
+            assert get_effective_worker_db_max_connections() == 7
+            sem_default = _get_worker_db_semaphore()
+            acquired = 0
+            try:
+                for _ in range(7):
+                    assert sem_default.acquire(blocking=False) is True
+                    acquired += 1
+                assert sem_default.acquire(blocking=False) is False
+            finally:
+                for _ in range(acquired):
+                    sem_default.release()
+
+            # Case 2: WORKER_DB_MAX_CONNECTIONS is explicitly set -> takes precedence
+            monkeypatch.setattr(database_settings, "WORKER_DB_MAX_CONNECTIONS", 2)
+            monkeypatch.setattr(redis_settings, "REDIS_WORKER_NUMBER", 10)
+            reset_worker_db_semaphore()
+
+            assert get_effective_worker_db_max_connections() == 2
+            sem_override = _get_worker_db_semaphore()
+            acquired = 0
+            try:
+                for _ in range(2):
+                    assert sem_override.acquire(blocking=False) is True
+                    acquired += 1
+                assert sem_override.acquire(blocking=False) is False
+            finally:
+                for _ in range(acquired):
+                    sem_override.release()
+        finally:
+            reset_worker_db_semaphore()
+
+    @pytest.mark.asyncio
+    async def test_acquire_worker_db_slot_cancellation_does_not_leak_slot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+        from document_ia_infra.data.data_settings import database_settings
+        from document_ia_worker.core.db_semaphore import (
+            _get_worker_db_semaphore,
+            acquire_worker_db_slot,
+            reset_worker_db_semaphore,
+        )
+
+        monkeypatch.setattr(database_settings, "WORKER_DB_MAX_CONNECTIONS", 1)
+        reset_worker_db_semaphore()
+        try:
+            holder_entered = asyncio.Event()
+            release_holder = asyncio.Event()
+
+            async def holder() -> None:
+                async with acquire_worker_db_slot(timeout_seconds=2.0):
+                    holder_entered.set()
+                    await release_holder.wait()
+
+            async def waiter() -> None:
+                async with acquire_worker_db_slot(timeout_seconds=2.0):
+                    await asyncio.sleep(0)
+
+            holder_task = asyncio.create_task(holder())
+            await holder_entered.wait()
+
+            waiter_task = asyncio.create_task(waiter())
+            await asyncio.sleep(0.05)
+            waiter_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter_task
+
+            release_holder.set()
+            await holder_task
+
+            # Give the background thread a brief moment to observe cancellation if still polling
+            await asyncio.sleep(0.15)
+
+            sem = _get_worker_db_semaphore()
+            assert sem.acquire(blocking=False) is True
+            sem.release()
+        finally:
+            reset_worker_db_semaphore()
+
+    @pytest.mark.asyncio
+    async def test_acquire_worker_db_slot_timeout_raises_retryable_exception(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from document_ia_infra.data.data_settings import database_settings
+        from document_ia_worker.core.db_semaphore import (
+            acquire_worker_db_slot,
+            reset_worker_db_semaphore,
+        )
+
+        monkeypatch.setattr(database_settings, "WORKER_DB_MAX_CONNECTIONS", 1)
+        reset_worker_db_semaphore()
+        try:
+            async with acquire_worker_db_slot(timeout_seconds=1.0):
+                with pytest.raises(
+                    RetryableException,
+                    match="Timed out waiting for a worker database connection slot",
+                ):
+                    async with acquire_worker_db_slot(timeout_seconds=0.05):
+                        pass
+        finally:
+            reset_worker_db_semaphore()
+
+    @pytest.mark.asyncio
+    async def test_save_workflow_result_step_uses_db_slot_and_closes_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datetime import datetime, UTC
+        from uuid import uuid4
+        from document_ia_infra.data.data_settings import database_settings
+        from document_ia_worker.core.db_semaphore import (
+            _get_worker_db_semaphore,
+            reset_worker_db_semaphore,
+        )
+        from document_ia_worker.workflow.main_workflow_context import (
+            MainWorkflowContext,
+        )
+        from document_ia_worker.workflow.step.save_workflow_result.save_workflow_result import (
+            SaveWorkflowResultStep,
+        )
+
+        monkeypatch.setattr(database_settings, "WORKER_DB_MAX_CONNECTIONS", 1)
+        reset_worker_db_semaphore()
+        try:
+            ctx = MainWorkflowContext(
+                execution_id="exec-save-1",
+                start_time=datetime.now(UTC),
+                organization_id=uuid4(),
+                steps_metadata=[],
+                workflow_version=1,
+            )
+            mock_session = AsyncMock()
+            step = SaveWorkflowResultStep(ctx, "wf-1", mock_session)
+
+            slot_held_during_emit = False
+
+            async def fake_emit_success(**_kwargs):
+                nonlocal slot_held_during_emit
+                sem = _get_worker_db_semaphore()
+                # With max=1, acquiring non-blocking must fail while inside DB slot
+                slot_held_during_emit = not sem.acquire(blocking=False)
+                if not slot_held_during_emit:
+                    sem.release()
+
+            step.event_service.emit_workflow_completed = AsyncMock(
+                side_effect=fake_emit_success
+            )
+            await step._execute_internal()
+
+            assert slot_held_during_emit is True
+            mock_session.close.assert_awaited_once()
+            sem = _get_worker_db_semaphore()
+            assert sem.acquire(blocking=False) is True
+            sem.release()
+
+            # Error path: slot still released and session still closed
+            mock_session.close.reset_mock()
+            step.event_service.emit_workflow_completed = AsyncMock(
+                side_effect=RetryableException("db down")
+            )
+            with pytest.raises(RetryableException):
+                await step._execute_internal()
+
+            mock_session.close.assert_awaited_once()
+            assert sem.acquire(blocking=False) is True
+            sem.release()
+        finally:
+            reset_worker_db_semaphore()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_last_retry", [False, True])
+    async def test_start_preserves_retryable_exception_when_failure_save_and_rollback_fail(
+        self,
+        mock_workflow_message,
+        mock_db_manager,
+        mock_dependencies,
+        is_last_retry: bool,
+    ) -> None:
+        """Un échec de session.rollback() après échec de _save_failure_event ne doit pas masquer RetryableException ni bloquer la purge S3."""
+        manager = WorkflowManager(
+            mock_workflow_message,
+            retry_count=3 if is_last_retry else 0,
+            is_last_retry=is_last_retry,
+        )
+        manager.event_dto = MagicMock()
+        mock_session = mock_db_manager.return_value.local_session.return_value.__aenter__.return_value
+        mock_session.rollback.side_effect = RuntimeError("connection already dead")
+
+        with (
+            patch.object(
+                manager,
+                "_prepare_workflow",
+                side_effect=WorkflowStepException(
+                    "ocr", RetryableException("transient ocr error")
+                ),
+            ),
+            patch.object(
+                manager,
+                "_save_failure_event",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("db write failed"),
+            ),
+            patch.object(
+                manager, "_notify_webhook_execution_finished", new_callable=AsyncMock
+            ) as mock_notify,
+            patch.object(
+                manager, "_purge_s3_file_for_execution", new_callable=AsyncMock
+            ) as mock_purge_s3,
+        ):
+            with pytest.raises(RetryableException, match="transient ocr error"):
+                await manager.start()
+
+            if is_last_retry:
+                mock_purge_s3.assert_awaited_once()
+                mock_notify.assert_awaited_once()
+            else:
+                mock_notify.assert_not_awaited()
+                mock_purge_s3.assert_not_awaited()
+                # No unnecessary commit in finally when need_to_notify_webhook is False
+                mock_session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_db_slot_released_before_s3_purge_and_webhook_publish(
+        self,
+        mock_workflow_message,
+        mock_db_manager,
+        mock_dependencies,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Le slot DB et la session doivent être libérés/fermés AVANT les appels réseau S3 et Redis."""
+        from datetime import datetime, UTC
+        from uuid import uuid4
+        from document_ia_infra.data.data_settings import database_settings
+        from document_ia_infra.data.event.dto.event_dto import EventDTO
+        from document_ia_infra.data.event.dto.event_type_enum import EventType
+        from document_ia_worker.core.db_semaphore import (
+            _get_worker_db_semaphore,
+            reset_worker_db_semaphore,
+        )
+
+        monkeypatch.setattr(database_settings, "WORKER_DB_MAX_CONNECTIONS", 1)
+        reset_worker_db_semaphore()
+        try:
+            manager = WorkflowManager(
+                mock_workflow_message, retry_count=2, is_last_retry=True
+            )
+            mock_session = mock_db_manager.return_value.local_session.return_value.__aenter__.return_value
+
+            org_id = uuid4()
+            started_dto = EventDTO(
+                id=uuid4(),
+                workflow_id="wf-1",
+                execution_id=mock_workflow_message.workflow_execution_id,
+                organization_id=org_id,
+                created_at=datetime.now(UTC),
+                event_type=EventType.WORKFLOW_EXECUTION_STARTED,
+                event={"version": 1},
+            )
+            started_event_model = MagicMock()
+            started_event_model.s3_file_info = MagicMock()
+            started_event_model.s3_file_info.s3_key.get_secret_value.return_value = (
+                "uploads/doc.pdf"
+            )
+
+            s3_slot_free = False
+            s3_session_closed = False
+            redis_slot_free = False
+            redis_session_closed = False
+
+            def fake_s3_delete(_s3_key: str) -> bool:
+                nonlocal s3_slot_free, s3_session_closed
+                sem = _get_worker_db_semaphore()
+                s3_slot_free = sem.acquire(blocking=False)
+                if s3_slot_free:
+                    sem.release()
+                s3_session_closed = mock_session.close.await_count >= 1
+                return True
+
+            async def fake_publish(_msg) -> None:
+                nonlocal redis_slot_free, redis_session_closed
+                sem = _get_worker_db_semaphore()
+                redis_slot_free = sem.acquire(blocking=False)
+                if redis_slot_free:
+                    sem.release()
+                redis_session_closed = mock_session.close.await_count >= 1
+
+            fake_webhook = MagicMock(id=uuid4())
+
+            with (
+                patch(
+                    "document_ia_worker.workflow.workflow_manager.EventStoreService"
+                ) as mock_es_cls,
+                patch(
+                    "document_ia_worker.workflow.workflow_manager.S3Manager"
+                ) as mock_s3_cls,
+                patch(
+                    "document_ia_worker.workflow.workflow_manager.WebHookRepository"
+                ) as mock_wh_repo_cls,
+            ):
+                mock_es = mock_es_cls.return_value
+                mock_es.session = mock_session
+                mock_es.get_last_event_for_execution_id = AsyncMock(
+                    return_value=started_dto
+                )
+                mock_es.emit_workflow_failed = AsyncMock()
+                mock_es.get_workflow_started_event = AsyncMock(
+                    return_value=(started_dto, started_event_model)
+                )
+
+                mock_s3_cls.return_value.delete_file.side_effect = fake_s3_delete
+                mock_wh_repo_cls.return_value.list_webhooks_by_organization = AsyncMock(
+                    return_value=[fake_webhook]
+                )
+                manager._webhook_producer.publish_message = AsyncMock(
+                    side_effect=fake_publish
+                )
+
+                await manager.record_watchdog_terminal_failure("watchdog timeout")
+
+            assert s3_slot_free is True
+            assert s3_session_closed is True
+            assert redis_slot_free is True
+            assert redis_session_closed is True
+        finally:
+            reset_worker_db_semaphore()

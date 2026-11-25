@@ -7,6 +7,8 @@ from document_ia_evals.utils.api import (
     execute_workflow_v2,
     wait_for_execution,
 )
+from document_ia_evals.components.auth_ui import enforce_page_auth
+from document_ia_evals.services.administration_service import get_current_config
 from document_ia_evals.utils.config import config
 
 
@@ -15,21 +17,25 @@ def load_snippet(filename: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-
 def main():
     title = "🧾 Execute a workflow on document"
     st.set_page_config(page_title=title, page_icon="🧾")
+    enforce_page_auth()
+
     st.title(title)
 
+    cfg = get_current_config()
+    endpoint = cfg["base_url"]
+    api_key = cfg["api_key"]
+
     # Mask base URL to protect sensitive environments
-    masked_url = config.DOCUMENT_IA_BASE_URL
+    masked_url = endpoint
     if "localhost" not in masked_url and "127.0.0.1" not in masked_url:
         masked_url = "https://<DOCUMENT_IA_URL>/"
 
     st.caption(f"Using API endpoint: {masked_url}")
 
     # Check for API Key
-    api_key = config.DOCUMENT_IA_API_KEY
     if not api_key:
         st.warning("⚠️ DOCUMENT_IA_API_KEY not found in configuration.")
         return
@@ -130,19 +136,21 @@ def main():
 
         if override:
             curl_template = curl_template.replace(
-                "OVERRIDE_CODE_PLACEHOLDER",
-                f"-F 'override={override_json_str}'"
+                "OVERRIDE_CODE_PLACEHOLDER", f"-F 'override={override_json_str}'"
             )
         else:
-            curl_template = curl_template.replace("  OVERRIDE_CODE_PLACEHOLDER \\\n", "")
+            curl_template = curl_template.replace(
+                "  OVERRIDE_CODE_PLACEHOLDER \\\n", ""
+            )
 
         if metadata:
             curl_template = curl_template.replace(
-                "METADATA_CODE_PLACEHOLDER",
-                f"-F 'metadata={metadata_json_str}'"
+                "METADATA_CODE_PLACEHOLDER", f"-F 'metadata={metadata_json_str}'"
             )
         else:
-            curl_template = curl_template.replace("  METADATA_CODE_PLACEHOLDER \\\n", "")
+            curl_template = curl_template.replace(
+                "  METADATA_CODE_PLACEHOLDER \\\n", ""
+            )
 
         curl_code = (
             curl_template.replace("URL_PLACEHOLDER", full_url)
@@ -164,7 +172,7 @@ formData.append('file', fileStream as any);"""
         if override:
             ts_template = ts_template.replace(
                 "OVERRIDE_CODE_PLACEHOLDER",
-                f"formData.append('override', JSON.stringify({override_json_str}));"
+                f"formData.append('override', JSON.stringify({override_json_str}));",
             )
         else:
             ts_template = ts_template.replace("OVERRIDE_CODE_PLACEHOLDER\n", "")
@@ -172,7 +180,7 @@ formData.append('file', fileStream as any);"""
         if metadata:
             ts_template = ts_template.replace(
                 "METADATA_CODE_PLACEHOLDER",
-                f"formData.append('metadata', JSON.stringify({metadata_json_str}));"
+                f"formData.append('metadata', JSON.stringify({metadata_json_str}));",
             )
         else:
             ts_template = ts_template.replace("METADATA_CODE_PLACEHOLDER\n", "")
@@ -196,18 +204,22 @@ formData.append('file', fileStream as any);"""
         if override:
             java_template = java_template.replace(
                 "OVERRIDE_CODE_PLACEHOLDER",
-                f'bodyBuilder.addFormDataPart("override", "{override_escaped_java}");'
+                f'bodyBuilder.addFormDataPart("override", "{override_escaped_java}");',
             )
         else:
-            java_template = java_template.replace("        OVERRIDE_CODE_PLACEHOLDER\n", "")
+            java_template = java_template.replace(
+                "        OVERRIDE_CODE_PLACEHOLDER\n", ""
+            )
 
         if metadata:
             java_template = java_template.replace(
                 "METADATA_CODE_PLACEHOLDER",
-                f'bodyBuilder.addFormDataPart("metadata", "{metadata_escaped_java}");'
+                f'bodyBuilder.addFormDataPart("metadata", "{metadata_escaped_java}");',
             )
         else:
-            java_template = java_template.replace("        METADATA_CODE_PLACEHOLDER\n", "")
+            java_template = java_template.replace(
+                "        METADATA_CODE_PLACEHOLDER\n", ""
+            )
 
         java_code = (
             java_template.replace("URL_PLACEHOLDER", full_url)
@@ -270,7 +282,9 @@ formData.append('file', fileStream as any);"""
                     return
                 st.subheader("Résultat final")
                 result_dict = (
-                    execution_details.model_dump(mode="json") if execution_details else None
+                    execution_details.model_dump(mode="json")
+                    if execution_details
+                    else None
                 )
                 st.code(
                     json.dumps(result_dict, indent=2, ensure_ascii=False),

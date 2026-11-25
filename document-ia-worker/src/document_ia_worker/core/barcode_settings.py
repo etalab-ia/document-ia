@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import Field
 
@@ -10,9 +10,38 @@ class BarcodeSettings(BaseDocumentIaSettings):
         default="s",
         description="Size of the model for QRcode and barcode detection. Can be 'n', 's', 'm' or 'l'. Larger models are more accurate but slower.",
     )
-    QRDET_WEIGHTS_DIR: Optional[str] = Field(
+    QRDET_WEIGHTS_DIR: str | None = Field(
         default=None,
         description="Directory path containing pre-downloaded weights for QRDet model.",
+    )
+    MAX_BARCODE_IMAGE_DIM: int = Field(
+        default=2400,
+        gt=0,
+        description="Maximum dimension (width or height) in pixels for the whole page image during barcode scanning. Images exceeding this will be downscaled with INTER_AREA.",
+    )
+    MAX_CROP_DIM_FOR_UPSCALE: int = Field(
+        default=300,
+        gt=0,
+        description="Maximum crop dimension (width or height) in pixels eligible for 2x/3x upscaling. Larger crops skip upscaling.",
+    )
+    MAX_BARCODE_IMAGE_PIXELS: int = Field(
+        default=100_000_000,
+        gt=0,
+        description="Maximum total pixel count (width * height) permitted for an image before cv2.imread decompression, protecting against decompression bombs.",
+    )
+    TWO_D_DOC_CRL_REFRESH_ENABLED: bool = Field(
+        default=True,
+        description="Enable startup and periodic in-memory 2D-Doc CRL refresh.",
+    )
+    TWO_D_DOC_CRL_REFRESH_INTERVAL_HOURS: float = Field(
+        default=3.0,
+        gt=0,
+        description="Interval in hours between periodic 2D-Doc CRL refreshes to detect updated CRLs and certificate revocations.",
+    )
+    TWO_D_DOC_CRL_REFRESH_TIMEOUT_SECONDS: int = Field(
+        default=10,
+        gt=0,
+        description="HTTP timeout in seconds per CRL fetch during 2D-Doc CRL refresh.",
     )
 
 

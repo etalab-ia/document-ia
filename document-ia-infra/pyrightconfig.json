@@ -1,7 +1,7 @@
 {
-  "venvPath": ".",
+  "venvPath": "..",
   "venv": ".venv",
-  "pythonVersion": "3.13",
+  "pythonVersion": "3.14",
   "typeCheckingMode": "strict",
   "reportMissingTypeStubs": false,
   "include": [
@@ -13,7 +13,6 @@
   ],
   "extraPaths": [
     "src",
-    "src/document_ia_infra",
     "../document-ia-schemas/src"
   ]
 }

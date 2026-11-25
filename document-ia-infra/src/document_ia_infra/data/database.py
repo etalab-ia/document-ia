@@ -32,8 +32,10 @@ class DatabaseManager:
         pool_timeout: int = settings.DB_POOL_TIMEOUT,
         pool_recycle: int = settings.DB_POOL_RECYCLE,
         pool_pre_ping: bool = settings.DB_POOL_PRE_PING,
+        use_null_pool: bool = False,
     ):
         self.db_settings = db_settings
+        self.use_null_pool = use_null_pool
         self.engine_kwargs: Dict[str, Any] = {
             "echo": False,
             "future": True,
@@ -48,15 +50,22 @@ class DatabaseManager:
             server_settings = connect_args.setdefault("server_settings", {})
             server_settings["search_path"] = f"{db_settings.POSTGRES_SCHEMA}, public"
 
-        self.async_engine = create_async_engine(
-            db_settings.get_database_url(async_connection=True),
-            pool_size=pool_size,
-            max_overflow=max_overflow,
-            pool_timeout=pool_timeout,
-            pool_recycle=pool_recycle,
-            pool_pre_ping=pool_pre_ping,
-            **self.engine_kwargs,
-        )
+        if use_null_pool:
+            self.async_engine = create_async_engine(
+                db_settings.get_database_url(async_connection=True),
+                poolclass=NullPool,
+                **self.engine_kwargs,
+            )
+        else:
+            self.async_engine = create_async_engine(
+                db_settings.get_database_url(async_connection=True),
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_timeout=pool_timeout,
+                pool_recycle=pool_recycle,
+                pool_pre_ping=pool_pre_ping,
+                **self.engine_kwargs,
+            )
 
         # Session factory for async usage (API/worker)
         self.local_session = async_sessionmaker(

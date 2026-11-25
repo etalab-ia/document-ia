@@ -1,34 +1,38 @@
 import logging
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import SecretStr
 
 from document_ia_api.api.contracts.execution.failed import (
-    ExecutionFailedModel,
     ExecutionFailedData,
+    ExecutionFailedModel,
 )
 from document_ia_api.api.contracts.execution.result import (
     ClassificationResult,
     ExtractionResult,
 )
 from document_ia_api.api.contracts.execution.started import (
-    ExecutionStartedModel,
     ExecutionStartedData,
+    ExecutionStartedModel,
     S3FileInfo,
 )
 from document_ia_api.api.contracts.execution.success import (
     ExecutionSuccessModel,
-    SuccessResult,
     SuccessData,
+    SuccessResult,
 )
 from document_ia_api.api.contracts.execution.types import ExecutionStatus
 from document_ia_infra.core.model.typed_generic_model import GenericProperty
 from document_ia_infra.data.document.schema.document_extraction import (
     DocumentExtraction,
 )
+from document_ia_infra.data.event.dto.anonymization_enum import AnonymizationStatus
 from document_ia_infra.data.event.dto.event_dto import EventDTO
 from document_ia_infra.data.event.dto.event_type_enum import EventType
+from document_ia_infra.data.event.schema.mappers.event_mapper import (
+    decode_event_dto,
+)
 from document_ia_infra.data.event.schema.workflow.workflow_execution_completed_event import (
     WorkflowExecutionCompletedEvent,
 )
@@ -38,11 +42,7 @@ from document_ia_infra.data.event.schema.workflow.workflow_execution_failed_even
 from document_ia_infra.data.event.schema.workflow.workflow_execution_started_event import (
     WorkflowExecutionStartedEvent,
 )
-from document_ia_schemas import (
-    resolve_extract_schema,
-    BaseDocumentTypeSchema,
-    SupportedDocumentType,
-)
+from document_ia_schemas import SupportedDocumentType
 
 logger = logging.getLogger(__name__)
 
@@ -53,52 +53,108 @@ class ExecutionService:
     def __init__(self):
         pass
 
+    @staticmethod
+    def _build_started_model(
+        execution_id: str,
+        event_dto: EventDTO,
+        event_data: WorkflowExecutionStartedEvent,
+        *,
+        is_purged: bool = False,
+    ) -> ExecutionStartedModel:
+        file_info: Optional[S3FileInfo] = None
+        if event_data.s3_file_info is not None:
+            file_info = S3FileInfo(
+                file_name=event_data.s3_file_info.filename,
+                content_type=event_data.s3_file_info.content_type,
+                presigned_url=event_data.s3_file_info.presigned_url,
+            )
+        return ExecutionStartedModel(
+            id=execution_id,
+            status=ExecutionStatus.STARTED,
+            data=ExecutionStartedData(
+                created_at=event_dto.created_at,
+                s3_file_info=file_info,
+                file_url=(
+                    SecretStr(event_data.file_url)
+                    if event_data.file_url is not None
+                    else None
+                ),
+            ),
+            purged=is_purged,
+        )
+
     def get_event_model(
-        self, event_dto: EventDTO, execution_id: str, is_debug_mode: bool
+        self,
+        event_dto: EventDTO,
+        execution_id: str,
+        is_debug_mode: bool,
+        started_event_dto: Optional[EventDTO] = None,
     ) -> ExecutionStartedModel | ExecutionSuccessModel | ExecutionFailedModel:
-        if event_dto.event_type == EventType.WORKFLOW_EXECUTION_STARTED:
-            event_data = WorkflowExecutionStartedEvent(**event_dto.event)
-            file_info: Optional[S3FileInfo] = None
-            if event_data.s3_file_info is not None:
-                file_info = S3FileInfo(
-                    file_name=event_data.s3_file_info.filename,
-                    content_type=event_data.s3_file_info.content_type,
-                    presigned_url=event_data.s3_file_info.presigned_url,
+        if event_dto.event_type not in (
+            EventType.WORKFLOW_EXECUTION_STARTED,
+            EventType.WORKFLOW_EXECUTION_FAILED,
+            EventType.WORKFLOW_EXECUTION_COMPLETED,
+        ):
+            raise HTTPException(status_code=400, detail="Event type not supported")
+
+        is_purged = event_dto.anonymization_status == AnonymizationStatus.DONE
+        event_data = decode_event_dto(event_dto)
+        match event_data:
+            case WorkflowExecutionStartedEvent():
+                return self._build_started_model(
+                    execution_id, event_dto, event_data, is_purged=is_purged
                 )
-            return ExecutionStartedModel(
-                id=execution_id,
-                status=ExecutionStatus.STARTED,
-                data=ExecutionStartedData(
-                    created_at=event_dto.created_at,
-                    s3_file_info=file_info,
-                    file_url=event_data.file_url,
-                ),
-            )
-
-        if event_dto.event_type == EventType.WORKFLOW_EXECUTION_FAILED:
-            event_data = WorkflowExecutionFailedEvent(**event_dto.event)
-            return ExecutionFailedModel(
-                id=execution_id,
-                status=ExecutionStatus.FAILED,
-                data=ExecutionFailedData(
-                    error_type=event_data.error_type,
-                    failed_step=event_data.failed_step,
-                    retry_count=event_data.retry_count,
-                    workflow_id=event_data.workflow_id,
-                    error_message=event_data.error_message,
-                ),
-            )
-
-        if event_dto.event_type == EventType.WORKFLOW_EXECUTION_COMPLETED:
-            return self._get_success_response(execution_id, event_dto, is_debug_mode)
-
-        raise HTTPException(status_code=400, detail="Event type not supported")
+            case WorkflowExecutionFailedEvent():
+                if event_data.is_terminal is False:
+                    if started_event_dto is not None:
+                        started_data = decode_event_dto(started_event_dto)
+                        if isinstance(started_data, WorkflowExecutionStartedEvent):
+                            started_is_purged = (
+                                started_event_dto.anonymization_status
+                                == AnonymizationStatus.DONE
+                            )
+                            return self._build_started_model(
+                                execution_id,
+                                started_event_dto,
+                                started_data,
+                                is_purged=started_is_purged,
+                            )
+                    return ExecutionStartedModel(
+                        id=execution_id,
+                        status=ExecutionStatus.STARTED,
+                        data=ExecutionStartedData(
+                            created_at=event_dto.created_at,
+                            s3_file_info=None,
+                            file_url=None,
+                        ),
+                        purged=is_purged,
+                    )
+                return ExecutionFailedModel(
+                    id=execution_id,
+                    status=ExecutionStatus.FAILED,
+                    data=ExecutionFailedData(
+                        error_type=event_data.error_type,
+                        failed_step=event_data.failed_step,
+                        retry_count=event_data.retry_count,
+                        workflow_id=event_data.workflow_id,
+                        error_message=event_data.error_message,
+                    ),
+                    purged=is_purged,
+                )
+            case WorkflowExecutionCompletedEvent():
+                return self._get_success_response(
+                    execution_id, event_data, is_debug_mode, is_purged=is_purged
+                )
+            case _:
+                raise HTTPException(status_code=400, detail="Event type not supported")
 
     def _get_success_response(
-        self, execution_id: str, last_event: EventDTO, is_debug_mode: bool
-    ):
-        event_data = WorkflowExecutionCompletedEvent(**last_event.event)
-
+        self,
+        execution_id: str,
+        event_data: WorkflowExecutionCompletedEvent,
+        is_debug_mode: bool,
+        is_purged: bool = False,
+    ) -> ExecutionSuccessModel:
         success_result = SuccessResult()
 
         if event_data.final_result.classification is not None:
@@ -115,11 +171,8 @@ class ExecutionService:
                     properties=[],
                 )
             else:
-                extraction_class = resolve_extract_schema(
-                    event_data.final_result.extraction.type.value
-                )
                 success_result.extraction = self._convert_extraction_result(
-                    event_data.final_result.extraction, extraction_class
+                    event_data.final_result.extraction
                 )
 
         success_result.barcodes = event_data.final_result.barcodes
@@ -133,47 +186,20 @@ class ExecutionService:
         )
 
         return ExecutionSuccessModel(
-            id=execution_id, status=ExecutionStatus.SUCCESS, data=success_data
+            id=execution_id,
+            status=ExecutionStatus.SUCCESS,
+            data=success_data,
+            purged=is_purged,
         )
-
-    def _infer_value_type(
-        self, value: Any
-    ) -> Literal["string", "number", "boolean", "object"]:
-        if isinstance(value, bool):
-            return "boolean"
-        if isinstance(value, int):
-            return "number"
-        if isinstance(value, float):
-            return "number"
-        if isinstance(value, str):
-            return "string"
-        return "object"
 
     def _convert_extraction_result(
         self,
         extraction_data: DocumentExtraction[Any],
-        extraction_class: BaseDocumentTypeSchema[BaseModel],
     ) -> ExtractionResult:
-        model_cls: type[BaseModel] = extraction_class.document_model
-
-        # On récupère les propriétés brutes (souvent une instance Pydantic)
-        props_raw: Any = extraction_data.properties
-
-        # Si ce n'est pas déjà une instance de `model_cls`, on tente de l'instancier
-        model_instance: BaseModel
-        if isinstance(props_raw, BaseModel):
-            model_instance = props_raw
-        elif isinstance(props_raw, dict):
-            model_instance = model_cls(**props_raw)
-        else:
-            model_instance = model_cls(**getattr(props_raw, "__dict__", {}))
-
-        # Utilisation centrale de `GenericProperty`
-        generic_properties: list[GenericProperty] = (
-            GenericProperty.convert_pydantic_model(model_instance)
-        )
-
+        """Project the already-decoded domain extraction into the API contract."""
         return ExtractionResult(
             type=extraction_data.type,
-            properties=generic_properties,
+            properties=GenericProperty.convert_pydantic_model(
+                extraction_data.properties
+            ),
         )

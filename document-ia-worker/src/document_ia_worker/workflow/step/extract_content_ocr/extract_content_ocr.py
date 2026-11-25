@@ -1,10 +1,14 @@
 import logging
+import shlex
 from typing import Any, Optional
 
 import cv2
 from cv2.typing import MatLike
 from pytesseract import image_to_string  # pyright: ignore [reportUnknownVariableType]
 
+from document_ia_worker.core.model_artifacts import (
+    resolve_and_verify_tesseract_lang_data,
+)
 from document_ia_worker.workflow.main_workflow_context import (
     MainWorkflowContext,
     StepMetadata,
@@ -35,10 +39,16 @@ class ExtractContentOcrStep(BaseStep[OcrResult]):
     def get_context_result_key(self) -> str:
         return OcrResult.__name__
 
-    async def _prepare_step(self):
+    async def _prepare_step(self) -> None:
         logger.info(f"Preparing ocr extraction step for file: {self.execution_id}")
         if self.preprocess_file_result is None:
             raise ValueError("DownloadFileReturnData not injected in context")
+        verified_lang_data = resolve_and_verify_tesseract_lang_data(self.tesseract_lang)
+        base_config = f"--psm {self.tesseract_psm} --oem {self.tesseract_oem}"
+        if verified_lang_data is not None:
+            self.tesseract_config = f"{base_config} --tessdata-dir {shlex.quote(str(verified_lang_data.parent))}"
+        else:
+            self.tesseract_config = base_config
 
     def inject_workflow_context(self, context: dict[str, Any]):
         not_typed_data = context.get(PreprocessFileResult.__name__)
@@ -63,7 +73,11 @@ class ExtractContentOcrStep(BaseStep[OcrResult]):
                     lang=self.tesseract_lang,
                     timeout=self.tesseract_timeout,
                 )
-                logger.debug(f"OCR data extracted : {data}")
+                logger.debug(
+                    "OCR extracted %d characters for page %d",
+                    len(data),
+                    index,
+                )
                 results.append(
                     OcrResultPage(
                         text=data,
@@ -74,7 +88,11 @@ class ExtractContentOcrStep(BaseStep[OcrResult]):
             # When there is an error during the OCR processing, we catch it and continue with the next page
             # It could be a timeout or any other error
             except Exception as e:
-                logger.error(f"Error during OCR processing: {e}")
+                logger.error(
+                    "Error during OCR processing for page %d: %s",
+                    index,
+                    type(e).__name__,
+                )
                 results.append(
                     OcrResultPage(
                         text=None,
@@ -84,7 +102,7 @@ class ExtractContentOcrStep(BaseStep[OcrResult]):
                 )
                 continue
             finally:
-                logger.info(f"OCR processing completed for file: {file_path}")
+                logger.info("OCR processing completed for page %d", index)
                 del gray
                 index += 1
 

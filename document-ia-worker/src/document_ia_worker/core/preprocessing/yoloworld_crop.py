@@ -3,13 +3,21 @@ import os
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, cast
 
 from PIL import Image
 
+from document_ia_worker.core.model_artifacts import (
+    resolve_and_verify_clip_path,
+    resolve_and_verify_yoloworld_path,
+)
+
+os.environ.setdefault("YOLO_OFFLINE", "true")
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
 YOLO_WORLD_MODEL = "yolov8m-world.pt"
-_YOLO_LOCK = threading.Lock()
+_YOLO_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -22,16 +30,48 @@ class DetectionBox:
 
 
 _MODEL_CACHE: Any = None
+_LAST_MODEL_INSTANCE: Any = None
+_LAST_CLASS_NAME: str | None = None
+
+
+def _get_yoloworld_model_unlocked() -> Any:
+    global _MODEL_CACHE, _LAST_MODEL_INSTANCE, _LAST_CLASS_NAME
+    if _MODEL_CACHE is None:
+        from ultralytics import YOLOWorld  # pyright: ignore [reportPrivateImportUsage]
+
+        verified_path = resolve_and_verify_yoloworld_path()
+        _MODEL_CACHE = YOLOWorld(str(verified_path))  # pyright: ignore [reportConstantRedefinition]
+        _LAST_MODEL_INSTANCE = None  # pyright: ignore[reportConstantRedefinition]
+        _LAST_CLASS_NAME = None  # pyright: ignore[reportConstantRedefinition]
+    return _MODEL_CACHE
 
 
 def get_yoloworld_model() -> Any:
-    global _MODEL_CACHE
-    if _MODEL_CACHE is None:
-        from ultralytics import YOLOWorld
+    with _YOLO_LOCK:
+        return _get_yoloworld_model_unlocked()
 
-        model_path = os.environ.get("YOLOWORLD_PATH", YOLO_WORLD_MODEL)
-        _MODEL_CACHE = YOLOWorld(model_path)
-    return _MODEL_CACHE
+
+def _configure_ultralytics_offline_weights_dir(verified_clip_path: Path) -> Path:
+    weights_dir = verified_clip_path.parent.parent
+    import ultralytics.nn.text_model as text_model_mod
+    import ultralytics.utils as ultralytics_utils
+
+    ultralytics_utils.SETTINGS["weights_dir"] = str(weights_dir)
+    ultralytics_utils.WEIGHTS_DIR = weights_dir
+    setattr(text_model_mod, "WEIGHTS_DIR", weights_dir)
+    return weights_dir
+
+
+def ensure_yoloworld_classes(yolo_model: Any, class_name: str) -> None:
+    """Verify CLIP weights, force offline weights_dir, and update classes only when changed."""
+    global _LAST_MODEL_INSTANCE, _LAST_CLASS_NAME
+    with _YOLO_LOCK:
+        verified_clip_path = resolve_and_verify_clip_path()
+        _configure_ultralytics_offline_weights_dir(verified_clip_path)
+        if _LAST_MODEL_INSTANCE is not yolo_model or _LAST_CLASS_NAME != class_name:
+            yolo_model.set_classes([class_name])
+            _LAST_MODEL_INSTANCE = yolo_model  # pyright: ignore[reportConstantRedefinition]
+            _LAST_CLASS_NAME = class_name  # pyright: ignore[reportConstantRedefinition]
 
 
 def detect_boxes(
@@ -39,16 +79,19 @@ def detect_boxes(
     *,
     class_name: str,
     confidence_threshold: float,
+    iou: float = 0.7,
     image_size: Optional[int] = None,
 ) -> list[DetectionBox]:
     predict_kwargs: dict[str, Any] = {"verbose": False}
     predict_kwargs["device"] = "cpu"
+    predict_kwargs["conf"] = confidence_threshold
+    predict_kwargs["iou"] = iou
     if image_size is not None:
         predict_kwargs["imgsz"] = image_size
 
     with _YOLO_LOCK:
         yolo_model = get_yoloworld_model()
-        yolo_model.set_classes([class_name])
+        ensure_yoloworld_classes(yolo_model, class_name)
         results = yolo_model.predict(image, **predict_kwargs)
 
     if not results:
@@ -65,16 +108,13 @@ def detect_boxes(
     for coordinates, confidence in zip(xyxy_values, confidence_values):
         if len(coordinates) < 4:
             continue
-        confidence_float = float(confidence)
-        if confidence_float < confidence_threshold:
-            continue
         detections.append(
             DetectionBox(
                 x1=float(coordinates[0]),
                 y1=float(coordinates[1]),
                 x2=float(coordinates[2]),
                 y2=float(coordinates[3]),
-                confidence=confidence_float,
+                confidence=float(confidence),
             )
         )
     return detections
@@ -98,12 +138,14 @@ def yoloworld_crop_image(
     class_name: str = "book",
     margin: int = 20,
     confidence_threshold: float = 0.25,
+    iou: float = 0.7,
     image_size: Optional[int] = None,
 ) -> Image.Image:
     boxes = detect_boxes(
         image,
         class_name=class_name,
         confidence_threshold=confidence_threshold,
+        iou=iou,
         image_size=image_size,
     )
     return crop_image_to_merged_boxes(image, boxes, margin=margin)
@@ -151,11 +193,11 @@ def _to_list(value: Any) -> list[Any]:
         value = value.cpu()
     if hasattr(value, "tolist"):
         parsed = value.tolist()
-        return parsed if isinstance(parsed, list) else [parsed]
+        return cast(list[Any], parsed) if isinstance(parsed, list) else [parsed]
     if isinstance(value, list):
-        return value
+        return cast(list[Any], value)
     if isinstance(value, tuple):
-        return list(value)
+        return list(cast(tuple[Any, ...], value))
     if isinstance(value, Iterable):
-        return list(value)
+        return list(cast(Iterable[Any], value))
     return []

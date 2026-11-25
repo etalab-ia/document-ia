@@ -5,10 +5,13 @@ Technical README for the API subproject: setup, configuration, build, and useful
 ## Documentation API
 
 - **API summary (entry point)**: [docs/API_SUMMARY.md](./docs/API_SUMMARY.md)
+- **Authentication & API keys**: [docs/AUTHENTICATION.md](./docs/AUTHENTICATION.md)
+- **Workflow Idempotency-Key**: [docs/WORKFLOW_IDEMPOTENCY_KEY.md](./docs/WORKFLOW_IDEMPOTENCY_KEY.md)
+- **Security (file confinement & anti-SSRF)**: [docs/SECURITY_FILE_NETWORK.md](./docs/SECURITY_FILE_NETWORK.md)
 
 ## Prerequisites
 
-- Python 3.13
+- Python 3.14
 - UV 0.11.x
 - Redis
 - PostgreSQL
@@ -32,10 +35,11 @@ Main API variables:
 | `BASE_URL` | `""` | External API base URL |
 | `AUTO_MIGRATE` | `true` | Run Alembic migrations on startup |
 | `APP_ENV` | `prod` | Runtime environment (also affects API key format) |
-| `API_KEY_VERSION` | `1` | API key format version |
+| `API_KEY_VERSION` | `2` | API key format version (`1` legacy or `2` cryptographically bound) |
+| `API_KEY_ALLOW_V1` | `true` | Allow legacy `v1` keys during the 20-day rotation window |
 | `API_KEY_PEPPER_HASH` | `default_pepper_hash_value` | Pepper used to hash API keys |
 | `API_KEY_PEPPER_CHK` | `default_pepper_chk_value` | Pepper used for API key checksum |
-| `DOCUMENT_IA_API_KEY` | `""` | Internal/service API key |
+| `DOCUMENT_IA_API_KEY` | `""` | Initial `PlatformAdmin` organization API key (seeded during Alembic migration) |
 | `RATE_LIMIT_REQUESTS_PER_MINUTE` | `300` | Per-minute limit per API key |
 | `RATE_LIMIT_REQUESTS_PER_DAY` | `5000` | Per-day limit per API key |
 | `SYNC_EXECUTION_TIMEOUT_SECONDS` | `30` | Soft timeout for sync endpoints |
@@ -45,7 +49,32 @@ Main API variables:
 | `LOKI_LOGGING_ENABLED` | `true` | Enable Loki log ingestion |
 | `LOKI_BEARER_TOKEN` | unset | Optional Bearer token for Loki push. Use the raw token only, without the `Bearer ` prefix. Leave empty to push without authentication. |
 
-The API also depends on shared monorepo settings (PostgreSQL, Redis, S3, logging). Use the repository root `env.example` as reference.
+The API also depends on shared monorepo settings (PostgreSQL, Redis, S3, logging, `WEBHOOK_SECRET_ENCRYPTION_KEY`). Use the repository root `env.example` and [document-ia-infra/README.md](../document-ia-infra/README.md) as references.
+
+### Generating the initial Admin API key (`DOCUMENT_IA_API_KEY`)
+
+During the initial Alembic migration, the API reads `DOCUMENT_IA_API_KEY` to seed the default `PlatformAdmin` organization (`Document IA Default Organization`) and its active API key in PostgreSQL.
+
+> **Important:** Make sure `APP_ENV` (`dev`, `staging`, `sandbox`, or `prod`), `API_KEY_PEPPER_CHK`, and `API_KEY_PEPPER_HASH` are already set to their target environment values in your `.env` (or shell environment) **before** running the script, otherwise checksum verification will fail during migration or authentication.
+
+Generate a valid API key from the repository root:
+
+```bash
+uv run --directory document-ia-api python scripts/generate_api_key.py
+```
+
+Or for a specific target environment/pepper without modifying your local `.env`:
+
+```bash
+APP_ENV=prod API_KEY_PEPPER_CHK="<target-chk-pepper>" API_KEY_PEPPER_HASH="<target-hash-pepper>" \
+  uv run --directory document-ia-api python scripts/generate_api_key.py
+```
+
+Copy the `API key (presented)` value (`dia_<env>_<version>_<prefix>_<body>_<checksum>`) into your `.env` file (or deployment environment variables) before running migrations:
+
+```dotenv
+DOCUMENT_IA_API_KEY=<presented-api-key>
+```
 
 ## Run
 
@@ -92,6 +121,27 @@ Analytics note:
 - Operationally, in PaaS environments, ensure the API starts at least once with valid `ANALYTICS_*` before enabling the worker replication schedule.
 
 ## Quality and tests
+
+### Saturation responses
+
+All four v1/v2 execution and synchronous-execution routes check admission before
+storing uploads in S3 or writing start events. Publication rechecks and allocates capacity
+atomically, so preflight success is not a reservation. A race that saturates the
+queue after preflight follows the existing #120 compensation: return 503,
+attempt to record terminal scheduling failure and retain any uploaded file.
+
+Client quota exhaustion returns **429** with `Retry-After` until the relevant
+quota reset. Unavailable quota checks, queue saturation or failed admission
+inspection return **503** with bounded `Retry-After` (default 5 seconds). They do
+not disable rate limiting. RFC 7807 responses preserve this header. Result reads
+are not admission- or quota-gated and remain available when Redis/processing is
+degraded, provided their own database/authentication dependencies are available.
+
+See [infra admission policy](../document-ia-infra/README.md#new-execution-admission)
+for thresholds, recovery semantics and deployment limits. Redis connection/ping,
+admission and quota commands have five-second deadlines per attempt; consumer
+blocking reads retain their own longer blocking budget. Later requests retry
+after an exhausted connection budget instead of remaining permanently disconnected.
 
 ```bash
 cd document-ia-api

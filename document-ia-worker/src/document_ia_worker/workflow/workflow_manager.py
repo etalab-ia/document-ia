@@ -1,14 +1,25 @@
+import asyncio
+import contextlib
+import ctypes
+import gc
 import logging
+import sys
 from datetime import datetime, UTC
 from typing import Optional, Any
 
+from document_ia_infra.core.file.safe_path import (
+    get_execution_sandbox_root,
+    safe_cleanup_directory,
+)
 from document_ia_infra.data.database import DatabaseManager
 from document_ia_infra.data.event.dto.event_dto import EventDTO
+from document_ia_infra.data.event.dto.event_type_enum import EventType
 from document_ia_infra.data.event.repository.event import EventRepository
+from document_ia_infra.data.event.schema.mappers.event_mapper import (
+    decode_event_dto,
+)
 from document_ia_infra.data.event.schema.workflow.workflow_execution_started_event import (
     WorkflowExecutionStartedEvent,
-    ClassificationParameters,
-    ExtractionParameters,
 )
 from document_ia_infra.data.webhook.repository.webhook_repository import (
     WebHookRepository,
@@ -23,9 +34,14 @@ from document_ia_infra.redis.model.webhook_message import WebHookMessage
 from document_ia_infra.redis.model.workflow_execution_message import (
     WorkflowExecutionMessage,
 )
-from document_ia_infra.redis.publisher import Publisher
+from document_ia_infra.redis.progress_tracker import (
+    get_current_progress_tracker,
+    record_step_progress,
+)
+from document_ia_infra.redis.publisher import PublishFailedError, Publisher
 from document_ia_infra.redis.redis_manager import RedisManager
 from document_ia_infra.redis.redis_settings import redis_settings
+from document_ia_infra.s3.s3_manager import S3Manager
 from document_ia_infra.service.event_store_service import EventStoreService
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +52,11 @@ from document_ia_worker.core.aggregator_log import (
     start_time_var,
     handle_finish_execution,
 )
+from document_ia_worker.core.db_semaphore import (
+    acquire_worker_db_slot,
+    close_session_safely,
+)
+from document_ia_worker.core.temp_file_sweeper import ActiveExecutionTracker
 from document_ia_worker.exception.no_event_attached_to_execution_exception import (
     NoEventAttachedToExecutionException,
 )
@@ -49,6 +70,38 @@ from document_ia_worker.workflow.step_factory_v1 import prepareStepListsV1
 from document_ia_worker.workflow.step_factory_v2 import prepareStepListsV2
 
 logger = logging.getLogger(__name__)
+
+
+def _load_libc() -> Any:
+    if sys.platform.startswith("linux"):
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            if hasattr(libc, "malloc_trim"):
+                libc.malloc_trim.argtypes = [ctypes.c_size_t]
+                libc.malloc_trim.restype = ctypes.c_int
+            return libc
+        except Exception:
+            return None
+    return None
+
+
+_LIBC: Any = _load_libc()
+
+
+def _release_worker_memory() -> None:
+    gc.collect()
+    if _LIBC is not None:
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
+
+
+def _create_worker_database_manager() -> DatabaseManager:
+    try:
+        return DatabaseManager(pool_size=1, max_overflow=1, use_null_pool=True)
+    except TypeError:
+        return DatabaseManager(pool_size=1, max_overflow=1)
 
 
 class WorkflowManager:
@@ -77,6 +130,7 @@ class WorkflowManager:
         self.workflow_context = {}
         self.main_workflow_context = None
         self.workflow = None
+        self._s3_cleaned_up = False
 
         # Aggregated logging context init (per workflow execution)
         setup_logging_worker()
@@ -85,11 +139,68 @@ class WorkflowManager:
         self._agg_token_started_at = start_time_var.set(datetime.now(UTC))
 
         # noinspection PyTypeChecker
+        self._webhook_redis_manager = RedisManager()
         self._webhook_producer: Publisher[WebHookMessage] = Publisher(
-            redis_settings.WEBHOOK_STREAM_NAME, RedisManager()
+            redis_settings.WEBHOOK_STREAM_NAME, self._webhook_redis_manager
         )
 
+    def _reset_logging_context_vars(self) -> None:
+        """Reset ContextVars to avoid leaking into subsequent tasks on the same thread."""
+        # RuntimeError is raised if handle_finish_execution already reset the token.
+        with contextlib.suppress(ValueError, LookupError, RuntimeError):
+            agg_buffer_var.reset(self._agg_token_buf)
+        with contextlib.suppress(ValueError, LookupError, RuntimeError):
+            execution_id_var.reset(self._agg_token_exec)
+        with contextlib.suppress(ValueError, LookupError, RuntimeError):
+            start_time_var.reset(self._agg_token_started_at)
+
+    async def _purge_s3_file_for_execution(
+        self,
+        event_service: EventStoreService,
+        execution_id: str,
+        context_label: str = "Terminal failure",
+    ) -> None:
+        """Purge orphaned S3 object associated with the execution's start event."""
+        try:
+            s3_key: Optional[str] = None
+            async with acquire_worker_db_slot():
+                try:
+                    started_tuple = await event_service.get_workflow_started_event(
+                        execution_id
+                    )
+                    if started_tuple is not None:
+                        _, started_event = started_tuple
+                        if started_event.s3_file_info is not None:
+                            s3_key = (
+                                started_event.s3_file_info.s3_key.get_secret_value()
+                            )
+                finally:
+                    await close_session_safely(getattr(event_service, "session", None))
+
+            if s3_key is not None:
+                deleted = await asyncio.to_thread(S3Manager().delete_file, s3_key)
+                if deleted:
+                    logger.info(
+                        "%s: S3 file deleted for execution %s",
+                        context_label,
+                        execution_id,
+                    )
+                else:
+                    logger.warning(
+                        "%s: failed to delete S3 file for execution %s",
+                        context_label,
+                        execution_id,
+                    )
+        except Exception as s3_err:
+            logger.warning(
+                "%s: error while deleting S3 file for execution %s (%s)",
+                context_label,
+                execution_id,
+                type(s3_err).__name__,
+            )
+
     async def start(self):
+        ActiveExecutionTracker.add(self.message.workflow_execution_id)
         self.main_workflow_context = MainWorkflowContext(
             execution_id=self.message.workflow_execution_id,
             start_time=datetime.now(UTC),
@@ -98,33 +209,72 @@ class WorkflowManager:
         )
         need_to_notify_webhook = True
         is_success = True
+        is_retry_scheduled = False
         err_type: Optional[str] = None
         err_message: Optional[str] = None
         failed_step: Optional[str] = None
-        local_database_manager = DatabaseManager(pool_size=1, max_overflow=1)
+        is_completed_duplicate = False
+        local_database_manager = _create_worker_database_manager()
         try:
             async with local_database_manager.local_session() as session:
                 try:
-                    await self._prepare_workflow(session)
+                    async with acquire_worker_db_slot():
+                        try:
+                            is_completed_duplicate = (
+                                await self._prepare_workflow(session) is True
+                            )
+                        finally:
+                            await close_session_safely(session)
+                    if is_completed_duplicate:
+                        logger.info(
+                            "Skipping duplicate delivery for completed execution %s",
+                            self.message.workflow_execution_id,
+                        )
+                        return
                     self.event_data = self._parse_start_event()
                     self._prepare_executor(session)
+                    tracker = get_current_progress_tracker()
+                    if tracker is not None and tracker.is_aborted:
+                        logger.warning(
+                            f"Workflow execution {self.message.workflow_execution_id} was aborted by watchdog; skipping execution"
+                        )
+                        return
                     await self._execute_workflow()
                 except Exception as e:
-                    logger.error(f"Workflow execution failed: {e}")
+                    failed_step = (
+                        e.step_name
+                        if isinstance(e, WorkflowStepException)
+                        else "workflow"
+                    )
+                    inner_exc = (
+                        e.inner_exception if isinstance(e, WorkflowStepException) else e
+                    )
+                    logger.error(
+                        "Workflow execution failed on step %s (%s): execution_id=%s",
+                        failed_step,
+                        type(inner_exc).__name__,
+                        self.message.workflow_execution_id,
+                    )
                     is_success = False
+
+                    tracker = get_current_progress_tracker()
+                    if tracker is not None and tracker.is_aborted:
+                        logger.warning(
+                            f"Workflow execution {self.message.workflow_execution_id} was aborted by watchdog; skipping failure event and DB commit"
+                        )
+                        return
+
                     # We use the WorkflowStepException to know in which step the error happened
                     # and we dispatch the inner exception to have the original exception
-                    if isinstance(e, WorkflowStepException):
-                        failed_step = e.step_name
-                        inner_exc = e.inner_exception
-                    else:
-                        inner_exc = e
                     err_type = (
                         RetryableException.__name__
                         if isinstance(inner_exc, RetryableException)
                         else inner_exc.__class__.__name__
                     )
-                    err_message = str(inner_exc)
+                    raw_msg = str(inner_exc)
+                    if "?" in raw_msg:
+                        raw_msg = raw_msg.split("?")[0]
+                    err_message = raw_msg
 
                     # we need to notify the webhook for every not retryable exception or if it's the last retry
                     # By default the need_to_notify_webhook is True
@@ -134,8 +284,76 @@ class WorkflowManager:
                         and not self.is_last_retry
                     ):
                         need_to_notify_webhook = False
+                        is_retry_scheduled = True
 
-                    await self._save_failure_event(session, e)
+                    is_terminal_failure = (
+                        not WorkflowStepException.is_retryable_exception(e)
+                        or self.is_last_retry
+                    )
+                    need_s3_purge = is_terminal_failure and not self._s3_cleaned_up
+
+                    if self.event_dto is not None or is_terminal_failure:
+                        try:
+                            async with acquire_worker_db_slot():
+                                try:
+                                    if self.event_dto is None and is_terminal_failure:
+                                        with contextlib.suppress(Exception):
+                                            event_repository = EventRepository(session)
+                                            last_event = await event_repository.get_last_event_by_execution_id(
+                                                self.message.workflow_execution_id
+                                            )
+                                            if (
+                                                last_event is not None
+                                                and self._is_terminal_event(last_event)
+                                            ):
+                                                logger.info(
+                                                    "Execution %s is already terminal (%s); skipping duplicate failure event",
+                                                    self.message.workflow_execution_id,
+                                                    last_event.event_type,
+                                                )
+                                            else:
+                                                self.event_dto = await event_repository.get_started_event_by_execution_id(
+                                                    self.message.workflow_execution_id
+                                                )
+
+                                    if self.event_dto is not None:
+                                        await self._save_failure_event(
+                                            session, e, is_terminal=is_terminal_failure
+                                        )
+                                finally:
+                                    await close_session_safely(session)
+                        except Exception as save_err:
+                            with contextlib.suppress(Exception):
+                                await session.rollback()
+                            tracker = get_current_progress_tracker()
+                            if tracker is not None and tracker.is_aborted:
+                                logger.warning(
+                                    "Workflow execution %s was aborted by watchdog during failure save; skipping S3 purge",
+                                    self.message.workflow_execution_id,
+                                )
+                                return
+                            logger.warning(
+                                "Could not save failure event for execution %s: %s",
+                                self.message.workflow_execution_id,
+                                type(save_err).__name__,
+                            )
+
+                    tracker = get_current_progress_tracker()
+                    if tracker is not None and tracker.is_aborted:
+                        logger.warning(
+                            "Workflow execution %s was aborted by watchdog; skipping S3 purge",
+                            self.message.workflow_execution_id,
+                        )
+                        return
+
+                    if need_s3_purge:
+                        event_service = EventStoreService(session)
+                        await self._purge_s3_file_for_execution(
+                            event_service,
+                            self.message.workflow_execution_id,
+                            context_label="Start terminal failure",
+                        )
+
                     if isinstance(e, WorkflowStepException):
                         raise e.inner_exception
                     else:
@@ -165,41 +383,91 @@ class WorkflowManager:
                             else []
                         )
                     )
-                    # Persist DB changes
-                    await session.commit()
-                    if need_to_notify_webhook:
-                        await self._notify_webhook_execution_finished(session)
-                    handle_finish_execution(
-                        logger,
-                        self.main_workflow_context.organization_id,
-                        workflow_id_for_logs,
-                        is_success,
-                        self.retry_count,
-                        workflow_steps_for_logs,
-                        self._agg_token_exec,
-                        self._agg_token_buf,
-                        self._agg_token_started_at,
-                        err_type,
-                        err_message,
-                        failed_step,
-                        self.main_workflow_context.steps_metadata,
-                    )
+                    tracker = get_current_progress_tracker()
+                    if tracker is not None and tracker.is_aborted:
+                        logger.warning(
+                            f"Workflow execution {self.message.workflow_execution_id} was aborted by watchdog; skipping session commit and webhooks"
+                        )
+                    elif not is_completed_duplicate:
+                        if need_to_notify_webhook:
+                            try:
+                                async with acquire_worker_db_slot():
+                                    try:
+                                        # Persist DB changes
+                                        await session.commit()
+                                    finally:
+                                        await close_session_safely(session)
+                            except Exception as commit_err:
+                                logger.warning(
+                                    "Could not commit session during workflow finalization for execution %s: %s",
+                                    self.message.workflow_execution_id,
+                                    type(commit_err).__name__,
+                                )
+                            await self._notify_webhook_execution_finished(session)
+                        handle_finish_execution(
+                            logger,
+                            self.main_workflow_context.organization_id,
+                            workflow_id_for_logs,
+                            is_success,
+                            self.retry_count,
+                            workflow_steps_for_logs,
+                            self._agg_token_exec,
+                            self._agg_token_buf,
+                            self._agg_token_started_at,
+                            err_type,
+                            err_message,
+                            failed_step,
+                            self.main_workflow_context.steps_metadata,
+                        )
         finally:
+            self._reset_logging_context_vars()
+            tracker = get_current_progress_tracker()
+            is_aborted_with_retries_left = (
+                tracker is not None and tracker.is_aborted and not self.is_last_retry
+            )
+            if is_retry_scheduled or is_aborted_with_retries_left:
+                ActiveExecutionTracker.remove(self.message.workflow_execution_id)
+            else:
+                ActiveExecutionTracker.remove_and_cleanup_if_inactive(
+                    self.message.workflow_execution_id,
+                    lambda: self._cleanup_execution_sandbox("workflow completion"),
+                )
             # We destroy correctly the databaeManager
             try:
                 await local_database_manager.dispose_async()
             except Exception as e:
-                logger.error(f"Error while disposing local database manager: {e}")
+                logger.error(
+                    "Error while disposing local database manager: %s", type(e).__name__
+                )
+            finally:
+                try:
+                    await self._webhook_redis_manager.close()
+                except Exception as e:
+                    logger.error(
+                        "Error while closing workflow Redis manager: %s",
+                        type(e).__name__,
+                    )
+                finally:
+                    self.main_workflow_context = None
+                    _release_worker_memory()
 
-    async def _prepare_workflow(self, session: AsyncSession):
+    async def _prepare_workflow(self, session: AsyncSession) -> bool:
         try:
             logger.info(f"Preparing workflow {self.message.workflow_execution_id}")
-            event_dto = await EventRepository(
-                session
-            ).get_created_event_if_execution_not_completed_or_failed(
+            event_repository = EventRepository(session)
+            event_dto = await event_repository.get_created_event_if_execution_not_completed_or_failed(
                 self.message.workflow_execution_id
             )
             if event_dto is None:
+                latest_event = await event_repository.get_last_event_by_execution_id(
+                    self.message.workflow_execution_id
+                )
+                if (
+                    latest_event is not None
+                    and latest_event.event_type
+                    == EventType.WORKFLOW_EXECUTION_COMPLETED
+                ):
+                    return True
                 logger.error(
                     f"No events found that match a new execution {self.message.workflow_execution_id}"
                 )
@@ -209,18 +477,21 @@ class WorkflowManager:
 
             self.event_dto = event_dto
 
-            event_version_raw = event_dto.event.get("version")
-            event_version = (
-                event_version_raw if isinstance(event_version_raw, int) else 1
+            workflow_version_raw = event_dto.event.get("version")
+            workflow_version = (
+                workflow_version_raw if isinstance(workflow_version_raw, int) else 1
             )
+            if self.main_workflow_context is not None:
+                self.main_workflow_context.organization_id = event_dto.organization_id
+                self.main_workflow_context.workflow_version = workflow_version
 
             workflow_v1: Optional[WorkflowDTO] = None
             workflow_v2 = None
-            if event_version == 1:
+            if workflow_version == 1:
                 workflow_v1 = await workflow_repository.get_workflow_by_id(
                     event_dto.workflow_id
                 )
-            elif event_version == 2:
+            elif workflow_version == 2:
                 workflow_v2 = workflow_v2_repository.get_raw_workflow_by_id(
                     event_dto.workflow_id
                 )
@@ -231,23 +502,7 @@ class WorkflowManager:
 
             self.workflow = workflow_v1
 
-            if self.main_workflow_context is not None:
-                self.main_workflow_context.organization_id = event_dto.organization_id
-
-                classification_raw = self.event_dto.event.get(
-                    "classification_parameters"
-                )
-                if isinstance(classification_raw, dict):
-                    self.main_workflow_context.classification_parameters = (
-                        ClassificationParameters.model_validate(classification_raw)
-                    )
-
-                extraction_raw = self.event_dto.event.get("extraction_parameters")
-                if isinstance(extraction_raw, dict):
-                    self.main_workflow_context.extraction_parameters = (
-                        ExtractionParameters.model_validate(extraction_raw)
-                    )
-
+            return False
         except Exception as e:
             # We catch all exceptions here to wrap them in a WorkflowStepException
             raise WorkflowStepException("prepare_workflow", e)
@@ -261,13 +516,21 @@ class WorkflowManager:
             ):
                 raise Exception("Workflow or event not prepared")
 
-            self.main_workflow_context.event_version = self.event_data.version
+            self.main_workflow_context.workflow_version = (
+                self.event_data.workflow_version
+            )
+            self.main_workflow_context.classification_parameters = (
+                self.event_data.classification_parameters
+            )
+            self.main_workflow_context.extraction_parameters = (
+                self.event_data.extraction_parameters
+            )
 
             # Ensure a fresh step list per workflow execution
             self.step_list = []
 
             # v1 events use the dedicated v1 step factory.
-            if self.event_data.version == 1:
+            if self.event_data.workflow_version == 1:
                 if self.workflow is None:
                     raise Exception("Workflow v1 not prepared")
 
@@ -279,7 +542,7 @@ class WorkflowManager:
                     session=session,
                 )
                 return
-            elif self.event_data.version == 2:
+            elif self.event_data.workflow_version == 2:
                 self.step_list = prepareStepListsV2(
                     event_v2=self.event_data,
                     workflow_context=self.main_workflow_context,
@@ -287,23 +550,27 @@ class WorkflowManager:
                 )
                 return
             else:
-                raise Exception(f"Unsupported event version: {self.event_data.version}")
+                raise Exception(
+                    f"Unsupported workflow version: {self.event_data.workflow_version}"
+                )
 
         except Exception as e:
             raise WorkflowStepException("prepare_executor", e)
 
-    def _parse_start_event(self):
+    def _parse_start_event(self) -> WorkflowExecutionStartedEvent:
         try:
             if self.event_dto is None:
                 raise Exception("Event not prepared")
-            try:
-                return WorkflowExecutionStartedEvent(**self.event_dto.event)
-            except Exception as e:
-                logger.error(
-                    f"Failed to parse start event for execution {self.message.workflow_execution_id}: {e}"
-                )
-                raise
+            event = decode_event_dto(self.event_dto)
+            if not isinstance(event, WorkflowExecutionStartedEvent):
+                raise ValueError("Expected a workflow execution started event")
+            return event
         except Exception as e:
+            logger.error(
+                "Failed to parse start event for execution %s: %s",
+                self.message.workflow_execution_id,
+                type(e).__name__,
+            )
             raise WorkflowStepException("parse_start_event", e)
 
     async def _notify_webhook_execution_finished(self, async_session: AsyncSession):
@@ -318,23 +585,42 @@ class WorkflowManager:
             return
         try:
             logger.info(
-                f"Notifying webhook for finished execution {self.main_workflow_context.execution_id} of organization {self.main_workflow_context.organization_id}"
+                "Notifying webhook for finished execution %s of organization %s",
+                self.main_workflow_context.execution_id,
+                self.main_workflow_context.organization_id,
             )
-            webhook_repository = WebHookRepository(async_session)
-            webhooks = await webhook_repository.list_webhooks_by_organization(
-                self.main_workflow_context.organization_id
-            )
+            async with acquire_worker_db_slot():
+                try:
+                    webhook_repository = WebHookRepository(async_session)
+                    webhooks = await webhook_repository.list_webhooks_by_organization(
+                        self.main_workflow_context.organization_id
+                    )
+                finally:
+                    await close_session_safely(async_session)
 
             for webhook in webhooks:
-                await self._webhook_producer.publish_message(
-                    WebHookMessage(
-                        webhook_id=webhook.id,
-                        workflow_execution_id=self.main_workflow_context.execution_id,
+                try:
+                    await self._webhook_producer.publish_message(
+                        WebHookMessage(
+                            webhook_id=webhook.id,
+                            workflow_execution_id=self.main_workflow_context.execution_id,
+                        )
                     )
-                )
+                except PublishFailedError as e:
+                    # Isoler l'échec de chaque webhook : le publisher lève
+                    # désormais au lieu de renvoyer `None`, et une indisponibilité
+                    # ne doit pas interrompre les notifications suivantes.
+                    logger.error(
+                        "Failed to publish webhook notification %s for execution %s: %s",
+                        webhook.id,
+                        self.main_workflow_context.execution_id,
+                        type(e).__name__,
+                    )
         except Exception as e:
             logger.error(
-                f"Failed to notify webhook for finished execution {self.main_workflow_context.execution_id}: {e}"
+                "Failed to notify webhook for finished execution %s: %s",
+                self.main_workflow_context.execution_id,
+                type(e).__name__,
             )
 
     async def _execute_workflow(self):
@@ -349,6 +635,12 @@ class WorkflowManager:
             )
         try:
             for step in self.step_list:
+                tracker = get_current_progress_tracker()
+                if tracker is not None and tracker.is_aborted:
+                    logger.warning(
+                        f"Execution {self.message.workflow_execution_id} aborted during step execution; stopping workflow"
+                    )
+                    break
                 try:
                     logger.info(f"Executing step {step.__class__.__name__}")
                     step.inject_workflow_context(self.workflow_context)
@@ -358,6 +650,7 @@ class WorkflowManager:
                         self.main_workflow_context.number_of_step_executed + 1
                     )
                     self.main_workflow_context.steps_metadata.append(step_metadata)
+                    record_step_progress(step.__class__.__name__)
                 except Exception as e:
                     raise WorkflowStepException(step.__class__.__name__, e)
         except Exception as e:
@@ -368,17 +661,61 @@ class WorkflowManager:
             ):
                 is_last_cleanup = False
 
+            failed_step = (
+                e.step_name if isinstance(e, WorkflowStepException) else "unknown"
+            )
+            inner_exc = e.inner_exception if isinstance(e, WorkflowStepException) else e
             logger.error(
-                f"Failed to execute workflow {self.message.workflow_execution_id}: {e}"
+                "Failed to execute workflow %s on step %s: %s",
+                self.message.workflow_execution_id,
+                failed_step,
+                type(inner_exc).__name__,
             )
             raise e
         finally:
+            tracker = get_current_progress_tracker()
+            if tracker is not None and tracker.is_aborted:
+                is_last_cleanup = False
             logger.info(f"Cleaning up workflow {self.message.workflow_execution_id}")
             # We clean up the data in the reverse order because the first step need to be the last
+            cleanup_all_succeeded = True
             for step in reversed(self.step_list):
-                await step.cleanup(is_last_cleanup)
+                try:
+                    await step.cleanup(is_last_cleanup)
+                except Exception as cleanup_err:
+                    cleanup_all_succeeded = False
+                    logger.warning(
+                        "Error during step cleanup (%s) for execution %s: %s",
+                        step.__class__.__name__,
+                        self.message.workflow_execution_id,
+                        type(cleanup_err).__name__,
+                    )
+            s3_step_failed_cleanup = any(
+                hasattr(step, "s3_cleanup_succeeded")
+                and getattr(step, "file_info", None) is not None
+                and not getattr(step, "s3_cleanup_succeeded")
+                for step in self.step_list
+            )
+            if (
+                is_last_cleanup
+                and cleanup_all_succeeded
+                and len(self.step_list) > 0
+                and not s3_step_failed_cleanup
+            ):
+                self._s3_cleaned_up = True
 
-    async def _save_failure_event(self, db: AsyncSession, exception: Exception):
+            self.workflow_context.clear()
+            self.step_list.clear()
+            _release_worker_memory()
+
+    async def _save_failure_event(
+        self, db: AsyncSession, exception: Exception, *, is_terminal: bool = True
+    ):
+        if self.event_dto is None:
+            with contextlib.suppress(Exception):
+                self.event_dto = await EventRepository(
+                    db
+                ).get_started_event_by_execution_id(self.message.workflow_execution_id)
         if self.event_dto is None:
             raise Exception("Event not prepared")
 
@@ -418,6 +755,27 @@ class WorkflowManager:
             else self.event_dto.workflow_id
         )
 
+        raw_version = self.event_dto.event.get("version")
+        fallback_version = (
+            raw_version
+            if (
+                isinstance(raw_version, int)
+                and not isinstance(raw_version, bool)
+                and raw_version in (1, 2)
+            )
+            else 1
+        )
+        workflow_version = (
+            self.main_workflow_context.workflow_version
+            if (
+                self.main_workflow_context is not None
+                and isinstance(self.main_workflow_context.workflow_version, int)
+                and not isinstance(self.main_workflow_context.workflow_version, bool)
+                and self.main_workflow_context.workflow_version in (1, 2)
+            )
+            else fallback_version
+        )
+
         await EventStoreService(db).emit_workflow_failed(
             workflow_id=workflow_id,
             execution_id=self.event_dto.execution_id,
@@ -426,4 +784,175 @@ class WorkflowManager:
             error_message=final_error_message,
             failed_step=final_failed_step,
             retry_count=self.retry_count,
+            workflow_version=workflow_version,
+            is_terminal=is_terminal,
         )
+
+    def _cleanup_execution_sandbox(self, context_label: str) -> bool:
+        """Clean up the execution sandbox directory if it exists."""
+        try:
+            sandbox_root = get_execution_sandbox_root(
+                self.message.workflow_execution_id,
+                create_base=False,
+            )
+            if sandbox_root.exists() or sandbox_root.is_symlink():
+                return safe_cleanup_directory(sandbox_root, sandbox_root=sandbox_root)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Failed to clean up sandbox on %s for %s: %s",
+                context_label,
+                self.message.workflow_execution_id,
+                exc,
+            )
+            return False
+
+    async def record_watchdog_terminal_failure(self, reason: str) -> None:
+        """Enregistre l'échec terminal d'une tentative dont les reprises sont épuisées.
+
+        Appelé par le consommateur via son callback ``on_terminal_failure`` : la
+        tentative a été fencée par le watchdog et ne rapportera donc jamais son
+        propre échec. Sans cet enregistrement, une exécution dont toutes les
+        tentatives dépassent le délai reste bloquée en ``STARTED``, sans nouvelle
+        tentative planifiée.
+        """
+        local_database_manager = _create_worker_database_manager()
+        try:
+            async with local_database_manager.local_session() as session:
+                event_service = EventStoreService(session)
+                already_terminal = False
+                target_execution_id = self.message.workflow_execution_id
+
+                async with acquire_worker_db_slot():
+                    try:
+                        last_event = (
+                            await event_service.get_last_event_for_execution_id(
+                                self.message.workflow_execution_id
+                            )
+                        )
+                        target_execution_id = last_event.execution_id
+
+                        if self._is_terminal_event(last_event):
+                            logger.info(
+                                "Execution %s is already terminal (%s); skipping watchdog failure",
+                                last_event.execution_id,
+                                last_event.event_type,
+                            )
+                            already_terminal = True
+                        else:
+                            self.event_dto = last_event
+                            raw_version = last_event.event.get("version")
+                            workflow_version = (
+                                raw_version if isinstance(raw_version, int) else 1
+                            )
+                            self.main_workflow_context = MainWorkflowContext(
+                                execution_id=last_event.execution_id,
+                                organization_id=last_event.organization_id,
+                                workflow_version=workflow_version,
+                                start_time=datetime.now(UTC),
+                                steps_metadata=[],
+                            )
+
+                            if reason == "error_requeueing_message":
+                                terminal_error_type = "RetrySchedulingError"
+                                terminal_error_message = (
+                                    "Failed to schedule retry and no attempt is left: "
+                                    f"{reason}"
+                                )
+                                raw_failed_step = last_event.event.get("failed_step")
+                                terminal_failed_step = (
+                                    raw_failed_step
+                                    if isinstance(raw_failed_step, str)
+                                    and raw_failed_step
+                                    else "retry_scheduler"
+                                )
+                                logger.warning(
+                                    "Recording terminal retry-scheduling failure for execution %s (reason=%s)",
+                                    last_event.execution_id,
+                                    reason,
+                                )
+                            else:
+                                terminal_error_type = "WatchdogTimeout"
+                                terminal_error_message = (
+                                    "The watchdog stopped the execution and no attempt is left: "
+                                    f"{reason}"
+                                )
+                                terminal_failed_step = "watchdog"
+                                logger.warning(
+                                    "Recording terminal watchdog failure for execution %s (reason=%s)",
+                                    last_event.execution_id,
+                                    reason,
+                                )
+                            await event_service.emit_workflow_failed(
+                                workflow_id=last_event.workflow_id,
+                                execution_id=last_event.execution_id,
+                                organization_id=last_event.organization_id,
+                                error_type=terminal_error_type,
+                                error_message=terminal_error_message,
+                                failed_step=terminal_failed_step,
+                                retry_count=self.retry_count,
+                                workflow_version=workflow_version,
+                                is_terminal=True,
+                            )
+                    finally:
+                        await close_session_safely(session)
+
+                if already_terminal:
+                    await self._purge_s3_file_for_execution(
+                        event_service,
+                        target_execution_id,
+                        context_label="Watchdog terminal failure (already terminal)",
+                    )
+                    return
+
+                await self._purge_s3_file_for_execution(
+                    event_service,
+                    target_execution_id,
+                    context_label="Watchdog terminal failure",
+                )
+
+                await self._notify_webhook_execution_finished(session)
+
+                await asyncio.to_thread(
+                    ActiveExecutionTracker.cleanup_if_inactive,
+                    self.message.workflow_execution_id,
+                    lambda: self._cleanup_execution_sandbox(
+                        "watchdog terminal failure"
+                    ),
+                )
+        finally:
+            self._reset_logging_context_vars()
+            # Cette entrée construit son propre moteur de base et son propre
+            # gestionnaire Redis : les libérer explicitement, sinon des échecs
+            # terminaux répétés accumulent des connexions jusqu'au GC.
+            try:
+                await local_database_manager.dispose_async()
+            except Exception as e:
+                logger.error(
+                    "Error while disposing terminal-failure database manager: %s",
+                    type(e).__name__,
+                )
+            try:
+                await self._webhook_redis_manager.close()
+            except Exception as e:
+                logger.error(
+                    "Error while closing terminal-failure Redis manager: %s",
+                    type(e).__name__,
+                )
+
+    @staticmethod
+    def _is_terminal_event(event: EventDTO) -> bool:
+        """Indique si le dernier événement clôt définitivement l'exécution.
+
+        Un échec ``RetryableException`` est un échec intermédiaire : ``start()`` a
+        volontairement retenu sa notification webhook en attendant une reprise, donc
+        l'échec terminal du watchdog doit encore être enregistré.
+        """
+        if event.event_type == EventType.WORKFLOW_EXECUTION_COMPLETED.value:
+            return True
+        if event.event_type == EventType.WORKFLOW_EXECUTION_FAILED.value:
+            is_terminal = event.event.get("is_terminal")
+            if isinstance(is_terminal, bool):
+                return is_terminal
+            return event.event.get("error_type") != RetryableException.__name__
+        return False

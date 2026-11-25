@@ -110,3 +110,43 @@ class TestS3Service:
             assert result.connected is True
             assert result.credentials_valid is True
             assert result.bucket_exists is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("filename", "expected_suffix", "forbidden_substrings"),
+        [
+            (None, ".bin", ["application/pdf", "application"]),
+            ("sans_extension", "", ["."]),
+            ("fichier.pdf/../../evil", "", ["..", "evil"]),
+            ("report.verylongextension", "", ["verylongextension"]),
+            ("bulletin.PDF", ".PDF", []),
+        ],
+    )
+    async def test_s3_upload_file_sanitizes_s3_key_extension(
+        self,
+        filename: str | None,
+        expected_suffix: str,
+        forbidden_substrings: list[str],
+    ):
+        with patch("document_ia_infra.s3.s3_manager.boto3.client") as mock_boto3:
+            mock_client = MagicMock()
+            mock_boto3.return_value = mock_client
+            mock_client.put_object.return_value = None
+            mock_client.generate_presigned_url.return_value = (
+                "http://example.com/presigned"
+            )
+
+            service = S3Service()
+            result = await service.upload_file(
+                file_data=b"test content",
+                filename=filename,
+                content_type="application/pdf",
+            )
+
+        s3_key: str = result["s3_key"]
+        # Key format: uploads/YYYY/MM/DD/{uuid}[.{ext}] -> always 5 slash-separated segments
+        assert len(s3_key.split("/")) == 5
+        assert s3_key.endswith(expected_suffix)
+        assert not s3_key.endswith(".")
+        for forbidden in forbidden_substrings:
+            assert forbidden not in s3_key

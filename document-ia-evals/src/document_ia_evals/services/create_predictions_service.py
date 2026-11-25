@@ -28,6 +28,7 @@ class TaskProcessingResult:
     error: str | None = None
     execution_id: str | None = None
     total_processing_time_ms: int = -1
+    execution_result: dict[str, Any] | None = None
 
 
 def extract_s3_url_from_task_url(pdf_url: str) -> str:
@@ -199,6 +200,9 @@ def process_single_task(
             success=True,
             execution_id=execution_id,
             total_processing_time_ms=execution_details.data.total_processing_time_ms,
+            execution_result=result_data.model_dump(mode="json")
+            if hasattr(result_data, "model_dump")
+            else None,
         )
 
     except Exception as e:
@@ -247,6 +251,7 @@ def run_workflow_on_dataset(
     model_version: str | None = None,
     extraction_parameters: dict[str, Any] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    tasks: list[Any] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """
     Run workflow on all tasks in a Label Studio project.
@@ -264,8 +269,12 @@ def run_workflow_on_dataset(
     Returns:
         Dictionary mapping task IDs to their processing results
     """
-    # Get all tasks from the project
-    tasks = [task for task in ls_client.tasks.list(project=project_id, fields="all")]
+    # Callers can provide a deliberately small subset (typically one task).
+    # Keep the project-wide lookup as the backwards-compatible default.
+    if tasks is None:
+        tasks = [
+            task for task in ls_client.tasks.list(project=project_id, fields="all")
+        ]
 
     if not tasks:
         return {}
@@ -306,6 +315,7 @@ def run_workflow_on_dataset(
             "error": result.error,
             "execution_id": result.execution_id,
             "total_processing_time_ms": result.total_processing_time_ms,
+            "execution_result": result.execution_result,
         }
         if on_progress:
             on_progress(i + 1, len(tasks))
@@ -378,6 +388,7 @@ def process_single_task_v2(
     model_version: str | None = None,
     override: dict[str, Any] | None = None,
     dataset_type: str = "extraction",
+    base_url: str | None = None,
 ) -> TaskProcessingResult:
     """Process a single task using V2 API: download file, execute workflow V2, create prediction."""
     task_id = task.id
@@ -431,6 +442,7 @@ def process_single_task_v2(
             override=override,
             metadata={"source": "streamlit-predictions-creation-v2"},
             sync=False,
+            base_url=base_url,
         )
 
         execution_id = response.get("execution_id") or response.get("data", {}).get(
@@ -443,7 +455,7 @@ def process_single_task_v2(
                 error="Failed to get execution_id from workflow response",
             )
 
-        execution_details = wait_for_execution(execution_id, api_key)
+        execution_details = wait_for_execution(execution_id, api_key, base_url=base_url)
 
         # Check status
         if not execution_details or execution_details.status.upper() != "SUCCESS":
@@ -506,6 +518,9 @@ def process_single_task_v2(
             success=True,
             execution_id=execution_id,
             total_processing_time_ms=workflow_data.total_processing_time_ms,
+            # Keep the result shape used by the prompt playground, including
+            # debug workflow metadata (system_prompt/user_prompt).
+            execution_result=execution_details.data.result.model_dump(mode="json"),
         )
 
     except Exception as e:
@@ -526,8 +541,13 @@ def _task_consumer_v2(
     model_version: str | None = None,
     override: dict[str, Any] | None = None,
     dataset_type: str = "extraction",
+    base_url: str | None = None,
 ) -> None:
-    """Consumer function for processing tasks from a queue using V2 API."""
+    """Consumer function for processing tasks from a queue using V2 API.
+
+    Runs in a worker thread with no Streamlit script context, so the endpoint is
+    passed explicitly alongside the key instead of resolved from the session.
+    """
     while True:
         try:
             task = task_queue.get(block=False)
@@ -542,6 +562,7 @@ def _task_consumer_v2(
             model_version=model_version,
             override=override,
             dataset_type=dataset_type,
+            base_url=base_url,
         )
         callback.put(result)
 
@@ -556,10 +577,18 @@ def run_workflow_on_dataset_v2(
     override: dict[str, Any] | None = None,
     dataset_type: str = "extraction",
     on_progress: Callable[[int, int], None] | None = None,
+    tasks: list[Any] | None = None,
+    base_url: str | None = None,
 ) -> dict[int, dict[str, Any]]:
-    """Run V2 workflow on all tasks in a Label Studio project."""
-    # Get all tasks from the project
-    tasks = [task for task in ls_client.tasks.list(project=project_id, fields="all")]
+    """Run a V2 workflow on selected tasks, or on all project tasks.
+
+    `base_url` is paired with `api_key` by the caller and forwarded to the worker
+    threads, which cannot read Streamlit session configuration.
+    """
+    if tasks is None:
+        tasks = [
+            task for task in ls_client.tasks.list(project=project_id, fields="all")
+        ]
 
     if not tasks:
         return {}
@@ -590,6 +619,7 @@ def run_workflow_on_dataset_v2(
                 model_version,
                 override,
                 dataset_type,
+                base_url,
             ),
             daemon=True,
         )
@@ -604,6 +634,7 @@ def run_workflow_on_dataset_v2(
             "error": result.error,
             "execution_id": result.execution_id,
             "total_processing_time_ms": result.total_processing_time_ms,
+            "execution_result": result.execution_result,
         }
         if on_progress:
             on_progress(i + 1, len(tasks))

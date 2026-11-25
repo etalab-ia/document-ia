@@ -1,6 +1,9 @@
 import logging
 
 from document_ia_infra.data.database import database_manager
+from document_ia_infra.data.event.dto.event_dto import EventDTO
+from document_ia_infra.data.event.dto.event_type_enum import EventType
+from document_ia_infra.data.event.repository.event import is_transient_db_error
 from document_ia_infra.data.organization.dto.organization_dto import OrganizationDTO
 from document_ia_infra.data.workflow.repository.workflow import workflow_repository
 from document_ia_infra.data.workflow.repository.workflow_v2_repository import (
@@ -9,6 +12,7 @@ from document_ia_infra.data.workflow.repository.workflow_v2_repository import (
 from document_ia_infra.exception.entity_not_found_exception import (
     EntityNotFoundException,
 )
+from document_ia_infra.exception.retryable_exception import RetryableException
 from document_ia_infra.service.event_store_service import EventStoreService
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +31,9 @@ from document_ia_api.api.contracts.execution.success import (
 )
 from document_ia_api.api.exceptions.entity_not_found_exception import (
     HttpEntityNotFoundException,
+)
+from document_ia_api.api.exceptions.service_unavailable_exception import (
+    database_unavailable,
 )
 from document_ia_api.application.services.execution_service import ExecutionService
 
@@ -83,7 +90,31 @@ router = APIRouter(prefix="/executions")
                                                 }
                                             ],
                                         },
-                                        "barcodes": [],
+                                        "barcodes": [
+                                            {
+                                                "type": "2D_DOC",
+                                                "position": {
+                                                    "top_left": [120, 480],
+                                                    "top_right": [260, 480],
+                                                    "bottom_right": [260, 620],
+                                                    "bottom_left": [120, 620],
+                                                },
+                                                "page_number": 1,
+                                                "is_valid": True,
+                                                "verification_status": "verified",
+                                                "raw_data": {"issuer": "ANTS"},
+                                                "typed_data": [
+                                                    {
+                                                        "name": "first_name",
+                                                        "value": "Alice",
+                                                        "type": "string",
+                                                    }
+                                                ],
+                                                "issue_date": "2024-01-15",
+                                                "ants_type": "01",
+                                                "doc_type": "01",
+                                            }
+                                        ],
                                         "workflow_metadata": [
                                             {"step": "ocr", "execution_time": 120.5}
                                         ],
@@ -176,6 +207,25 @@ router = APIRouter(prefix="/executions")
                 }
             },
         },
+        503: {
+            "model": ProblemDetail,
+            "description": "Service Unavailable (ProblemDetail) — database temporarily unavailable",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "type": "about:blank",
+                        "title": "Service Unavailable",
+                        "status": 503,
+                        "code": "http.service_unavailable",
+                        "detail": {
+                            "error": "database_unavailable",
+                            "message": "Database temporarily unavailable",
+                        },
+                        "instance": "/api/v1/executions/{execution_id}",
+                    }
+                }
+            },
+        },
     },
     tags=["Executions"],
 )
@@ -193,31 +243,78 @@ async def get_execution(
     event_store_service = EventStoreService(db_session)
     execution_service = ExecutionService()
     try:
-        last_event = await event_store_service.get_last_event_for_execution_id(
-            execution_id
-        )
+        try:
+            last_event = await event_store_service.get_last_event_for_execution_id(
+                execution_id
+            )
+        except Exception as e:
+            if isinstance(e, RetryableException) or is_transient_db_error(e):
+                logger.error(
+                    "Database unavailable while retrieving execution events",
+                    extra={
+                        "endpoint": "get_execution",
+                        "execution_id": execution_id,
+                        "error": type(e).__name__,
+                    },
+                )
+                raise database_unavailable() from e
+            raise
+
         if last_event.organization_id != organization.id:
             raise HTTPException(status_code=403, detail="Forbidden access to execution")
-        event_version_raw = last_event.event.get("version")
-        event_version = event_version_raw if isinstance(event_version_raw, int) else 1
+        workflow_version_raw = last_event.event.get("version")
+        workflow_version = (
+            workflow_version_raw if isinstance(workflow_version_raw, int) else 1
+        )
 
         workflow_exists = False
-        if event_version == 2:
+        if workflow_version == 2:
             workflow_exists = (
                 workflow_v2_repository.get_raw_workflow_by_id(last_event.workflow_id)
                 is not None
             )
-        elif event_version == 1:
+        elif workflow_version == 1:
             workflow_exists = (
                 await workflow_repository.get_workflow_by_id(last_event.workflow_id)
                 is not None
             )
         else:
-            raise ValueError(f"Unsupported event version: {event_version}")
+            raise ValueError(f"Unsupported workflow version: {workflow_version}")
 
         if not workflow_exists:
             raise EntityNotFoundException("Workflow", last_event.workflow_id)
 
+        started_event_dto: EventDTO | None = None
+        if (
+            getattr(last_event, "event_type", None)
+            == EventType.WORKFLOW_EXECUTION_FAILED
+            and last_event.event.get("is_terminal", True) is False
+        ):
+            try:
+                started_tuple = await event_store_service.get_workflow_started_event(
+                    execution_id
+                )
+            except Exception as e:
+                if isinstance(e, RetryableException) or is_transient_db_error(e):
+                    logger.error(
+                        "Database unavailable while retrieving started event",
+                        extra={
+                            "endpoint": "get_execution",
+                            "execution_id": execution_id,
+                            "error": type(e).__name__,
+                        },
+                    )
+                    raise database_unavailable() from e
+                raise
+            started_event_dto = started_tuple[0] if started_tuple else None
+
+        if started_event_dto is not None:
+            return execution_service.get_event_model(
+                last_event,
+                execution_id,
+                is_debug_mode,
+                started_event_dto=started_event_dto,
+            )
         return execution_service.get_event_model(
             last_event, execution_id, is_debug_mode
         )
@@ -234,7 +331,7 @@ async def get_execution(
             extra={
                 "endpoint": "get_execution",
                 "execution_id": execution_id,
-                "error": str(e),
+                "error": type(e).__name__,
             },
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")

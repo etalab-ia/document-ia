@@ -4,7 +4,11 @@ on:
   push:
     branches: [ main, develop ]
   pull_request:
+  merge_group:
   workflow_dispatch:
+
+# Aucun droit par défaut : chaque job déclare ce dont il a besoin.
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,6 +18,9 @@ jobs:
   lint-and-test:
     name: Ruff lint and Pytest (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +50,11 @@ jobs:
             pythonpath: document-ia-evals/src
             needs_docker_stack: false
             needs_tesseract: false
+          - name: auto-scaler
+            project: document-ia-auto-scaler
+            pythonpath: document-ia-auto-scaler/src
+            needs_docker_stack: false
+            needs_tesseract: false
     env:
       # Python path per project
       PYTHONPATH: ${{ matrix.pythonpath }}
@@ -57,7 +69,7 @@ jobs:
       POSTGRES_PASSWORD: your-secure-postgres-password
       POSTGRES_PORT: 5432
 
-      WEBHOOK_SECRET_ENCRYPTION_KEY: H0NUUmyF6mUoiWcZ8LvVFLEPkYTkYR1ymeI4YouMYhM=
+      WEBHOOK_SECRET_ENCRYPTION_KEY: ${{ secrets.WEBHOOK_SECRET_ENCRYPTION_KEY }}
 
       # Redis
       REDIS_HOST: localhost
@@ -79,8 +91,12 @@ jobs:
       S3_REGION_NAME: us-east-1
       S3_USE_SSL: false
 
-      DOCUMENT_IA_API_KEY: dia_dev_1_A222AAAA_A222AAAAAAAAAAAAAAA2A2AA2A2AAAAAAAAA22AAAAA22AA2A2AA_T2BR
+      DOCUMENT_IA_API_KEY: ${{ secrets.DOCUMENT_IA_API_KEY }}
       APP_ENV: dev
+
+      # Disable Loki shipping in CI: with no LOKI_URL the queue-handler's daemon
+      # listener thread races interpreter shutdown and aborts pytest (exit 134).
+      LOKI_LOGGING_ENABLED: "false"
 
       # OpenAI / Albert
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -91,17 +107,17 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.13'
+          python-version: '3.14'
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "0.11.x"
+          version: "0.12.0"
           enable-cache: true
 
       # Install Tesseract OCR and French trained data
@@ -116,22 +132,27 @@ jobs:
       - name: Install dependencies (matrix project)
         run: |
           cd ${{ matrix.project }}
-          uv sync --frozen
+          uv sync --locked
 
       - name: Ruff - Lint sources
         run: |
           cd ${{ matrix.project }}
           uv run ruff check src
 
+      - name: Ruff - Check formatting
+        run: |
+          cd ${{ matrix.project }}
+          uv run ruff format --check src
+
       - name: Start PostgreSQL
         if: ${{ matrix.needs_docker_stack == true }}
         run: |
           docker run -d \
             --name postgres-test \
-            -e POSTGRES_DB=${POSTGRES_DB} \
-            -e POSTGRES_USER=${POSTGRES_USER} \
-            -e POSTGRES_PASSWORD=${POSTGRES_PASSWORD} \
-            -p ${POSTGRES_PORT}:5432 \
+            -e POSTGRES_DB="${POSTGRES_DB}" \
+            -e POSTGRES_USER="${POSTGRES_USER}" \
+            -e POSTGRES_PASSWORD="${POSTGRES_PASSWORD}" \
+            -p "${POSTGRES_PORT}":5432 \
             postgres:17-alpine
 
       - name: Start Redis
@@ -139,7 +160,7 @@ jobs:
         run: |
           docker run -d \
             --name redis-test \
-            -p ${REDIS_PORT}:6379 \
+            -p "${REDIS_PORT}":6379 \
             redis:8-alpine
 
       - name: Start MinIO
@@ -147,16 +168,16 @@ jobs:
         run: |
           docker run -d \
             --name minio-test \
-            -e MINIO_ROOT_USER=${MINIO_ROOT_USER} \
-            -e MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD} \
-            -p ${MINIO_API_PORT}:9000 \
-            -p ${MINIO_CONSOLE_PORT}:9001 \
-            minio/minio:latest-cicd server /data --console-address ":9001"
+            -e MINIO_ROOT_USER="${MINIO_ROOT_USER}" \
+            -e MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD}" \
+            -p "${MINIO_API_PORT}":9000 \
+            -p "${MINIO_CONSOLE_PORT}":9001 \
+            coollabsio/minio:latest server /data --console-address ":9001"
 
       - name: Wait for PostgreSQL to be ready
         if: ${{ matrix.needs_docker_stack == true }}
         run: |
-          timeout 60s bash -c 'until docker exec postgres-test pg_isready -U ${POSTGRES_USER}; do sleep 1; done'
+          timeout 60s bash -c "until docker exec postgres-test pg_isready -U ${POSTGRES_USER}; do sleep 1; done"
           echo "PostgreSQL is ready!"
 
       - name: Wait for Redis to be ready
@@ -168,15 +189,38 @@ jobs:
       - name: Wait for MinIO to be ready
         if: ${{ matrix.needs_docker_stack == true }}
         run: |
-          timeout 60s bash -c 'until curl -f http://localhost:${MINIO_API_PORT}/minio/health/live; do sleep 1; done'
+          timeout 60s bash -c "until curl -f http://localhost:${MINIO_API_PORT}/minio/health/live; do sleep 1; done"
           echo "MinIO is ready!"
+
+      - name: Generate test API key (if secret not set)
+        if: ${{ matrix.needs_docker_stack == true && env.DOCUMENT_IA_API_KEY == '' }}
+        run: |
+          cd document-ia-api
+          uv sync --locked
+          # Génère une clé de test valide avec les poivres par défaut
+          KEY=$(uv run python -c "
+          from document_ia_api.application.services.api_key.api_key_helper import ApiKeyHelper
+          h = ApiKeyHelper()
+          presented, _, _, _ = h.generate_new_api_key()
+          print(presented)
+          ")
+          echo "DOCUMENT_IA_API_KEY=$KEY" >> "$GITHUB_ENV"
+
+      - name: Generate test webhook encryption key (if secret not set)
+        if: ${{ matrix.needs_docker_stack == true && env.WEBHOOK_SECRET_ENCRYPTION_KEY == '' }}
+        run: |
+          cd document-ia-api
+          uv sync --locked
+          # Génère une clé Fernet valide (32 bytes base64 url-safe)
+          KEY=$(uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+          echo "WEBHOOK_SECRET_ENCRYPTION_KEY=$KEY" >> "$GITHUB_ENV"
 
       - name: Run migrations
         if: ${{ matrix.needs_docker_stack == true }}
         # We need to install deps of the API to run alembic migrations even on the worker
         run: |
           cd document-ia-api
-          uv sync --frozen
+          uv sync --locked
           uv run alembic upgrade head
 
       - name: Init S3 bucket
@@ -196,3 +240,121 @@ jobs:
         run: |
           docker stop postgres-test redis-test minio-test || true
           docker rm postgres-test redis-test minio-test || true
+
+  gitleaks:
+    name: Gitleaks (historique complet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    # Seules les trois empreintes historiques connues de .gitleaks-baseline.json
+    # sont ignorées ; toute modification de la baseline ou nouvelle détection
+    # fait échouer la CI. La sonde synthétique vérifie en outre la détection active.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        run: |
+          GITLEAKS_VERSION="8.30.1"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Gitleaks
+        run: |
+          gitleaks git --config .gitleaks.toml --baseline-path .gitleaks-baseline.json --verbose --redact .
+
+      - name: Vérifier la baseline et la détection d'un secret synthétique
+        run: |
+          bash scripts/verify_gitleaks_synthetic.sh
+
+  pyright:
+    name: Pyright (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Non bloquant tant que les erreurs de typage existantes ne sont pas résolues
+    # (baseline mesurée sur develop : api 9, infra 16, worker 9). Voir #124 point 6.
+    continue-on-error: true
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            project: document-ia-api
+          - name: infra
+            project: document-ia-infra
+          - name: worker
+            project: document-ia-worker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.0"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: |
+          cd ${{ matrix.project }}
+          uv sync --locked
+
+      - name: Pyright
+        # Les diagnostics restent consultables sans faire échouer le workflow
+        # tant que la baseline de typage existante n'est pas résolue.
+        continue-on-error: true
+        run: |
+          cd ${{ matrix.project }}
+          uv run pyright src
+
+  uv-workspace-lock:
+    name: uv (verrou de workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.0"
+          enable-cache: true
+
+      # Le monorepo n'a qu'un verrou, à la racine. Les six uv.lock des
+      # sous-projets doivent rester des liens vers celui-ci : c'est ce que le
+      # buildpack Scalingo détecte au répertoire de build (PROJECT_DIR), et un
+      # fichier ordinaire y ferait divergerer le verrou en six copies.
+      - name: Les uv.lock des sous-projets sont des liens vers la racine
+        run: |
+          status=0
+          for member in document-ia-*/; do
+            member="${member%/}"
+            [ -f "$member/pyproject.toml" ] || continue
+            lock="$member/uv.lock"
+            if [ ! -L "$lock" ]; then
+              echo "::error file=$lock::doit être un lien symbolique vers ../uv.lock"
+              status=1
+            elif [ "$(readlink "$lock")" != "../uv.lock" ]; then
+              echo "::error file=$lock::lien vers $(readlink "$lock"), attendu ../uv.lock"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Le verrou de la racine est à jour
+        run: uv lock --check

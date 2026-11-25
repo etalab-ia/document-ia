@@ -5,17 +5,26 @@ This module contains comprehensive unit tests for the event store repository,
 testing all CRUD operations and event stream functionality.
 """
 
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, timezone, UTC
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from document_ia_infra.data.event.dto.anonymization_enum import AnonymizationStatus
 from document_ia_infra.data.event.dto.event_dto import EventDTO
 from document_ia_infra.data.event.dto.event_type_enum import EventType
+from document_ia_infra.data.event.entity.event_entity import EventEntity
 from document_ia_infra.data.event.repository.event import EventRepository
+from document_ia_infra.exception.processing_aborted_exception import (
+    ProcessingAbortedException,
+)
 from document_ia_infra.exception.retryable_exception import RetryableException
+from document_ia_infra.redis.progress_tracker import (
+    ProgressTracker,
+    current_progress_tracker,
+)
 
 
 @pytest.fixture
@@ -88,6 +97,52 @@ class TestEventRepository:
         mock_session.flush.assert_called_once()
         mock_session.refresh.assert_called_once()
 
+    async def test_put_event_refuses_to_commit_when_processing_aborted(
+        self, event_repository, mock_session
+    ):
+        """A write fences at the persistence boundary once the watchdog aborts the attempt.
+
+        ``put_event`` commits internally, so the worker's own ``is_aborted`` guard runs
+        too late; the check must happen here, immediately before the commit.
+        """
+        tracker = ProgressTracker(msg_id="msg-1", max_processing_time_s=1.0)
+        tracker.abort("step_timeout")
+        token = current_progress_tracker.set(tracker)
+        try:
+            with pytest.raises(ProcessingAbortedException):
+                await event_repository.put_event(
+                    workflow_id="test_workflow_001",
+                    organization_id=uuid4(),
+                    execution_id="test_execution_001",
+                    event_type=EventType.WORKFLOW_EXECUTION_COMPLETED.value,
+                    event_data={},
+                )
+        finally:
+            current_progress_tracker.reset(token)
+
+        mock_session.commit.assert_not_awaited()
+        mock_session.rollback.assert_awaited()
+
+    def test_storage_projection_keeps_row_metadata_distinct(self):
+        row = MagicMock()
+        row.id = uuid4()
+        row.workflow_id = "test_workflow_001"
+        row.execution_id = "test_execution_001"
+        row.organization_id = uuid4()
+        row.created_at = datetime.now(UTC)
+        row.event_type = EventType.WORKFLOW_EXECUTION_STARTED.value
+        row.event = {
+            "event_id": str(uuid4()),
+            "created_at": "2020-01-01T00:00:00Z",
+        }
+
+        result = EventRepository._to_dto(row)
+
+        assert result.id == row.id
+        assert result.created_at == row.created_at
+        assert result.event["event_id"] != str(result.id)
+        assert result.event["created_at"] != result.created_at.isoformat()
+
     async def test_get_events_by_execution_id(self, event_repository, mock_session):
         """Test retrieving events by execution ID."""
         # Arrange
@@ -99,7 +154,11 @@ class TestEventRepository:
                 workflow_id="test_workflow_001",
                 execution_id="test_execution_001",
                 event_type=EventType.WORKFLOW_EXECUTION_STARTED,
-                event={"test": "data1", "classification_parameters": {}, "extraction_parameters": {}},
+                event={
+                    "test": "data1",
+                    "classification_parameters": {},
+                    "extraction_parameters": {},
+                },
             ),
             EventDTO(
                 id=uuid4(),
@@ -247,31 +306,45 @@ class TestGetCreatedEventIfExecutionNotCompletedOrFailed:
         row.event = payload or {}
         return row
 
-    async def test_returns_none_when_last_event_is_completed(
+    async def test_returns_none_when_latest_event_is_completed(
         self, event_repository, mock_session
     ):
         now = datetime.now(UTC)
-        # events list is ordered DESC by created_at according to query; code uses events[-1] (oldest)
-        newest = self._make_entity(evt_type=EventType.WORKFLOW_EXECUTION_STARTED, created_at=now)
-        oldest = self._make_entity(evt_type=EventType.WORKFLOW_EXECUTION_COMPLETED, created_at=now.replace(year=now.year-1))
+        newest = self._make_entity(
+            evt_type=EventType.WORKFLOW_EXECUTION_COMPLETED, created_at=now
+        )
+        oldest = self._make_entity(
+            evt_type=EventType.WORKFLOW_EXECUTION_STARTED,
+            created_at=now.replace(year=now.year - 1),
+        )
         mock_result = MagicMock()
         mock_result.scalars.return_value.all.return_value = [newest, oldest]
         mock_session.execute.return_value = mock_result
 
-        result = await event_repository.get_created_event_if_execution_not_completed_or_failed("exec1")
+        result = await event_repository.get_created_event_if_execution_not_completed_or_failed(
+            "exec1"
+        )
         assert result is None
 
-    async def test_returns_started_when_last_event_is_started(
+    async def test_returns_started_when_latest_event_is_started(
         self, event_repository, mock_session
     ):
         now = datetime.now(UTC)
-        newest = self._make_entity(evt_type=EventType.WORKFLOW_EXECUTION_FAILED, created_at=now, payload={"error_type": "Other"})
-        oldest_started = self._make_entity(evt_type=EventType.WORKFLOW_EXECUTION_STARTED, created_at=now.replace(year=now.year-1))
+        newest = self._make_entity(
+            evt_type=EventType.WORKFLOW_EXECUTION_STARTED, created_at=now
+        )
+        oldest_failed = self._make_entity(
+            evt_type=EventType.WORKFLOW_EXECUTION_FAILED,
+            created_at=now.replace(year=now.year - 1),
+            payload={"error_type": "Other"},
+        )
         mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = [newest, oldest_started]
+        mock_result.scalars.return_value.all.return_value = [newest, oldest_failed]
         mock_session.execute.return_value = mock_result
 
-        result = await event_repository.get_created_event_if_execution_not_completed_or_failed("exec1")
+        result = await event_repository.get_created_event_if_execution_not_completed_or_failed(
+            "exec1"
+        )
         assert isinstance(result, EventDTO)
         assert result.event_type == EventType.WORKFLOW_EXECUTION_STARTED
         assert result.execution_id == "exec1"
@@ -280,14 +353,26 @@ class TestGetCreatedEventIfExecutionNotCompletedOrFailed:
         self, event_repository, mock_session
     ):
         now = datetime.now(UTC)
-        # oldest is FAILED retryable, there is a STARTED more recent; code scans reversed(events) to find STARTED
-        newest_started = self._make_entity(evt_type=EventType.WORKFLOW_EXECUTION_STARTED, created_at=now)
-        oldest_failed = self._make_entity(evt_type=EventType.WORKFLOW_EXECUTION_FAILED, created_at=now.replace(year=now.year-1), payload={"error_type": RetryableException.__name__})
+        # The latest failure is retryable, so resume from its preceding start.
+        newest_failed = self._make_entity(
+            evt_type=EventType.WORKFLOW_EXECUTION_FAILED,
+            created_at=now,
+            payload={"error_type": RetryableException.__name__},
+        )
+        prior_started = self._make_entity(
+            evt_type=EventType.WORKFLOW_EXECUTION_STARTED,
+            created_at=now.replace(year=now.year - 1),
+        )
         mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = [newest_started, oldest_failed]
+        mock_result.scalars.return_value.all.return_value = [
+            newest_failed,
+            prior_started,
+        ]
         mock_session.execute.return_value = mock_result
 
-        result = await event_repository.get_created_event_if_execution_not_completed_or_failed("exec1")
+        result = await event_repository.get_created_event_if_execution_not_completed_or_failed(
+            "exec1"
+        )
         assert isinstance(result, EventDTO)
         assert result.event_type == EventType.WORKFLOW_EXECUTION_STARTED
 
@@ -295,13 +380,59 @@ class TestGetCreatedEventIfExecutionNotCompletedOrFailed:
         self, event_repository, mock_session
     ):
         now = datetime.now(UTC)
-        newest = self._make_entity(evt_type=EventType.WORKFLOW_EXECUTION_STARTED, created_at=now)
-        oldest_failed = self._make_entity(evt_type=EventType.WORKFLOW_EXECUTION_FAILED, created_at=now.replace(year=now.year-1), payload={"error_type": "SomeOther"})
+        newest = self._make_entity(
+            evt_type=EventType.WORKFLOW_EXECUTION_FAILED,
+            created_at=now,
+            payload={"error_type": "SomeOther"},
+        )
+        oldest_started = self._make_entity(
+            evt_type=EventType.WORKFLOW_EXECUTION_STARTED,
+            created_at=now.replace(year=now.year - 1),
+        )
         mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = [newest, oldest_failed]
+        mock_result.scalars.return_value.all.return_value = [newest, oldest_started]
         mock_session.execute.return_value = mock_result
 
-        result = await event_repository.get_created_event_if_execution_not_completed_or_failed("exec1")
+        result = await event_repository.get_created_event_if_execution_not_completed_or_failed(
+            "exec1"
+        )
+        assert result is None
+
+    async def test_latest_progress_event_prevents_reexecution(
+        self, event_repository, mock_session
+    ):
+        now = datetime.now(UTC)
+        newest = self._make_entity(
+            evt_type=EventType.WORKFLOW_EXECUTION_STEP_COMPLETED, created_at=now
+        )
+        oldest_started = self._make_entity(
+            evt_type=EventType.WORKFLOW_EXECUTION_STARTED,
+            created_at=now.replace(year=now.year - 1),
+        )
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = [newest, oldest_started]
+        mock_session.execute.return_value = mock_result
+
+        result = await event_repository.get_created_event_if_execution_not_completed_or_failed(
+            "exec1"
+        )
+        assert result is None
+
+    async def test_retryable_failure_without_start_event_returns_none(
+        self, event_repository, mock_session
+    ):
+        failed = self._make_entity(
+            evt_type=EventType.WORKFLOW_EXECUTION_FAILED,
+            created_at=datetime.now(UTC),
+            payload={"error_type": RetryableException.__name__},
+        )
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = [failed]
+        mock_session.execute.return_value = mock_result
+
+        result = await event_repository.get_created_event_if_execution_not_completed_or_failed(
+            "exec1"
+        )
         assert result is None
 
     async def test_oserror_raises_retryable_exception(
@@ -309,15 +440,518 @@ class TestGetCreatedEventIfExecutionNotCompletedOrFailed:
     ):
         mock_session.execute.side_effect = OSError("db connection down")
         with pytest.raises(RetryableException):
-            await event_repository.get_created_event_if_execution_not_completed_or_failed("exec1")
+            await (
+                event_repository.get_created_event_if_execution_not_completed_or_failed(
+                    "exec1"
+                )
+            )
 
-    async def test_empty_events_list_returns_none(
-        self, event_repository, mock_session
-    ):
+    async def test_empty_events_list_returns_none(self, event_repository, mock_session):
         mock_result = MagicMock()
         mock_result.scalars.return_value.all.return_value = []
         mock_session.execute.return_value = mock_result
 
-        result = await event_repository.get_created_event_if_execution_not_completed_or_failed("exec1")
+        result = await event_repository.get_created_event_if_execution_not_completed_or_failed(
+            "exec1"
+        )
         assert result is None
         mock_session.rollback.assert_not_called()
+
+    def test_anonymize_payload_started(self):
+        payload = {
+            "s3_file_info": {"filename": "test.pdf", "presigned_url": "https://secret"},
+            "file_info": {"legacy": "data"},
+            "file_url": "https://secret/test.pdf",
+            "metadata": {"user": "alice", "ip": "1.2.3.4"},
+            "workflow_id": "wf-1",
+        }
+        res = EventRepository.anonymize_payload("WorkflowExecutionStarted", payload)
+        assert res["s3_file_info"] is None
+        assert "file_info" not in res
+        assert res["file_url"] is None
+        assert res["metadata"] == {}
+        assert res["workflow_id"] == "wf-1"
+
+        # Also verify with EventType enum
+        payload_enum = {
+            "s3_file_info": {"filename": "test.pdf"},
+            "file_info": {"legacy": "data"},
+            "file_url": "https://secret",
+            "metadata": {},
+        }
+        res_enum = EventRepository.anonymize_payload(
+            EventType.WORKFLOW_EXECUTION_STARTED, payload_enum
+        )
+        assert res_enum["s3_file_info"] is None
+        assert "file_info" not in res_enum
+        assert res_enum["file_url"] is None
+
+    def test_anonymize_payload_step_completed(self):
+        payload = {
+            "step_name": "ocr_step",
+            "step_result": {"text": "Confidential extracted OCR text"},
+            "execution_time_ms": 250,
+            "output_data": {"extracted_data": "sensitive"},
+        }
+        res = EventRepository.anonymize_payload(
+            "WorkflowExecutionStepCompleted", payload
+        )
+        assert res["step_result"] == {}
+        assert res["output_data"] is None
+        assert res["step_name"] == "ocr_step"
+        assert res["execution_time_ms"] == 250
+
+    def test_anonymize_payload_completed(self):
+        payload = {
+            "final_result": {
+                "classification": {"type": "CNI"},
+                "extraction": {"name": "Jean Dupont"},
+            },
+            "output_summary": {"summary": "sensitive summary"},
+            "workflow_metadata": [{"info": "sensitive context"}],
+            "total_processing_time_ms": 1200,
+            "steps_completed": 4,
+        }
+        res = EventRepository.anonymize_payload("WorkflowExecutionCompleted", payload)
+        assert res["final_result"] == {}
+        assert res["output_summary"] == {}
+        assert res["workflow_metadata"] is None
+        assert res["total_processing_time_ms"] == 1200
+        assert res["steps_completed"] == 4
+
+    def test_anonymize_payload_failed(self):
+        payload = {
+            "error_type": "ValueError",
+            "error_message": "Document contains invalid token secret_token_12345",
+            "failed_step": "extraction",
+            "retry_count": 2,
+        }
+        res = EventRepository.anonymize_payload("WorkflowExecutionFailed", payload)
+        assert res["error_message"] == "[PURGED]"
+        assert res["error_type"] == "ValueError"
+        assert res["failed_step"] == "extraction"
+        assert res["retry_count"] == 2
+
+    def test_to_dto_anonymization_status(self):
+        entity = EventEntity(
+            id=uuid4(),
+            workflow_id="wf_1",
+            execution_id="exec_1",
+            organization_id=uuid4(),
+            created_at=datetime.now(UTC),
+            event_type="WorkflowExecutionCompleted",
+            event={"final_result": {}},
+            anonymization_status="DONE",
+        )
+        dto = EventRepository._to_dto(entity)
+        assert dto.anonymization_status == AnonymizationStatus.DONE
+
+        entity.anonymization_status = "ERROR"
+        dto_err = EventRepository._to_dto(entity)
+        assert dto_err.anonymization_status == AnonymizationStatus.ERROR
+
+    async def test_get_events_to_anonymize(self, event_repository, mock_session):
+        cutoff = datetime.now(timezone.utc)
+        entity1 = EventEntity(
+            id=uuid4(),
+            workflow_id="wf_1",
+            execution_id="exec_1",
+            organization_id=uuid4(),
+            created_at=cutoff - timedelta(days=31),
+            event_type="WorkflowExecutionCompleted",
+            event={},
+            anonymization_status="PENDING",
+        )
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = [entity1]
+        mock_session.execute.return_value = mock_result
+
+        events = await event_repository.get_events_to_anonymize(
+            before_date=cutoff,
+            statuses=["PENDING", "ERROR"],
+            limit=500,
+        )
+        assert len(events) == 1
+        assert events[0].id == entity1.id
+        mock_session.execute.assert_called_once()
+        mock_session.expunge_all.assert_called_once()
+
+    async def test_get_oldest_pending_event_age_seconds_none_when_empty(
+        self, event_repository, mock_session
+    ):
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        mock_session.execute.return_value = mock_result
+
+        age = await event_repository.get_oldest_pending_event_age_seconds()
+        assert age is None
+
+    async def test_get_oldest_pending_event_age_seconds_calculates_diff(
+        self, event_repository, mock_session
+    ):
+        ten_minutes_ago = datetime.now(timezone.utc) - timedelta(seconds=600)
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = ten_minutes_ago
+        mock_session.execute.return_value = mock_result
+
+        age = await event_repository.get_oldest_pending_event_age_seconds()
+        assert age is not None
+        assert 595.0 <= age <= 605.0
+
+    async def test_bulk_insert_events_uses_upsert(self, event_repository, mock_session):
+        entity = EventEntity(
+            id=uuid4(),
+            workflow_id="wf_1",
+            execution_id="exec_1",
+            organization_id=uuid4(),
+            created_at=datetime.now(timezone.utc),
+            event_type="WorkflowExecutionStarted",
+            event={"file_url": None},
+            anonymization_status="DONE",
+        )
+        await event_repository.bulk_insert_events([entity])
+        mock_session.execute.assert_called_once()
+        mock_session.commit.assert_called_once()
+        stmt = mock_session.execute.call_args[0][0]
+        # Verify the statement compiles to an ON CONFLICT DO UPDATE
+        stmt_str = str(stmt.compile(compile_kwargs={"literal_binds": False}))
+        assert "ON CONFLICT" in stmt_str
+        assert "DO UPDATE" in stmt_str
+        assert "anonymization_status" in stmt_str
+
+    async def test_anonymize_event_rollback_on_failure(
+        self, event_repository, mock_session
+    ):
+        entity = EventEntity(
+            id=uuid4(),
+            workflow_id="wf_1",
+            execution_id="exec_1",
+            organization_id=uuid4(),
+            created_at=datetime.now(timezone.utc),
+            event_type="WorkflowExecutionCompleted",
+            event={"final_result": {}},
+            anonymization_status="PENDING",
+        )
+        mock_session.commit.side_effect = RuntimeError("DB commit failed")
+
+        with pytest.raises(RuntimeError, match="DB commit failed"):
+            await event_repository.anonymize_event(entity)
+
+        mock_session.rollback.assert_awaited_once()
+
+    async def test_save_failed_anonymization_rollback_on_failure(
+        self, event_repository, mock_session
+    ):
+        entity = EventEntity(
+            id=uuid4(),
+            workflow_id="wf_1",
+            execution_id="exec_1",
+            organization_id=uuid4(),
+            created_at=datetime.now(timezone.utc),
+            event_type="WorkflowExecutionCompleted",
+            event={},
+            anonymization_status="PENDING",
+        )
+        mock_session.commit.side_effect = RuntimeError("DB commit failed")
+
+        with pytest.raises(RuntimeError, match="DB commit failed"):
+            await event_repository.save_failed_anonymization(entity)
+
+        mock_session.rollback.assert_awaited_once()
+
+    async def test_save_failed_anonymization_accepts_uuid(
+        self, event_repository, mock_session
+    ):
+        target_id = uuid4()
+        await event_repository.save_failed_anonymization(target_id)
+        mock_session.execute.assert_called_once()
+        mock_session.commit.assert_awaited_once()
+
+    def test_anonymize_payload_unknown_event_type_raises_value_error(self):
+        payload = {"data": "preserved"}
+        with pytest.raises(
+            ValueError,
+            match="Unsupported event_type for anonymization: 'UnknownEventType'",
+        ):
+            EventRepository.anonymize_payload("UnknownEventType", payload)
+
+    async def test_count_events_by_statuses(self, event_repository, mock_session):
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = 42
+        mock_session.execute.return_value = mock_result
+
+        count = await event_repository.count_events_by_statuses(["DONE", "ERROR"])
+        assert count == 42
+        mock_session.execute.assert_called_once()
+
+    async def test_get_events_by_cursor(self, event_repository, mock_session):
+        entity = EventEntity(
+            id=uuid4(),
+            workflow_id="wf_1",
+            execution_id="exec_1",
+            organization_id=uuid4(),
+            created_at=datetime.now(timezone.utc),
+            event_type="WorkflowExecutionCompleted",
+            event={},
+            anonymization_status="DONE",
+        )
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = [entity]
+        mock_session.execute.return_value = mock_result
+
+        events = await event_repository.get_events_by_cursor(
+            statuses=["DONE", "ERROR"],
+            limit=50,
+            after_id=uuid4(),
+        )
+        assert len(events) == 1
+        assert events[0].id == entity.id
+
+    async def test_dbapi_errors_translate_to_retryable_exception(
+        self, event_repository, mock_session
+    ):
+        from sqlalchemy.exc import (
+            DBAPIError,
+            IntegrityError,
+            InterfaceError,
+            OperationalError,
+            TimeoutError as SATimeoutError,
+        )
+
+        class TooManyConnectionsError(Exception):
+            pass
+
+        too_many_conns_exc = DBAPIError.instance(
+            "SELECT 1",
+            {},
+            TooManyConnectionsError(
+                "remaining connection slots are reserved for roles with the SUPERUSER attribute"
+            ),
+            Exception,
+        )
+        operational_exc = OperationalError("SELECT 1", {}, Exception("connection lost"))
+        interface_exc = InterfaceError("SELECT 1", {}, Exception("interface closed"))
+        pool_timeout_exc = SATimeoutError(
+            "QueuePool limit of size 5 overflow 5 reached"
+        )
+
+        for transient_exc in (
+            too_many_conns_exc,
+            operational_exc,
+            interface_exc,
+            pool_timeout_exc,
+            TooManyConnectionsError("remaining connection slots are reserved"),
+        ):
+            mock_session.execute.side_effect = transient_exc
+            with pytest.raises(RetryableException):
+                await event_repository.get_created_event_if_execution_not_completed_or_failed(
+                    "exec1"
+                )
+            with pytest.raises(RetryableException):
+                await event_repository.get_started_event_by_execution_id("exec1")
+            with pytest.raises(RetryableException):
+                await event_repository.get_last_event_by_execution_id("exec1")
+
+            mock_session.flush.side_effect = transient_exc
+            with pytest.raises(RetryableException):
+                await event_repository.put_event(
+                    workflow_id="wf_1",
+                    organization_id=uuid4(),
+                    execution_id="exec1",
+                    event_type=EventType.WORKFLOW_EXECUTION_STARTED.value,
+                    event_data={},
+                )
+            mock_session.flush.side_effect = None
+
+        # IntegrityError must NOT be translated into RetryableException
+        integrity_exc = IntegrityError("INSERT", {}, Exception("duplicate key"))
+        mock_session.flush.side_effect = integrity_exc
+        with pytest.raises(IntegrityError):
+            await event_repository.put_event(
+                workflow_id="wf_1",
+                organization_id=uuid4(),
+                execution_id="exec1",
+                event_type=EventType.WORKFLOW_EXECUTION_STARTED.value,
+                event_data={},
+            )
+
+    async def test_database_manager_use_null_pool(self):
+        from sqlalchemy.pool import NullPool
+        from document_ia_infra.data.database import DatabaseManager
+
+        dbm = DatabaseManager(pool_size=1, max_overflow=1, use_null_pool=True)
+        try:
+            assert dbm.use_null_pool is True
+            assert isinstance(dbm.async_engine.pool, NullPool)
+        finally:
+            await dbm.dispose_async()
+
+
+class TestEventRepositoryResilienceAndSecurity:
+    """Security and resilience tests for EventRepository and DatabaseSettings."""
+
+    async def test_transient_db_error_does_not_leak_sql_parameters_in_logs_or_exception(
+        self, event_repository, mock_session, caplog
+    ):
+        import logging
+        from sqlalchemy.exc import DataError, IntegrityError, OperationalError
+
+        pii_sample = "jean-dupont-pii-sample"
+        secret_s3 = "s3://bucket/private/secret_cni.pdf"
+        params = {"event": {"pii": pii_sample, "s3_key": secret_s3}}
+
+        op_exc = OperationalError(
+            "INSERT INTO event_store (event) VALUES (%(event)s)",
+            params,
+            Exception("connection lost"),
+        )
+        assert pii_sample in str(op_exc)
+
+        mock_session.flush.side_effect = op_exc
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(RetryableException) as exc_info:
+                await event_repository.put_event(
+                    workflow_id="wf_1",
+                    organization_id=uuid4(),
+                    execution_id="exec_pii_1",
+                    event_type=EventType.WORKFLOW_EXECUTION_COMPLETED.value,
+                    event_data={"pii": pii_sample},
+                )
+
+        assert pii_sample not in str(exc_info.value)
+        assert secret_s3 not in str(exc_info.value)
+        assert pii_sample not in caplog.text
+        assert secret_s3 not in caplog.text
+        assert "OperationalError" in str(exc_info.value)
+
+        # Also verify IntegrityError and non-transient DataError do not leak SQL params in logs
+        caplog.clear()
+        mock_session.flush.side_effect = IntegrityError(
+            "INSERT INTO event_store (event) VALUES (%(event)s)",
+            params,
+            Exception("duplicate key"),
+        )
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(IntegrityError):
+                await event_repository.put_event(
+                    workflow_id="wf_1",
+                    organization_id=uuid4(),
+                    execution_id="exec_pii_2",
+                    event_type=EventType.WORKFLOW_EXECUTION_STARTED.value,
+                    event_data={"pii": pii_sample},
+                )
+        assert pii_sample not in caplog.text
+        assert secret_s3 not in caplog.text
+
+        caplog.clear()
+        mock_session.execute.side_effect = DataError(
+            "SELECT * FROM event_store WHERE execution_id = %(id)s",
+            {"id": pii_sample},
+            Exception("invalid byte sequence for encoding UTF8"),
+        )
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(DataError):
+                await event_repository.get_last_event_by_execution_id("exec_pii_3")
+        assert pii_sample not in caplog.text
+
+    async def test_non_transient_db_errors_are_not_wrapped_as_retryable(
+        self, event_repository, mock_session
+    ):
+        from sqlalchemy.exc import (
+            DBAPIError,
+            DataError,
+            OperationalError,
+            ProgrammingError,
+        )
+        from document_ia_infra.data.event.repository.event import is_transient_db_error
+
+        data_err = DataError("SELECT 1", {}, ValueError("invalid input syntax"))
+        prog_err = ProgrammingError("SELECT bad_col", {}, RuntimeError("undefined col"))
+        non_transient_dbapi = DBAPIError(
+            "SELECT bad_col",
+            {},
+            RuntimeError("syntax error"),
+            connection_invalidated=False,
+        )
+
+        for non_transient in (data_err, prog_err, non_transient_dbapi):
+            assert is_transient_db_error(non_transient) is False
+            mock_session.execute.side_effect = non_transient
+            with pytest.raises(type(non_transient)):
+                await event_repository.get_last_event_by_execution_id("exec_non_trans")
+
+        # DBAPIError with connection_invalidated=True IS transient
+        invalidated_dbapi = DBAPIError(
+            "SELECT 1",
+            {},
+            RuntimeError("connection dropped"),
+            connection_invalidated=True,
+        )
+        assert is_transient_db_error(invalidated_dbapi) is True
+
+        # Recursive inspection through __cause__ and PostgreSQL transient SQLSTATEs
+        wrapped = RetryableException("outer")
+        wrapped.__cause__ = OperationalError("SELECT 1", {}, Exception("down"))
+        assert is_transient_db_error(wrapped) is True
+
+        class _PgSqlStateError(Exception):
+            def __init__(self, sqlstate: str) -> None:
+                super().__init__("pg error")
+                self.sqlstate = sqlstate
+
+        for code in ("08006", "53300", "57P01", "40001", "40P01"):
+            assert (
+                is_transient_db_error(
+                    DBAPIError(
+                        "SELECT 1",
+                        {},
+                        _PgSqlStateError(code),
+                        connection_invalidated=False,
+                    )
+                )
+                is True
+            )
+
+        assert (
+            is_transient_db_error(
+                DBAPIError(
+                    "SELECT 1",
+                    {},
+                    _PgSqlStateError("22P02"),
+                    connection_invalidated=False,
+                )
+            )
+            is False
+        )
+
+        # Anti-cycle guard
+        cycle_a = RuntimeError("a")
+        cycle_b = RuntimeError("b")
+        cycle_a.__cause__ = cycle_b
+        cycle_b.__cause__ = cycle_a
+        assert is_transient_db_error(cycle_a) is False
+
+    def test_database_settings_pool_bounds_validation(self):
+        from pydantic import ValidationError
+        from document_ia_infra.data.data_settings import DatabaseSettings
+
+        valid = DatabaseSettings(
+            DB_POOL_SIZE=1,
+            DB_MAX_OVERFLOW=0,
+            WORKER_DB_MAX_CONNECTIONS=None,
+        )
+        assert valid.DB_POOL_SIZE == 1
+        assert valid.DB_MAX_OVERFLOW == 0
+        assert valid.WORKER_DB_MAX_CONNECTIONS is None
+
+        valid_override = DatabaseSettings(WORKER_DB_MAX_CONNECTIONS=4)
+        assert valid_override.WORKER_DB_MAX_CONNECTIONS == 4
+
+        with pytest.raises(ValidationError):
+            DatabaseSettings(DB_POOL_SIZE=0)
+
+        with pytest.raises(ValidationError):
+            DatabaseSettings(DB_MAX_OVERFLOW=-1)
+
+        with pytest.raises(ValidationError):
+            DatabaseSettings(WORKER_DB_MAX_CONNECTIONS=0)

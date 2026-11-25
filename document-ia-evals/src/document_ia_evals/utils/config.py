@@ -5,6 +5,44 @@ from pydantic import Field
 from pydantic_settings import SettingsConfigDict, BaseSettings
 
 
+def resolve_root_dir(
+    current_file: Path | None = None,
+    cwd: Path | None = None,
+) -> Path:
+    """Resolve the document-ia-evals project root directory.
+
+    Works in both local editable installs and non-editable Scalingo/Docker
+    deployments where the package is installed inside site-packages.
+    """
+    base_cwd = (cwd if cwd is not None else Path.cwd()).resolve()
+    base_file = (current_file if current_file is not None else Path(__file__)).resolve()
+
+    def _is_evals_root(path: Path) -> bool:
+        return (path / "pyproject.toml").is_file() and (
+            path / "src" / "document_ia_evals"
+        ).is_dir()
+
+    # 1. Check CWD and its parents (Scalingo / Docker / running inside document-ia-evals)
+    for candidate in (base_cwd, *base_cwd.parents):
+        if _is_evals_root(candidate):
+            return candidate
+
+    # 2. Check source file parents (local editable install, even from monorepo root)
+    for candidate in base_file.parents:
+        if _is_evals_root(candidate):
+            return candidate
+
+    # 3. Standard Scalingo / Docker container root fallback
+    app_dir = Path("/app")
+    if (app_dir / "src" / "document_ia_evals").is_dir() or (
+        app_dir / ".streamlit"
+    ).is_dir():
+        return app_dir
+
+    # 4. Legacy fallback
+    return base_file.parents[3]
+
+
 class Config(BaseSettings):
     """Application configuration using Pydantic BaseSettings."""
 
@@ -29,7 +67,7 @@ class Config(BaseSettings):
     )
 
     # Project paths
-    ROOT_DIR: Path = Field(default_factory=lambda: Path(__file__).parent.parent.parent)
+    ROOT_DIR: Path = Field(default_factory=resolve_root_dir)
 
     @property
     def SRC_DIR(self) -> Path:
@@ -68,6 +106,21 @@ class Config(BaseSettings):
     DEFAULT_CLASSIFICATION_WORKFLOW_ID: str = Field(
         default="document-classification-v2"
     )
+
+    # ProConnect / OpenID Connect Authentication
+    AUTH_BYPASS_LOCAL: bool = Field(default=False)
+    PROCONNECT_CLIENT_ID: str | None = Field(default=None)
+    PROCONNECT_CLIENT_SECRET: str | None = Field(default=None)
+    PROCONNECT_METADATA_URL: str = Field(
+        default="https://fca.integ01.dev-agentconnect.fr/api/v2/.well-known/openid-configuration"
+    )
+    PROCONNECT_REDIRECT_URI: str = Field(default="http://localhost:8501/oauth2callback")
+    PROCONNECT_COOKIE_SECRET: str | None = Field(default=None)
+    PROCONNECT_SCOPES: str = Field(default="openid email profile")
+    # Optional override. When unset, federated logout keeps the redirect Streamlit
+    # derives from PROCONNECT_REDIRECT_URI, so hosted deployments are not sent to
+    # a localhost address that ProConnect has not registered.
+    PROCONNECT_POST_LOGOUT_REDIRECT_URI: str | None = Field(default=None)
 
     def ensure_directories(self):
         """Ensure necessary directories exist."""

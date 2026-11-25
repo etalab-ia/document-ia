@@ -41,7 +41,7 @@ router = APIRouter()
                     "example": {
                         "id": "8f2fdafb-9c2c-4a82-8a0e-7c7f12c9e111",
                         "prefix": "ABCD1234",
-                        "key": "dia_dev_v1_ABCD1234_ABCDEFGHIJKLMNOPQRSTUVWX1234567890YZ12_IFZS",
+                        "key": "dia_dev_2_ABCD1234_ABCDEFGHIJKLMNOPQRSTUVWX1234567890YZ12_IFZS",  # gitleaks:allow -- exemple de documentation OpenAPI, clé factice
                         "status": "Active",
                         "created_at": "2025-11-06T10:45:00Z",
                         "updated_at": "2025-11-06T10:45:00Z",
@@ -149,7 +149,9 @@ async def create_api_key(
         raise
     except Exception as err:
         logger.error(
-            "Error creating API key for organization %s: %s", str(organization_id), err
+            "Error creating API key for organization %s: %s",
+            str(organization_id),
+            type(err).__name__,
         )
         raise
 
@@ -293,7 +295,7 @@ async def update_api_key_status(
     except HttpEntityNotFoundException:
         raise
     except Exception as err:
-        logger.error("Error updating API key status: %s", err)
+        logger.error("Error updating API key status: %s", type(err).__name__)
         raise
 
 
@@ -382,5 +384,5 @@ async def delete_api_key(
     except HttpEntityNotFoundException:
         raise
     except Exception as err:
-        logger.error("Error updating API key status: %s", err)
+        logger.error("Error deleting API key: %s", type(err).__name__)
         raise

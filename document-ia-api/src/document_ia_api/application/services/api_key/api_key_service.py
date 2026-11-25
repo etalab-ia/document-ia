@@ -1,7 +1,10 @@
+import contextlib
 import logging
 from typing import Optional
 from uuid import UUID
 
+from fastapi import HTTPException
+from pydantic import SecretStr
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +15,9 @@ from document_ia_api.api.contracts.api_key.api_key import (
 from document_ia_api.api.exceptions.entity_not_found_exception import (
     HttpEntityNotFoundException,
 )
+from document_ia_api.api.exceptions.service_unavailable_exception import (
+    database_unavailable,
+)
 from document_ia_api.application.services.api_key.api_key_helper import ApiKeyHelper
 from document_ia_api.application.services.api_key.mapper import (
     map_api_key_dto_to_api_result,
@@ -19,6 +25,8 @@ from document_ia_api.application.services.api_key.mapper import (
 from document_ia_infra.data.api_key.dto.api_key_dto import ApiKeyDTO
 from document_ia_infra.data.api_key.enum.api_key_status import ApiKeyStatus
 from document_ia_infra.data.api_key.repository.api_key import ApiKeyRepository
+from document_ia_infra.data.event.repository.event import is_transient_db_error
+from document_ia_infra.exception.retryable_exception import RetryableException
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +96,8 @@ class ApiKeyService:
             )
             await self.db_session.commit()
             return APIKeyCreatedResult(
-                **map_api_key_dto_to_api_result(api_key_dto).__dict__, key=presented
+                **map_api_key_dto_to_api_result(api_key_dto).__dict__,
+                key=SecretStr(presented),
             )
         except IntegrityError:
             await self.db_session.rollback()
@@ -110,9 +119,28 @@ class ApiKeyService:
                 return None
 
             if self.api_key_helper.verify_api_key(presented_key, api_key_dto):
+                if self.api_key_helper.is_legacy_v1_key(presented_key):
+                    logger.warning(
+                        "Authenticated with legacy v1 API key (id=%s, prefix=%s, organization_id=%s); schedule rotation to v2",
+                        api_key_dto.id,
+                        api_key_dto.prefix,
+                        api_key_dto.organization_id,
+                    )
                 return api_key_dto
             else:
                 return None
+        except ValueError:
+            return None
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error("Error verifying API key: %s", e)
+            if isinstance(e, RetryableException) or is_transient_db_error(e):
+                logger.error(
+                    "Transient database error while verifying API key: %s",
+                    type(e).__name__,
+                )
+                with contextlib.suppress(Exception):
+                    await self.db_session.rollback()
+                raise database_unavailable() from e
+            logger.error("Error verifying API key: %s", type(e).__name__)
             return None

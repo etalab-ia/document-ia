@@ -35,7 +35,7 @@ Key paths:
 ## Execution Flow
 1) The consumer reads a batch of messages with `XREADGROUP` on the configured stream.
 2) Each message is decoded into a type `T` (implementing `SerializableMessage`).
-3) Message processing is submitted to a `ThreadPoolExecutor`. Each thread creates its own asyncio event loop and runs the async coroutine `process_message_callable(message, retry_count)`.
+3) Message processing is submitted either to a `ThreadPoolExecutor` (`ThreadConsumer`, used for CPU-bound worker workflows, where each thread creates its own asyncio event loop) or as a coroutine task on the current event loop (`AsyncIoConsumer`, used for I/O-bound API webhook notifications), running `process_message_callable(message, retry_count, is_last_retry)`. See [`document-ia-infra/docs/REDIS_CONSUMER.md`](../document-ia-infra/docs/REDIS_CONSUMER.md) for full details.
 4) `WorkflowManager`:
    - Retrieves a “created” event that is not closed (i.e., not Completed/Failed non‑retryable) using `EventRepository.get_created_event_if_execution_not_completed_or_failed`.
    - Loads the workflow definition (steps).
@@ -77,21 +77,25 @@ On failure:
   - `retry_count` = how many attempts were already made for this message.
 
 On the consumer side (`infra/redis/consumer.py`):
-- If processing raises `RetryableException`, the message is re‑queued on the stream with `retries = retries + 1` while `retries < max_retry_number`.
-- If a non‑retryable error occurs, the message is sent to the DLQ stream.
+- `retries` tracks how many attempts were already consumed (`0` on the initial delivery) and `max_retry_number` is the **total number of allowed attempts** (e.g., `max_retry_number = 3` allows `retries` values `0`, `1`, `2`).
+- If processing raises `RetryableException`, the message is re‑queued on the stream with `retries = retries + 1` while `retries < max_retry_number - 1`; once exhausted, it is routed to the DLQ (`max_retries_exceeded`).
+- If a decode error, invalid `retries` metadata, or non‑retryable error occurs, the message is sent directly to the DLQ stream.
 - If re‑queuing itself fails, the message is sent to the DLQ stream.
-- The DLQ stream is named `"<stream>:dlq"` and stores fields such as: `data`, `retries`, `original_id`, `reason`, `error`, `consumer`, `timestamp`.
+- The DLQ stream is named `"<stream>:dlq"` and stores fields such as: `data`, `retries`, `original_id`, `root_id`, `reason`, `error`, `consumer`, `timestamp` (plus `original_timestamp` when present). DLQ retention is idempotent per `original_id` (bounded paginated scan from `<source_ms>-0`, fail-closed on scan error), while `root_id` preserves the initial stream entry ID across multi-hop retries.
 
-Reclaiming pending messages:
-- A background “reclaimer” task uses `XAUTOCLAIM` to recover idle messages (idle > RECLAIM_IDLE_MS), increments `retries`, and attempts to re‑queue them; if retry limits are exceeded, the message is routed to DLQ.
+Reclaiming pending messages & in-flight heartbeat:
+- An `XCLAIM ... JUSTID` heartbeat refreshes the idle timer of active in-flight and reclaiming entries every `reclaim_idle_ms / 3` (including during graceful shutdown drain) so slow healthy handlers are never reclaimed as duplicates.
+- A background “reclaimer” task uses `XAUTOCLAIM` to recover idle messages (`idle > RECLAIM_IDLE_MS`). Any message already retained in the DLQ (e.g., after a prior `XACK` failure) is acknowledged immediately without re‑queuing. Otherwise, a reclaim consumes a single attempt (`attempts = retries + 1`): while `attempts < max_retry_number`, the message is idempotently re‑queued; once `attempts >= max_retry_number`, it is routed to the DLQ.
 
 ACKs/NACKs:
-- All code paths (success, non‑retryable error, DLQ) eventually `XACK` the original message to avoid infinite loops.
+- `XACK` is only sent after a confirmed terminal outcome (processing success, confirmed re‑queue, or confirmed DLQ retention); otherwise, the message remains pending in the PEL for recovery.
 
 ---
 
-## Redis Consumer (Multi‑thread)
-The consumer uses a `ThreadPoolExecutor` to process each message in a dedicated thread, creating an **asyncio event loop per thread** to run `process_message_callable(message, retry_count)`.
+## Redis Consumer (`BaseConsumer` / `ThreadConsumer` / `AsyncIoConsumer`)
+`BaseConsumer` shares all Redis Stream group, heartbeat, PEL recovery, retry, and DLQ logic across two specialized subclasses:
+- `ThreadConsumer` (used by `document-ia-worker`): uses a lazily initialized `ThreadPoolExecutor` (`worker_number`) to process each message in a dedicated thread, creating an **asyncio event loop per thread** to run `process_message_callable(message, retry_count, is_last_retry)`.
+- `AsyncIoConsumer` (used by `document-ia-api` webhooks): schedules tasks directly on the caller's event loop (`max_concurrency` defaulting to `batch_size`, without any thread pool).
 
 Key points:
 - Async resources (async Redis client, async DB sessions) are **bound to the event loop** that created them. Do not use a client/session created on the main loop from a worker thread loop.
@@ -99,9 +103,41 @@ Key points:
 - For CPU‑bound tasks (OCR, heavy parsing), threads work well. For external binaries (e.g., Tesseract), consider `asyncio.create_subprocess_exec` to run subprocesses concurrently without blocking the loop.
 
 Concurrency knobs:
-- `worker_number`: thread pool size (per message). Start with 1 in debug.
-- `batch_size`, `block_time`: batching and blocking timeout for `XREADGROUP`.
-- `max_retry_number`: retry limit before DLQ.
+- `worker_number` (`ThreadConsumer`): thread pool size. Start with 1 in debug.
+- `max_concurrency` (`AsyncIoConsumer`): max concurrent `asyncio` tasks in flight (defaults to `batch_size`).
+- `batch_size`, `block_time`: maximum batch and blocking timeout for `XREADGROUP`. Each read requests `min(batch_size, free_worker_slots)`; it does not prefetch while all workers are busy. `batch_size` and `worker_number` must be positive.
+- `max_retry_number`: total attempt budget before DLQ (`retries` counts consumed attempts).
+
+### Stream Admission Backpressure and Initial Group Cursor (`0-0`)
+
+- **Initial Group Cursor (`start_from = "0-0"`)**:
+  When a worker starts and initializes its Redis consumer group via `_ensure_consumer_group`, new groups start at `0-0` (instead of `$`). Work admitted and published before worker startup is deliverable and counted in group lag immediately upon creation. Existing groups preserve their current cursor and pending entries (handled via `BUSYGROUP`).
+
+- **Backpressure and API Admission Interaction**:
+  The API enforces bounded admission control (see [`document-ia-infra/README.md#new-execution-admission`](../document-ia-infra/README.md#new-execution-admission)) based on worker throughput and backlog:
+  1. **Outstanding count (`lag + pending`)**: If the total unacknowledged backlog reaches `ADMISSION_MAX_OUTSTANDING` (default `1000`), the API rejects new workflow submissions with HTTP `503 Service Unavailable` (`execution_capacity_unavailable`) until workers drain the backlog below `ADMISSION_RESUME_OUTSTANDING` (default `800`).
+  2. **Backlog age (oldest unacknowledged entry)**: If the oldest entry in the queue (pending in PEL or waiting to be read) exceeds `ADMISSION_MAX_AGE_SECONDS` (default `300s`), the API also blocks new admissions until the age falls below `ADMISSION_RESUME_AGE_SECONDS` (default `120s`).
+  3. **Retained entries budget (`XLEN(stream) + XLEN(dlq)`)**: If the total retained history in Redis reaches `ADMISSION_MAX_RETAINED` (default `10000`), the API blocks new admissions until background maintenance cleanup reduces retained entries below `ADMISSION_RESUME_RETAINED` (default `8000`).
+
+> [!NOTE]
+> Tracking queue age is critical even in an asynchronous system: worker processing time varies widely by document complexity (a 50-page PDF with OCR and LLM takes much longer than a 1-page ID). If workers crash or hang, age-based backpressure triggers fast protection without waiting for hundreds of requests to pile up.
+
+### Resource ownership and blocking-operation inventory
+
+The consumer orchestrates delivery while infra `StreamDelivery`, `HandlerExecution`, and `WorkerErrorPolicy` separately implement delivery primitives, bounded execution, and workflow error decisions. Each message runs inside an `asyncio.Runner` on a pool thread, **not** as a coroutine on the Redis event loop. Keep this boundary until every synchronous operation is explicitly offloaded:
+
+| Operation | Current execution boundary / ownership |
+|---|---|
+| PyMuPDF PDF open/render, PIL decode/resize/crop/save | Workflow pool thread; PDF/image handles are closed by preprocessing/step cleanup. Existing PDF lock remains. |
+| YOLO-World, QRDet, OpenCV, barcode parsing and local OCR | Workflow pool thread; process-cached models and existing model locks remain. Boot pre-warming happens before stream consumption. |
+| Sync boto3 S3 download/upload/delete and synchronous database/file helpers | Workflow pool thread; never move the whole workflow onto the delivery loop merely because its entrypoint is `async`. |
+| Async SQLAlchemy session/engine | Created per workflow on its thread loop; session context closes and workflow `finally` disposes the engine. |
+| Webhook publisher Redis pool | Created per workflow; publisher borrows it and workflow `finally` closes it on the same thread loop. |
+| HTTP downloads/OCR | Request-scoped `httpx.AsyncClient` context managers on the thread loop. |
+| LLM OpenAI calls | `OpenAIManager` creates a request-scoped `AsyncOpenAI` context; closes on success/error/cancel, and creates no client for skipped/unstarted steps. |
+| Main Redis delivery client/pool | Worker runtime owns and closes it after consumer shutdown; consumers/delivery primitives borrow it. |
+
+Loop teardown cancels leftover tasks and closes async generators via `Runner`; it does not rely on `gc.collect()` or HTTP client destructors. Threads/native inference cannot be cancelled by cancelling their asyncio Future. The existing bounded drain, heartbeat protection during drain, and final process-exit deadline remain; unfinished messages stay pending for recovery. New no-progress/fencing policies are outside this refactor.
 
 ---
 
@@ -127,16 +163,17 @@ By default, PyTorch and OpenCV detect all host CPU cores (e.g. 16–32 cores) an
 
 ### 3. AI Model Pre-bundling & Boot Pre-warming
 - **Pre-downloading at build time**: Model weights for **YOLO-World** (`yolov8m-world.pt`) and **QRDet** (`qrdet-s.pt`), as well as Tesseract language files (`fra.traineddata`), are downloaded during `bin/post_compile` and stored in `$APP_ROOT/.models/`.
-- **Pre-warming on boot**: Before listening to Redis events, `src/document_ia_worker/main.py` invokes `_prewarm_models()` to load YOLO-World and QRDet models into RAM once at worker startup. This avoids concurrent on-the-fly downloads, model reloading delays, or race conditions during job execution.
+- **Pre-warming on boot**: Before listening to Redis events, `src/document_ia_worker/main.py` invokes `_prewarm_models_and_trust_store()` to verify and load YOLO-World, CLIP, QRDet, Tesseract, and the offline 2D-Doc PKI trust store into RAM once at worker startup. This avoids concurrent on-the-fly downloads, model reloading delays, or race conditions during job execution.
+- **In-memory 2D-Doc CRL refresh**: Immediately after pre-warming (and before reading the first Redis message), `TwoDDocCrlRefresher` refreshes the ANTS 2D-Doc CRLs in memory and then schedules a periodic background refresh (every `3.0` hours by default, configurable) to detect both updated CRLs and early certificate revocations without writing to disk. Network failures degrade gracefully without crashing the worker (see [`docs/TWO_D_DOC_VERIFICATION.md`](../docs/TWO_D_DOC_VERIFICATION.md)).
 
 ### 4. Critical Section Thread Locking for Heavy C/RAM Steps
 Network I/O steps (downloading from S3, HTTP OCR, LLM API calls) use virtually zero RAM and run with high concurrency (`REDIS_WORKER_NUMBER = 10+`).
 However, local PDF rasterization and PyTorch inference are heavy in RAM. Thread locks serialize only these brief C/RAM intensive phases:
 - `_PDF_LOCK` in `PreprocessFileStep` (PyMuPDF PDF page rendering)
 - `_YOLO_LOCK` in `yoloworld_crop.py` (YOLO-World object detection)
-- `_QRDET_LOCK` in `extract_barcode_2ddoc_data.py` (QRDet barcode detection)
+- `_BARCODE_LOCK` in `base_extract_barcode.py` (shared across `ExtractBarcode2DDocData`, `ExtractBarcodeData`, and `ExtractBarcodeRawData` for image header validation, downscaling, ZXing and QRDet barcode detection)
 
-This allows high Redis concurrency (`REDIS_WORKER_NUMBER = 10`) for I/O bound waiting while keeping peak RAM footprint under 1.5 GB.
+This allows high Redis concurrency (`REDIS_WORKER_NUMBER = 8` by default) for I/O bound waiting while keeping peak RAM footprint under 1.5 GB.
 
 ---
 
@@ -277,6 +314,11 @@ When Loki push requires authentication, set `LOKI_BEARER_TOKEN` to the raw token
 - `OPENAI_ENCODING_MODEL` (str, default: `"gpt-4"`)
 - `OPENAI_TIMEOUT` (int, default: `30`)
 - `OPENAI_MAX_RETRIES` (int, default: `3`)
+
+### 2D-Doc CRL Refresh
+- `TWO_D_DOC_CRL_REFRESH_ENABLED` (bool, default: `True`) — enable startup and periodic in-memory 2D-Doc CRL refresh
+- `TWO_D_DOC_CRL_REFRESH_INTERVAL_HOURS` (float, default: `3.0`) — interval in hours between periodic CRL refreshes
+- `TWO_D_DOC_CRL_REFRESH_TIMEOUT_SECONDS` (int, default: `10`) — HTTP timeout in seconds per CRL fetch
 
 ### Task Scheduler
 - `EVENT_STORE_PPI_RETENTION_DAYS` (int, default: `7`)

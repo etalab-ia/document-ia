@@ -1,12 +1,19 @@
+import base64
+import io
 import logging
 import math
 import threading
 from pathlib import Path
 from typing import Optional, Any, Iterable, Protocol, runtime_checkable, cast
 
-from pymupdf import pymupdf, Document
+import pymupdf
+from pymupdf import Document
 from PIL import Image
 
+from document_ia_infra.core.file.safe_path import (
+    ensure_directory_permissions,
+    ensure_file_permissions,
+)
 from document_ia_infra.data.workflow.dto.workflow_v2_dto import PreprocessFileParams
 
 from document_ia_worker.workflow.main_workflow_context import (
@@ -62,11 +69,6 @@ class PreprocessFileStep(BaseFileManipulationStep[PreprocessFileResult]):
     ):
         super().__init__(main_workflow_context, subfolder="preprocess")
         self.params = params or PreprocessFileParams()
-        self.targeted_dpi = 180
-        self.max_long_edge = 1800
-        self.max_pixel_size = 2_000_000
-        self.min_long_edge = 1500
-        self.force_grayscale = True
 
     def get_context_result_key(self) -> str:
         return PreprocessFileResult.__name__
@@ -80,8 +82,8 @@ class PreprocessFileStep(BaseFileManipulationStep[PreprocessFileResult]):
     async def _prepare_step(self):
         if self.download_file_result is None:
             raise ValueError("DownloadFileReturnData not injected in context")
-        # Ensure output directory exists
-        Path(self.tmp_folder_path).mkdir(parents=True, exist_ok=True)
+        # Ensure output directory exists with strict permissions
+        ensure_directory_permissions(Path(self.tmp_folder_path), 0o700)
 
     async def _execute_internal(
         self,
@@ -98,18 +100,20 @@ class PreprocessFileStep(BaseFileManipulationStep[PreprocessFileResult]):
                 output_files_path=[self.download_file_result.file_path]
             )
 
+        metadata: Optional[StepMetadata] = None
         if self.params.yoloworld.enabled:
-            result = self._apply_yoloworld(result)
+            result, metadata = self._apply_yoloworld(result)
 
-        return result, None
+        return result, metadata
 
     def _apply_yoloworld(
         self, preprocess_result: PreprocessFileResult
-    ) -> PreprocessFileResult:
+    ) -> tuple[PreprocessFileResult, StepMetadata]:
         yolo_params = self.params.yoloworld
         output_paths: list[str] = []
+        output_images: list[str] = []
         out_dir = Path(self.tmp_folder_path)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        ensure_directory_permissions(out_dir, 0o700)
 
         for index, file_path in enumerate(preprocess_result.output_files_path, start=1):
             source_path = Path(file_path)
@@ -120,21 +124,39 @@ class PreprocessFileStep(BaseFileManipulationStep[PreprocessFileResult]):
                     class_name=yolo_params.class_name,
                     margin=yolo_params.margin,
                     confidence_threshold=yolo_params.confidence_threshold,
+                    iou=yolo_params.iou,
                     image_size=yolo_params.image_size,
                 )
                 cropped_image.save(output_path, format="PNG")
+                ensure_file_permissions(output_path, 0o600)
+                # Keep a compact preview in the execution debug metadata so
+                # clients can inspect the YoloWorld output after worker cleanup.
+                preview = cropped_image.convert("RGB")
+                preview.thumbnail((1200, 1200))
+                preview_buffer = io.BytesIO()
+                preview.save(preview_buffer, format="JPEG", quality=80, optimize=True)
+                output_images.append(
+                    "data:image/jpeg;base64,"
+                    + base64.b64encode(preview_buffer.getvalue()).decode("ascii")
+                )
+                preview.close()
                 cropped_image.close()
             output_paths.append(str(output_path))
 
-        return PreprocessFileResult(output_files_path=output_paths)
+        return PreprocessFileResult(output_files_path=output_paths), StepMetadata(
+            step_name="PreprocessFileStep",
+            execution_time=0,
+            output_images=output_images,
+        )
 
     def _preprocess_pdf(self) -> PreprocessFileResult:
         with _PDF_LOCK:
+            pdf_params = self.params.pdf
             image_paths: list[str] = []
             assert self.download_file_result
             doc: Document = pymupdf.open(filename=self.download_file_result.file_path)
             out_dir = Path(self.tmp_folder_path)
-            out_dir.mkdir(parents=True, exist_ok=True)
+            ensure_directory_permissions(out_dir, 0o700)
             base_name = Path(self.download_file_result.file_path).stem
             try:
                 pages = cast(Iterable[PageLike], doc)
@@ -144,27 +166,28 @@ class PreprocessFileStep(BaseFileManipulationStep[PreprocessFileResult]):
 
                     # Zoom cible basé sur le DPI souhaité
                     # 72 DPI est la résolution "naturelle" des pdf
-                    zoom = self.targeted_dpi / 72.0
+                    zoom = pdf_params.targeted_dpi / 72.0
 
                     # Taille prédite avec ce zoom
                     predicted_width = page_width * zoom
                     predicted_height = page_height * zoom
 
                     # On borne par la longueur max et le nombre total de pixels
-                    scale_by_edge = self.max_long_edge / max(
+                    scale_by_edge = pdf_params.max_long_edge / max(
                         predicted_width, predicted_height
                     )
                     scale_by_mp = math.sqrt(
-                        self.max_pixel_size / (predicted_width * predicted_height)
+                        pdf_params.max_pixel_size / (predicted_width * predicted_height)
                     )
                     clamp_factor = min(1.0, scale_by_edge, scale_by_mp)
 
                     # Si trop petit, on remonte au minimum requis
                     if (
                         clamp_factor == 1.0
-                        and max(predicted_width, predicted_height) < self.min_long_edge
+                        and max(predicted_width, predicted_height)
+                        < pdf_params.min_long_edge
                     ):
-                        clamp_factor = self.min_long_edge / max(
+                        clamp_factor = pdf_params.min_long_edge / max(
                             predicted_width, predicted_height
                         )
 
@@ -173,7 +196,7 @@ class PreprocessFileStep(BaseFileManipulationStep[PreprocessFileResult]):
 
                     # Préparation des kwargs pour get_pixmap (niveau de gris + pas d’alpha)
                     kwargs: dict[str, Any] = {"matrix": mat, "alpha": False}
-                    if self.force_grayscale and hasattr(pymupdf, "csGRAY"):
+                    if pdf_params.force_grayscale and hasattr(pymupdf, "csGRAY"):
                         kwargs["colorspace"] = pymupdf.csGRAY
 
                     pix = page.get_pixmap(**kwargs)
@@ -185,6 +208,7 @@ class PreprocessFileStep(BaseFileManipulationStep[PreprocessFileResult]):
 
                         image_path = str(out_dir / f"{base_name}_{page.number}.png")
                         pix.save(image_path)
+                        ensure_file_permissions(Path(image_path), 0o600)
                         image_paths.append(image_path)
                     finally:
                         # Libère la référence du pixmap

@@ -1,5 +1,6 @@
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any, cast
 
@@ -10,6 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from document_ia_api.api.contracts.workflow_v2 import WorkflowV2OverridePayload
 from document_ia_api.api.exceptions.entity_not_found_exception import (
     HttpEntityNotFoundException,
+)
+from document_ia_api.application.services.execution_acceptance import (
+    S3CompensationGuard,
+    schedule_workflow_execution,
+    scheduling_unavailable,
 )
 from document_ia_api.core.file_validator import validate_uploaded_file
 from document_ia_api.infra.s3_service import s3_service
@@ -51,6 +57,8 @@ class WorkflowV2Service:
         file_url: str | None,
         metadata_json: str | None,
         override_payload: WorkflowV2OverridePayload | None,
+        execution_id: str | None = None,
+        before_publish: Callable[[Any, Any], Awaitable[str]] | None = None,
     ) -> WorkflowExecutionDataV2:
         if self.db_session is None:
             raise HTTPException(
@@ -67,49 +75,68 @@ class WorkflowV2Service:
         )
 
         metadata = self._parse_metadata(metadata_json)
-        execution_id = uuid.uuid4().__str__()
+        execution_id = execution_id or str(uuid.uuid4())
 
         file_info: FileInfo | None = None
-        if file is not None:
-            detected_mime_type = validate_uploaded_file(file)
-            file_content = await self._read_file_content(file)
-            s3_upload_result = await self._upload_file_to_s3(
-                file_content=file_content,
-                filename=file.filename,
-                content_type=detected_mime_type,
-                metadata=metadata,
-            )
+        compensation_guard = S3CompensationGuard(execution_id=execution_id)
 
-            file_info = FileInfo(
-                filename=file.filename or "unknown",
-                s3_key=s3_upload_result["s3_key"],
-                size=len(file_content),
-                content_type=detected_mime_type,
-                uploaded_at=datetime.now().isoformat(),
-                presigned_url=s3_upload_result["presigned_url"],
-            )
+        try:
+            if file is not None:
+                detected_mime_type = validate_uploaded_file(file)
+                file_content = await self._read_file_content(file)
+                s3_upload_result = await self._upload_file_to_s3(
+                    file_content=file_content,
+                    filename=file.filename,
+                    content_type=detected_mime_type,
+                    metadata=metadata,
+                )
+                compensation_guard.arm(s3_upload_result["s3_key"])
 
-        event_store_service = EventStoreService(self.db_session)
-        await event_store_service.emit_workflow_started(
-            workflow_id=workflow_id,
-            execution_id=execution_id,
-            organization_id=organization_id,
-            file_info=file_info,
-            file_url=file_url,
-            metadata=metadata,
-            workflow_configuration=resolved_workflow,
-            event_version=2,
-        )
+                file_info = FileInfo(
+                    filename=file.filename or "unknown",
+                    s3_key=s3_upload_result["s3_key"],
+                    size=len(file_content),
+                    content_type=detected_mime_type,
+                    uploaded_at=datetime.now().isoformat(),
+                    presigned_url=s3_upload_result["presigned_url"],
+                )
 
-        publish_id = await self.redis_producer.publish_message(
-            WorkflowExecutionMessage(workflow_execution_id=execution_id)
-        )
-        if not publish_id:
-            logger.warning(
-                "Workflow v2 execution %s: message not published to stream %s",
-                execution_id,
-                self.redis_producer.stream_name,
+            event_store_service = EventStoreService(self.db_session)
+            try:
+                await event_store_service.emit_workflow_started(
+                    workflow_id=workflow_id,
+                    execution_id=execution_id,
+                    organization_id=organization_id,
+                    file_info=file_info,
+                    file_url=file_url,
+                    metadata=metadata,
+                    workflow_configuration=resolved_workflow,
+                    workflow_version=2,
+                )
+            except Exception as emit_error:
+                logger.error(
+                    "Workflow v2 execution %s: started event could not be persisted",
+                    execution_id,
+                )
+                raise scheduling_unavailable(execution_id) from emit_error
+
+            # Publication is fenced by reservation ownership in one Redis operation:
+            # a stale request must not publish a second execution. The started event
+            # is already committed by this point, so a lost reservation closes the
+            # execution explicitly rather than leaving a `STARTED` that never
+            # progresses.
+            await schedule_workflow_execution(
+                self.db_session,
+                redis_producer=self.redis_producer,
+                execution_id=execution_id,
+                workflow_id=workflow_id,
+                organization_id=organization_id,
+                workflow_version=2,
+                before_publish=before_publish,
+                compensation_guard=compensation_guard,
             )
+        finally:
+            await compensation_guard.compensate_if_needed()
 
         return WorkflowExecutionDataV2(
             execution_id=execution_id,
@@ -121,6 +148,43 @@ class WorkflowV2Service:
             file_url=file_url,
             metadata=metadata,
             workflow_configuration=resolved_workflow,
+        )
+
+    async def get_execution_data(
+        self, execution_id: str
+    ) -> WorkflowExecutionDataV2 | None:
+        """Retrieve execution data from the started event to reconstruct the admission response."""
+        if self.db_session is None:
+            raise HTTPException(
+                status_code=500,
+                detail="WorkflowV2Service requires a database session for reading execution.",
+            )
+
+        event_store_service = EventStoreService(self.db_session)
+        result = await event_store_service.get_workflow_started_event(execution_id)
+        if result is None:
+            return None
+
+        dto, started = result
+        if started.workflow_configuration is None:
+            raw_workflow = self._get_raw_workflow_or_404(started.workflow_id)
+            workflow_config = self._resolve_workflow_configuration(
+                raw_workflow=raw_workflow,
+                override_payload=None,
+            )
+        else:
+            workflow_config = started.workflow_configuration
+
+        return WorkflowExecutionDataV2(
+            execution_id=started.execution_id,
+            workflow_id=started.workflow_id,
+            organization_id=started.organization_id,
+            status="processing",
+            created_at=dto.created_at.isoformat(),
+            file_info=started.s3_file_info,
+            file_url=started.file_url,
+            metadata=started.metadata,
+            workflow_configuration=workflow_config,
         )
 
     def validateWorkflow(
@@ -236,10 +300,11 @@ class WorkflowV2Service:
             resolved_params: dict[str, Any] = {}
             for param_name, rule in params.items():
                 if param_name in override_map:
-                    configured_value = (
-                        rule.get("default")
-                        if isinstance(rule, dict)
-                        else None
+                    rule_dict = (
+                        cast(dict[str, Any], rule) if isinstance(rule, dict) else None
+                    )
+                    configured_value: Any = (
+                        rule_dict.get("default") if rule_dict is not None else None
                     )
                     resolved_params[param_name] = self._merge_override_value(
                         configured_value,
@@ -335,10 +400,12 @@ class WorkflowV2Service:
         if not isinstance(configured, dict) or not isinstance(override, dict):
             return override
 
-        merged = dict(configured)
-        for key, value in override.items():
+        configured_dict = cast(dict[str, Any], configured)
+        override_dict = cast(dict[str, Any], override)
+        merged: dict[str, Any] = dict(configured_dict)
+        for key, value in override_dict.items():
             merged[key] = WorkflowV2Service._merge_override_value(
-                configured.get(key), value
+                configured_dict.get(key), value
             )
         return merged
 
@@ -347,7 +414,7 @@ class WorkflowV2Service:
         try:
             return await file.read()
         except Exception as exc:
-            logger.error("Error reading file content: %s", exc)
+            logger.error("Error reading file content: %s", type(exc).__name__)
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -379,7 +446,7 @@ class WorkflowV2Service:
                 metadata=s3_metadata,
             )
         except Exception as exc:
-            logger.error("S3 upload failed: %s", exc)
+            logger.error("S3 upload failed: %s", type(exc).__name__)
             raise HTTPException(
                 status_code=500,
                 detail={

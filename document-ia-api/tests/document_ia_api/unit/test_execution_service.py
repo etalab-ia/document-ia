@@ -7,20 +7,39 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from unittest.mock import AsyncMock, MagicMock
 
+from document_ia_api.application.services.api_key.api_key_service import ApiKeyService
 from document_ia_api.application.services.execution_service import ExecutionService
+
 from document_ia_api.api.contracts.execution.types import ExecutionStatus
 from document_ia_infra.core.model.file_info import FileInfo
-from document_ia_infra.data.document.schema.document_classification import DocumentClassification
-from document_ia_infra.data.document.schema.document_extraction import DocumentExtraction
+from document_ia_infra.core.model.typed_generic_model import GenericProperty
+from document_ia_infra.data.document.schema.document_classification import (
+    DocumentClassification,
+)
+from document_ia_infra.data.document.schema.document_extraction import (
+    DocumentExtraction,
+)
+from document_ia_infra.data.event.dto.anonymization_enum import AnonymizationStatus
 from document_ia_infra.data.event.dto.event_dto import EventDTO
 from document_ia_infra.data.event.dto.event_type_enum import EventType
+from document_ia_infra.data.event.repository.event import EventRepository
 from document_ia_schemas import SupportedDocumentType
 
-from document_ia_infra.data.event.schema.workflow.workflow_execution_completed_event import \
-    WorkflowExecutionCompletedEvent, CompletedEventResult
-from document_ia_infra.data.event.schema.workflow.workflow_execution_failed_event import WorkflowExecutionFailedEvent
-from document_ia_infra.data.event.schema.workflow.workflow_execution_started_event import WorkflowExecutionStartedEvent, \
-    ClassificationParameters, ExtractionParameters
+from document_ia_infra.data.event.schema.workflow.workflow_execution_completed_event import (
+    WorkflowExecutionCompletedEvent,
+    CompletedEventResult,
+)
+from document_ia_infra.data.event.schema.workflow.workflow_execution_failed_event import (
+    WorkflowExecutionFailedEvent,
+)
+from document_ia_infra.data.event.schema.workflow.workflow_execution_started_event import (
+    WorkflowExecutionStartedEvent,
+    ClassificationParameters,
+    ExtractionParameters,
+)
+
+
+_REAL_GET_FROM_PRESENTED_KEY = ApiKeyService.get_from_presented_key
 
 
 class SampleProps(BaseModel):
@@ -64,15 +83,17 @@ def test_get_event_model_started(service: ExecutionService):
     )
     dto = EventDTO(
         id=uuid4(),
-        organization_id=uuid4(),
+        organization_id=start_evt.organization_id,
         workflow_id="wf",
         execution_id="exec",
-        created_at=datetime.now(UTC),
+        created_at=start_evt.created_at.replace(year=start_evt.created_at.year + 1),
         event_type=EventType.WORKFLOW_EXECUTION_STARTED,
         event=start_evt.model_dump(mode="json"),
     )
     res = service.get_event_model(dto, execution_id="exec", is_debug_mode=False)
     assert res.status == ExecutionStatus.STARTED
+    assert res.data.created_at == dto.created_at
+    assert res.data.created_at != start_evt.created_at
     assert res.data.s3_file_info.file_name == "doc.pdf"
 
 
@@ -91,7 +112,7 @@ def test_get_event_model_failed(service: ExecutionService):
     )
     dto = EventDTO(
         id=uuid4(),
-        organization_id=uuid4(),
+        organization_id=failed_evt.organization_id,
         workflow_id="wf",
         execution_id="exec",
         created_at=datetime.now(UTC),
@@ -103,7 +124,9 @@ def test_get_event_model_failed(service: ExecutionService):
     assert res.data.error_type == "X"
 
 
-def test_get_event_model_completed_with_extraction_and_classification(service: ExecutionService, monkeypatch: pytest.MonkeyPatch):
+def test_get_event_model_completed_with_extraction_and_classification(
+    service: ExecutionService, monkeypatch: pytest.MonkeyPatch
+):
     props = SampleProps(first_name="Alice", age=None)
     extraction = DocumentExtraction[SampleProps](
         title="t",
@@ -137,12 +160,14 @@ def test_get_event_model_completed_with_extraction_and_classification(service: E
     class DummySchema:
         document_model = SampleProps
 
-    monkeypatch.setattr("document_ia_api.application.services.execution_service.resolve_extract_schema", lambda name: DummySchema())
-    monkeypatch.setattr("document_ia_infra.data.document.schema.document_extraction.resolve_extract_schema", lambda name: DummySchema())
+    monkeypatch.setattr(
+        "document_ia_infra.data.document.schema.document_extraction.resolve_extract_schema",
+        lambda name: DummySchema(),
+    )
 
     dto = EventDTO(
         id=uuid4(),
-        organization_id=uuid4(),
+        organization_id=completed.organization_id,
         workflow_id="wf",
         execution_id="exec",
         created_at=datetime.now(UTC),
@@ -162,22 +187,27 @@ def test_get_event_model_completed_with_extraction_and_classification(service: E
     assert res.data.result.workflow_metadata == [{"step": 1}]
 
 
-def test__convert_extraction_result_unit(service: ExecutionService, monkeypatch: pytest.MonkeyPatch):
+def test_convert_extraction_result_uses_decoded_properties(
+    service: ExecutionService, monkeypatch: pytest.MonkeyPatch
+):
     props = SampleProps(first_name="Bob", age=42)
     extraction = DocumentExtraction[SampleProps](
         title="t",
         type=SupportedDocumentType.CNI,
         properties=props,
     )
+    convert = MagicMock(wraps=GenericProperty.convert_pydantic_model)
+    monkeypatch.setattr(
+        "document_ia_api.application.services.execution_service.GenericProperty.convert_pydantic_model",
+        convert,
+    )
 
-    class DummySchema:
-        document_model = SampleProps
+    result = service._convert_extraction_result(extraction)
 
-    result = service._convert_extraction_result(extraction, DummySchema())
+    convert.assert_called_once_with(props)
     assert result.type == SupportedDocumentType.CNI
     names = [p.name for p in result.properties]
     assert "first_name" in names and "age" in names
-    # type inference
     types = {p.name: p.type for p in result.properties}
     assert types["first_name"] == "string"
     assert types["age"] == "number"
@@ -210,13 +240,13 @@ def test_get_event_model_completed_with_other_extraction_skips_schema_resolution
 
     resolve_extract_schema_mock = MagicMock()
     monkeypatch.setattr(
-        "document_ia_api.application.services.execution_service.resolve_extract_schema",
+        "document_ia_infra.data.document.schema.document_extraction.resolve_extract_schema",
         resolve_extract_schema_mock,
     )
 
     dto = EventDTO(
         id=uuid4(),
-        organization_id=uuid4(),
+        organization_id=completed.organization_id,
         workflow_id="wf",
         execution_id="exec",
         created_at=datetime.now(UTC),
@@ -230,3 +260,580 @@ def test_get_event_model_completed_with_other_extraction_skips_schema_resolution
     assert res.data.result.extraction.type == SupportedDocumentType.AUTRE
     assert res.data.result.extraction.properties == []
     resolve_extract_schema_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("is_debug_mode", [False, True])
+def test_date_anomaly_survives_completed_event_and_api_response(version, is_debug_mode):
+    from document_ia_api.api.contracts.execution.success import ExecutionSuccessModel
+    from document_ia_schemas.cni import CNIModel
+
+    extraction = DocumentExtraction[CNIModel](
+        type=SupportedDocumentType.CNI,
+        properties=CNIModel(
+            nom="DUPONT",
+            date_naissance="31/04/2026",
+            date_delivrance="1/1/2024",
+        ),
+    )
+    completed = WorkflowExecutionCompletedEvent(
+        event_id=uuid4(),
+        organization_id=uuid4(),
+        workflow_id="wf",
+        execution_id="exec",
+        created_at=datetime.now(UTC),
+        version=version,
+        final_result=CompletedEventResult(extraction=extraction),
+        total_processing_time_ms=100,
+        output_summary={},
+        steps_completed=3,
+    )
+    # JSON round-trip stands for the worker -> event store/Redis -> API boundary.
+    import json
+
+    stored_event = json.loads(completed.model_dump_json())
+    assert stored_event["final_result"]["extraction"]["properties"][
+        "date_naissance"
+    ] == {
+        "code": "invalid_date",
+        "raw_value": "31/04/2026",
+    }
+    dto = EventDTO(
+        id=uuid4(),
+        organization_id=completed.organization_id,
+        workflow_id="wf",
+        execution_id="exec",
+        created_at=completed.created_at,
+        event_type=EventType.WORKFLOW_EXECUTION_COMPLETED,
+        event=stored_event,
+    )
+    response = ExecutionService().get_event_model(dto, "exec", is_debug_mode)
+    payload = json.loads(response.model_dump_json())
+    props = {
+        p["name"]: p for p in payload["data"]["result"]["extraction"]["properties"]
+    }
+    assert props["nom"]["value"] == "DUPONT"
+    assert props["date_naissance"] == {
+        "name": "date_naissance",
+        "type": "date",
+        "value": None,
+        "anomaly": {
+            "code": "invalid_date",
+            "raw_value": "31/04/2026",
+        },
+    }
+    assert props["date_delivrance"] == {
+        "name": "date_delivrance",
+        "type": "date",
+        "value": "2024-01-01",
+    }
+    assert props["date_expiration"] == {
+        "name": "date_expiration",
+        "type": "date",
+        "value": None,
+    }
+    assert (
+        ExecutionSuccessModel.model_validate_json(response.model_dump_json())
+        == response
+    )
+
+
+def test_get_event_model_started_purged(service: ExecutionService):
+    start_evt = WorkflowExecutionStartedEvent(
+        event_id=uuid4(),
+        organization_id=uuid4(),
+        workflow_id="wf",
+        execution_id="exec",
+        created_at=datetime.now(UTC),
+        version=1,
+        s3_file_info=None,
+        file_url=None,
+        metadata={},
+        classification_parameters=ClassificationParameters(),
+        extraction_parameters=ExtractionParameters(),
+    )
+    dto = EventDTO(
+        id=uuid4(),
+        organization_id=start_evt.organization_id,
+        workflow_id="wf",
+        execution_id="exec",
+        created_at=start_evt.created_at,
+        event_type=EventType.WORKFLOW_EXECUTION_STARTED,
+        event=start_evt.model_dump(mode="json"),
+        anonymization_status=AnonymizationStatus.DONE,
+    )
+    res = service.get_event_model(dto, execution_id="exec", is_debug_mode=False)
+    assert res.status == ExecutionStatus.STARTED
+    assert res.purged is True
+    assert res.data.s3_file_info is None
+    assert res.data.file_url is None
+
+
+def test_get_event_model_started_not_purged(service: ExecutionService):
+    start_evt = WorkflowExecutionStartedEvent(
+        event_id=uuid4(),
+        organization_id=uuid4(),
+        workflow_id="wf",
+        execution_id="exec",
+        created_at=datetime.now(UTC),
+        version=1,
+        s3_file_info=_file_info(),
+        file_url="https://example.com/test.pdf",
+        metadata={"key": "val"},
+        classification_parameters=ClassificationParameters(),
+        extraction_parameters=ExtractionParameters(),
+    )
+    dto = EventDTO(
+        id=uuid4(),
+        organization_id=start_evt.organization_id,
+        workflow_id="wf",
+        execution_id="exec",
+        created_at=start_evt.created_at,
+        event_type=EventType.WORKFLOW_EXECUTION_STARTED,
+        event=start_evt.model_dump(mode="json"),
+        anonymization_status=AnonymizationStatus.PENDING,
+    )
+    res = service.get_event_model(dto, execution_id="exec", is_debug_mode=False)
+    assert res.status == ExecutionStatus.STARTED
+    assert res.purged is False
+    assert res.data.s3_file_info is not None
+    assert res.data.file_url is not None
+    assert res.data.file_url.get_secret_value() == "https://example.com/test.pdf"
+
+
+def test_get_event_model_completed_purged(service: ExecutionService):
+    completed = WorkflowExecutionCompletedEvent(
+        event_id=uuid4(),
+        organization_id=uuid4(),
+        workflow_id="wf",
+        execution_id="exec",
+        created_at=datetime.now(UTC),
+        version=1,
+        final_result=CompletedEventResult(
+            extraction=None,
+            classification=None,
+            barcodes=[],
+        ),
+        total_processing_time_ms=500,
+        output_summary={},
+        steps_completed=2,
+        workflow_metadata=None,
+    )
+    dto = EventDTO(
+        id=uuid4(),
+        organization_id=completed.organization_id,
+        workflow_id="wf",
+        execution_id="exec",
+        created_at=completed.created_at,
+        event_type=EventType.WORKFLOW_EXECUTION_COMPLETED,
+        event=completed.model_dump(mode="json"),
+        anonymization_status=AnonymizationStatus.DONE,
+    )
+    res = service.get_event_model(dto, execution_id="exec", is_debug_mode=True)
+    assert res.status == ExecutionStatus.SUCCESS
+    assert res.purged is True
+    assert res.data.result.classification is None
+    assert res.data.result.extraction is None
+    assert res.data.result.barcodes == []
+    assert res.data.result.workflow_metadata is None
+
+
+def test_get_event_model_failed_purged(service: ExecutionService):
+    failed = WorkflowExecutionFailedEvent(
+        event_id=uuid4(),
+        organization_id=uuid4(),
+        workflow_id="wf",
+        execution_id="exec",
+        created_at=datetime.now(UTC),
+        version=1,
+        error_type="ProcessingError",
+        error_message="[PURGED]",
+        failed_step="ocr",
+        retry_count=0,
+    )
+    dto = EventDTO(
+        id=uuid4(),
+        organization_id=failed.organization_id,
+        workflow_id="wf",
+        execution_id="exec",
+        created_at=failed.created_at,
+        event_type=EventType.WORKFLOW_EXECUTION_FAILED,
+        event=failed.model_dump(mode="json"),
+        anonymization_status=AnonymizationStatus.DONE,
+    )
+    res = service.get_event_model(dto, execution_id="exec", is_debug_mode=False)
+    assert res.status == ExecutionStatus.FAILED
+    assert res.purged is True
+    assert res.data.error_message == "[PURGED]"
+
+
+def test_anonymize_payload_roundtrip_with_decode_and_execution_service(
+    service: ExecutionService,
+):
+    """End-to-end roundtrip: full payload -> anonymize_payload -> decode_event_dto -> get_event_model."""
+    # 1. WorkflowExecutionStartedEvent
+    raw_started = WorkflowExecutionStartedEvent(
+        event_id=uuid4(),
+        organization_id=uuid4(),
+        workflow_id="wf-test",
+        execution_id="exec-test",
+        created_at=datetime.now(UTC),
+        version=1,
+        s3_file_info=_file_info(),
+        file_url="https://s3.example.com/sensitive-doc.pdf?signature=secret",
+        metadata={"client_ip": "10.0.0.1", "username": "admin"},
+        classification_parameters=ClassificationParameters(),
+        extraction_parameters=ExtractionParameters(),
+    )
+    started_payload = raw_started.model_dump(mode="json")
+    EventRepository.anonymize_payload("WorkflowExecutionStarted", started_payload)
+
+    started_dto = EventDTO(
+        id=uuid4(),
+        organization_id=raw_started.organization_id,
+        workflow_id="wf-test",
+        execution_id="exec-test",
+        created_at=raw_started.created_at,
+        event_type=EventType.WORKFLOW_EXECUTION_STARTED,
+        event=started_payload,
+        anonymization_status=AnonymizationStatus.DONE,
+    )
+    started_model = service.get_event_model(
+        started_dto, execution_id="exec-test", is_debug_mode=False
+    )
+    assert started_model.status == ExecutionStatus.STARTED
+    assert started_model.purged is True
+    assert started_model.data.s3_file_info is None
+    assert started_model.data.file_url is None
+
+    # 2. WorkflowExecutionCompletedEvent
+    raw_completed = WorkflowExecutionCompletedEvent(
+        event_id=uuid4(),
+        organization_id=uuid4(),
+        workflow_id="wf-test",
+        execution_id="exec-test",
+        created_at=datetime.now(UTC),
+        version=1,
+        final_result=CompletedEventResult(
+            extraction=DocumentExtraction[SampleProps](
+                type=SupportedDocumentType.AUTRE,
+                properties=SampleProps(first_name="Jean", age=30),
+            ),
+            classification=DocumentClassification(
+                document_type=SupportedDocumentType.AUTRE,
+                confidence=0.98,
+                explanation="Valid document",
+            ),
+            barcodes=[],
+        ),
+        total_processing_time_ms=1800,
+        output_summary={"summary": "sensitive summary"},
+        steps_completed=3,
+        workflow_metadata=[{"meta": "sensitive"}],
+    )
+    completed_payload = raw_completed.model_dump(mode="json")
+    EventRepository.anonymize_payload("WorkflowExecutionCompleted", completed_payload)
+
+    completed_dto = EventDTO(
+        id=uuid4(),
+        organization_id=raw_completed.organization_id,
+        workflow_id="wf-test",
+        execution_id="exec-test",
+        created_at=raw_completed.created_at,
+        event_type=EventType.WORKFLOW_EXECUTION_COMPLETED,
+        event=completed_payload,
+        anonymization_status=AnonymizationStatus.DONE,
+    )
+    completed_model = service.get_event_model(
+        completed_dto, execution_id="exec-test", is_debug_mode=True
+    )
+    assert completed_model.status == ExecutionStatus.SUCCESS
+    assert completed_model.purged is True
+    assert completed_model.data.result.classification is None
+    assert completed_model.data.result.extraction is None
+    assert completed_model.data.result.barcodes == []
+    assert completed_model.data.result.workflow_metadata is None
+
+    # 3. WorkflowExecutionFailedEvent
+    raw_failed = WorkflowExecutionFailedEvent(
+        event_id=uuid4(),
+        organization_id=uuid4(),
+        workflow_id="wf-test",
+        execution_id="exec-test",
+        created_at=datetime.now(UTC),
+        version=1,
+        error_type="ExtractionError",
+        error_message="Critical: failed with token secret_token_xyz in query string",
+        failed_step="extract_text",
+        retry_count=1,
+    )
+    failed_payload = raw_failed.model_dump(mode="json")
+    EventRepository.anonymize_payload("WorkflowExecutionFailed", failed_payload)
+
+    failed_dto = EventDTO(
+        id=uuid4(),
+        organization_id=raw_failed.organization_id,
+        workflow_id="wf-test",
+        execution_id="exec-test",
+        created_at=raw_failed.created_at,
+        event_type=EventType.WORKFLOW_EXECUTION_FAILED,
+        event=failed_payload,
+        anonymization_status=AnonymizationStatus.DONE,
+    )
+    failed_model = service.get_event_model(
+        failed_dto, execution_id="exec-test", is_debug_mode=False
+    )
+    assert failed_model.status == ExecutionStatus.FAILED
+    assert failed_model.purged is True
+    assert failed_model.data.error_message == "[PURGED]"
+
+
+@pytest.mark.asyncio
+async def test_api_key_service_raises_503_on_database_error(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import HTTPException
+    from sqlalchemy.exc import DBAPIError, OperationalError
+
+    monkeypatch.setattr(
+        ApiKeyService, "get_from_presented_key", _REAL_GET_FROM_PRESENTED_KEY
+    )
+    api_key_service = ApiKeyService(db_session)
+    api_key_service.api_key_helper.get_key_prefix = MagicMock(return_value="ABCDEFGH")
+    presented_key = "dia_dev_2_ABCDEFGH_" + "A" * 44 + "_AAAA"
+
+    class TooManyConnectionsError(Exception):
+        pass
+
+    for db_exc in (
+        OperationalError("SELECT 1", {}, Exception("connection failed")),
+        DBAPIError.instance(
+            "SELECT 1",
+            {},
+            TooManyConnectionsError(
+                "remaining connection slots are reserved for roles with the SUPERUSER attribute"
+            ),
+            Exception,
+        ),
+    ):
+        api_key_service.api_key_repository.get_by_prefix_with_relation = AsyncMock(
+            side_effect=db_exc
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            await api_key_service.get_from_presented_key(presented_key)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.headers == {"Retry-After": "5"}
+
+
+@pytest.mark.asyncio
+async def test_get_execution_route_raises_503_on_retryable_db_error(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import HTTPException
+    from document_ia_api.api.routes.v1 import executions as executions_route
+    from document_ia_infra.data.organization.dto.organization_dto import (
+        OrganizationDTO,
+    )
+    from document_ia_infra.data.organization.enum.platform_role import PlatformRole
+    from document_ia_infra.exception.retryable_exception import RetryableException
+
+    class _FailingEventStoreService:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_last_event_for_execution_id(self, _exec_id: str) -> Any:
+            raise RetryableException(
+                Exception("remaining connection slots are reserved")
+            )
+
+    monkeypatch.setattr(
+        executions_route, "EventStoreService", _FailingEventStoreService
+    )
+    org = OrganizationDTO(
+        id=uuid4(),
+        name="Test Org",
+        contact_email="test@example.com",
+        platform_role=PlatformRole.STANDARD,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await executions_route.get_execution(
+            execution_id="exec-123",
+            organization=org,
+            db_session=db_session,
+            is_debug_mode=False,
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.headers == {"Retry-After": "5"}
+
+
+@pytest.mark.asyncio
+async def test_get_execution_does_not_return_503_on_non_transient_or_local_file_errors(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import HTTPException
+    from sqlalchemy.exc import DataError, ProgrammingError
+    from document_ia_api.api.routes.v1 import executions as executions_route
+    from document_ia_infra.data.organization.dto.organization_dto import (
+        OrganizationDTO,
+    )
+    from document_ia_infra.data.organization.enum.platform_role import PlatformRole
+
+    # 1. ApiKeyService must NOT return 503 on DataError / ProgrammingError
+    monkeypatch.setattr(
+        ApiKeyService, "get_from_presented_key", _REAL_GET_FROM_PRESENTED_KEY
+    )
+    api_key_service = ApiKeyService(db_session)
+    api_key_service.api_key_helper.get_key_prefix = MagicMock(return_value="ABCDEFGH")
+    presented_key = "dia_dev_2_ABCDEFGH_" + "A" * 44 + "_AAAA"
+
+    for non_transient_exc in (
+        DataError("SELECT 1", {}, ValueError("invalid UTF-8 byte sequence")),
+        ProgrammingError("SELECT bad_col", {}, RuntimeError("undefined column")),
+    ):
+        api_key_service.api_key_repository.get_by_prefix_with_relation = AsyncMock(
+            side_effect=non_transient_exc
+        )
+        result = await api_key_service.get_from_presented_key(presented_key)
+        assert result is None
+
+    # 2. get_execution must NOT return 503 on DataError / ProgrammingError (and must not leak str(e))
+    org = OrganizationDTO(
+        id=uuid4(),
+        name="Test Org",
+        contact_email="test@example.com",
+        platform_role=PlatformRole.STANDARD,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    for non_transient_exc in (
+        DataError("SELECT 1", {"secret": "LEAK"}, ValueError("invalid byte sequence")),
+        ProgrammingError("SELECT bad_col", {}, RuntimeError("undefined column")),
+    ):
+
+        class _NonTransientEventStoreService:
+            def __init__(self, _session: Any) -> None:
+                pass
+
+            async def get_last_event_for_execution_id(
+                self, _exec_id: str, exc: Exception = non_transient_exc
+            ) -> Any:
+                raise exc
+
+        monkeypatch.setattr(
+            executions_route, "EventStoreService", _NonTransientEventStoreService
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            await executions_route.get_execution(
+                execution_id="exec-123",
+                organization=org,
+                db_session=db_session,
+                is_debug_mode=False,
+            )
+
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.detail == "Internal server error"
+
+    # 3. get_execution must NOT return 503 on local FileNotFoundError (OSError) from workflow_repository
+    started_dto = EventDTO(
+        id=uuid4(),
+        workflow_id="wf-1",
+        execution_id="exec-123",
+        organization_id=org.id,
+        created_at=datetime.now(UTC),
+        event_type=EventType.WORKFLOW_EXECUTION_STARTED,
+        event={"version": 1},
+    )
+
+    class _OkEventStoreService:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_last_event_for_execution_id(self, _exec_id: str) -> EventDTO:
+            return started_dto
+
+    monkeypatch.setattr(executions_route, "EventStoreService", _OkEventStoreService)
+    monkeypatch.setattr(
+        executions_route.workflow_repository,
+        "get_workflow_by_id",
+        AsyncMock(side_effect=FileNotFoundError("workflows.json missing")),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await executions_route.get_execution(
+            execution_id="exec-123",
+            organization=org,
+            db_session=db_session,
+            is_debug_mode=False,
+        )
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Internal server error"
+
+
+@pytest.mark.asyncio
+async def test_verify_api_key_returns_rfc7807_503_problem_detail_on_db_outage(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from sqlalchemy.exc import OperationalError
+
+    from document_ia_api.api.exceptions.handler.exception_handlers import (
+        setup_exception_handlers,
+    )
+    from document_ia_api.api.routes.v1 import executions as executions_route
+    import inspect
+    from document_ia_api.api.auth import verify_api_key
+
+    monkeypatch.setattr(
+        ApiKeyService, "get_from_presented_key", _REAL_GET_FROM_PRESENTED_KEY
+    )
+
+    failing_session = AsyncMock(spec=AsyncSession)
+    failing_session.execute = AsyncMock(
+        side_effect=OperationalError("SELECT 1", {}, Exception("db unreachable"))
+    )
+    failing_session.rollback = AsyncMock()
+
+    async def _override_get_db():
+        yield failing_session
+
+    db_dep = (
+        inspect.signature(verify_api_key).parameters["db_session"].default.dependency
+    )
+    test_app = FastAPI()
+    setup_exception_handlers(test_app)
+    test_app.include_router(executions_route.router, prefix="/api/v1")
+    test_app.dependency_overrides[db_dep] = _override_get_db
+
+    # Valid v2 key format so ApiKeyHelper.get_key_prefix succeeds and hits the DB
+    monkeypatch.setattr(
+        "document_ia_api.application.services.api_key.api_key_helper.ApiKeyHelper.get_key_prefix",
+        lambda _self, _key: "ABCDEFGH",
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=test_app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/api/v1/executions/exec-123",
+            headers={"X-API-KEY": "dia_dev_2_ABCDEFGH_" + "A" * 44 + "_AAAA"},
+        )
+
+    assert response.status_code == 503
+    assert response.headers.get("retry-after") == "5"
+    body = response.json()
+    assert body["status"] == 503
+    assert isinstance(body["type"], str) and len(body["type"]) > 0
+    assert "code" in body
+    assert "title" in body
+    assert body["instance"] == "/api/v1/executions/exec-123"

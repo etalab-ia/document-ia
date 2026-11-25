@@ -1,6 +1,8 @@
 import logging
+import asyncio
 from datetime import datetime, timedelta
-from typing import Tuple
+from typing import Any, Awaitable, Tuple, cast
+from uuid import UUID
 
 from redis.exceptions import ConnectionError, TimeoutError
 
@@ -11,41 +13,64 @@ from document_ia_api.infra.redis.redis_connectivity_status import (
     RedisConnectivityStatus,
 )
 from document_ia_api.schemas.rate_limiting import RateLimitInfo
+from document_ia_api.api.exceptions.service_unavailable_exception import (
+    capacity_unavailable,
+)
 
 logger = logging.getLogger(__name__)
 
+RATE_LIMIT_SCRIPT = """
+local minute_key = KEYS[1]
+local daily_key = KEYS[2]
+local minute_limit = tonumber(ARGV[1])
+local daily_limit = tonumber(ARGV[2])
+local minute_ttl = tonumber(ARGV[3])
+local daily_ttl = tonumber(ARGV[4])
 
-# TODO: reset self.connection_attempts to 0 otherwise it will never reconnect
+local minute_count = tonumber(redis.call('GET', minute_key) or '0')
+local daily_count = tonumber(redis.call('GET', daily_key) or '0')
+
+if minute_count >= minute_limit or daily_count >= daily_limit then
+    return {0, minute_count, daily_count}
+end
+
+minute_count = redis.call('INCR', minute_key)
+if minute_count == 1 or redis.call('TTL', minute_key) < 0 then
+    redis.call('EXPIRE', minute_key, minute_ttl)
+end
+
+daily_count = redis.call('INCR', daily_key)
+if daily_count == 1 or redis.call('TTL', daily_key) < 0 then
+    redis.call('EXPIRE', daily_key, daily_ttl)
+end
+
+return {1, minute_count, daily_count}
+"""
 
 
 class RedisService:
     """Redis service for caching and rate limiting operations."""
 
-    async def check_rate_limit(self, api_key: str) -> Tuple[bool, RateLimitInfo]:
+    async def check_rate_limit(self, key_id: UUID | str) -> Tuple[bool, RateLimitInfo]:
         """
-        Check rate limits for an API key.
+        Check rate limits for an API key by its identifier.
 
         Args:
-            api_key: The API key to check rate limits for
+            key_id: The API key identifier (UUID or str) to check rate limits for
 
         Returns:
             Tuple[bool, RateLimitInfo]: (is_allowed, rate_limit_info)
         """
-        connection = await redis_manager.get_connection()
-        if connection is None:
-            # If Redis is unavailable, allow the request but log the issue
-            logger.error(
-                "Redis unavailable - allowing request but rate limiting is disabled"
-            )
-            return True, RateLimitInfo(
-                limit_exceeded=False,
-                remaining_minute=settings.RATE_LIMIT_REQUESTS_PER_MINUTE,
-                remaining_daily=settings.RATE_LIMIT_REQUESTS_PER_DAY,
-                reset_minute=None,
-                reset_daily=None,
-            )
-
         try:
+            key_uuid = key_id if isinstance(key_id, UUID) else UUID(str(key_id))
+        except (ValueError, TypeError) as exc:
+            raise ValueError("key_id must be a valid UUID") from exc
+
+        key_identifier = str(key_uuid)
+        try:
+            connection = await redis_manager.get_connection()
+            if connection is None:
+                raise ConnectionError("Quota connection unavailable")
             now = datetime.now()
 
             # Calculate proper window boundaries for fixed window rate limiting
@@ -55,37 +80,41 @@ class RedisService:
             day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             next_day = day_start + timedelta(days=1)
 
-            minute_key = (
-                f"rate_limit:minute:{api_key}:{minute_start.strftime('%Y%m%d%H%M')}"
+            minute_key = f"rate_limit:minute:{key_identifier}:{minute_start.strftime('%Y%m%d%H%M')}"
+            daily_key = (
+                f"rate_limit:daily:{key_identifier}:{day_start.strftime('%Y%m%d')}"
             )
-            daily_key = f"rate_limit:daily:{api_key}:{day_start.strftime('%Y%m%d')}"
 
             # Use pipeline for atomic operations
             async with connection.pipeline() as pipe:
-                # Increment counters and get current values
-                await pipe.incr(minute_key)
-                await pipe.expire(minute_key, 60)  # Expire after 60 seconds
-                await pipe.incr(daily_key)
-                await pipe.expire(daily_key, 86400)  # Expire after 24 hours
+                await cast(
+                    Awaitable[Any],
+                    pipe.eval(
+                        RATE_LIMIT_SCRIPT,
+                        2,
+                        minute_key,
+                        daily_key,
+                        str(settings.RATE_LIMIT_REQUESTS_PER_MINUTE),
+                        str(settings.RATE_LIMIT_REQUESTS_PER_DAY),
+                        "60",
+                        "86400",
+                    ),
+                )
+                results = await asyncio.wait_for(pipe.execute(), timeout=5)
+                eval_result = results[0]
+                is_allowed = bool(int(eval_result[0]))
+                minute_count = int(eval_result[1])
+                daily_count = int(eval_result[2])
 
-                # Get current values
-                await pipe.get(minute_key)
-                await pipe.get(daily_key)
-
-                results = await pipe.execute()
-
-                minute_count = int(results[4])
-                daily_count = int(results[5])
-
-            # Check limits
-            minute_exceeded = minute_count > settings.RATE_LIMIT_REQUESTS_PER_MINUTE
-            daily_exceeded = daily_count > settings.RATE_LIMIT_REQUESTS_PER_DAY
-
-            if minute_exceeded or daily_exceeded:
+            if not is_allowed:
                 logger.warning(
-                    f"Rate limit exceeded for API key {api_key[:8]}... - "
-                    f"Minute: {minute_count}/{settings.RATE_LIMIT_REQUESTS_PER_MINUTE}, "
-                    f"Daily: {daily_count}/{settings.RATE_LIMIT_REQUESTS_PER_DAY}"
+                    "Rate limit exceeded for API key identifier %s - "
+                    "Minute: %s/%s, Daily: %s/%s",
+                    key_identifier,
+                    minute_count,
+                    settings.RATE_LIMIT_REQUESTS_PER_MINUTE,
+                    daily_count,
+                    settings.RATE_LIMIT_REQUESTS_PER_DAY,
                 )
                 return False, RateLimitInfo(
                     limit_exceeded=True,
@@ -107,26 +136,9 @@ class RedisService:
                 reset_daily=next_day.isoformat(),
             )
 
-        except (ConnectionError, TimeoutError) as e:
-            logger.error(f"Redis error during rate limit check: {e}")
-            # Allow request if Redis fails
-            return True, RateLimitInfo(
-                limit_exceeded=False,
-                remaining_minute=settings.RATE_LIMIT_REQUESTS_PER_MINUTE,
-                remaining_daily=settings.RATE_LIMIT_REQUESTS_PER_DAY,
-                reset_minute=None,
-                reset_daily=None,
-            )
         except Exception as e:
-            logger.error(f"Unexpected error during rate limit check: {e}")
-            # Allow request on unexpected errors
-            return True, RateLimitInfo(
-                limit_exceeded=False,
-                remaining_minute=settings.RATE_LIMIT_REQUESTS_PER_MINUTE,
-                remaining_daily=settings.RATE_LIMIT_REQUESTS_PER_DAY,
-                reset_minute=None,
-                reset_daily=None,
-            )
+            logger.error("Quota check unavailable: %s", type(e).__name__)
+            raise capacity_unavailable() from e
 
     async def check_connectivity(self) -> RedisConnectivityStatus:
         """
@@ -170,7 +182,8 @@ class RedisService:
                     connectivity_status.nb_execution_to_process = None
             except Exception as lag_err:
                 logger.error(
-                    f"Failed to check event stream lag during connectivity check: {lag_err}"
+                    "Failed to check event stream lag during connectivity check: %s",
+                    lag_err,
                 )
 
         except (ConnectionError, TimeoutError) as e:
@@ -229,7 +242,7 @@ class RedisService:
                 except Exception:
                     return 0, 0
             else:
-                logger.error(f"Error checking Redis stream groups: {e}")
+                logger.error("Error checking Redis stream groups: %s", e)
                 return None, None
 
     async def close(self):

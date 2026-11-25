@@ -20,7 +20,10 @@ from document_ia_infra.data.event.schema.event import (
     EventStoreRecord,
     EventStream,
 )
-from document_ia_infra.data.event.schema.mappers.event_mapper import convert_event_dto
+from document_ia_infra.data.event.schema.mappers.event_mapper import (
+    convert_event_dto,
+    decode_event_dto,
+)
 from document_ia_infra.data.event.schema.workflow.workflow_execution_completed_event import (
     CompletedEventResult,
     WorkflowExecutionCompletedEvent,
@@ -66,9 +69,29 @@ class EventStoreService:
             )
             raise
 
+    async def get_workflow_started_event(
+        self, execution_id: str
+    ) -> tuple[EventDTO, WorkflowExecutionStartedEvent] | None:
+        """Retrieve the started event for an execution."""
+        try:
+            event_dto = await self.repository.get_started_event_by_execution_id(
+                execution_id
+            )
+            if not event_dto:
+                return None
+            decoded = decode_event_dto(event_dto)
+            if isinstance(decoded, WorkflowExecutionStartedEvent):
+                return event_dto, decoded
+            return None
+        except Exception as e:
+            logger.error(
+                f"Failed to get started event for execution_id {execution_id}: {e}"
+            )
+            raise
+
     async def store_event(self, event: BaseEvent) -> EventStoreRecord:
         """
-        Store an event in the event store with automatic versioning.
+        Store an event with its workflow definition version.
 
         Args:
             event: The event to store
@@ -191,7 +214,7 @@ class EventStoreService:
         classification_parameters: Optional[ClassificationParameters] = None,
         extraction_parameters: Optional[ExtractionParameters] = None,
         workflow_configuration: Optional[WorkflowV2Dto] = None,
-        event_version: int = 1,
+        workflow_version: int = 1,
     ) -> WorkflowExecutionStartedEvent:
         """Create a WorkflowExecutionStartedEvent."""
         return WorkflowExecutionStartedEvent(
@@ -199,7 +222,7 @@ class EventStoreService:
             execution_id=execution_id,
             organization_id=organization_id,
             created_at=datetime.now(),
-            version=event_version,
+            version=workflow_version,
             s3_file_info=file_info,
             file_url=file_url,
             metadata=metadata,
@@ -226,7 +249,7 @@ class EventStoreService:
             execution_id=execution_id,
             organization_id=organization_id,
             created_at=datetime.now(),
-            version=1,  # Will be updated when stored
+            version=1,
             step_name=step_name,
             step_result=step_result,
             execution_time_ms=execution_time_ms,
@@ -243,7 +266,7 @@ class EventStoreService:
         output_summary: Dict[str, Any],
         steps_completed: int,
         workflow_metadata: Optional[list[Any]] = None,
-        event_version: int = 1,
+        workflow_version: int = 1,
     ) -> WorkflowExecutionCompletedEvent:
         """Create a WorkflowExecutionCompletedEvent."""
         return WorkflowExecutionCompletedEvent(
@@ -252,7 +275,7 @@ class EventStoreService:
             organization_id=organization_id,
             execution_id=execution_id,
             created_at=datetime.now(UTC),
-            version=event_version,
+            version=workflow_version,
             final_result=final_result,
             total_processing_time_ms=total_processing_time_ms,
             output_summary=output_summary,
@@ -269,19 +292,27 @@ class EventStoreService:
         error_message: str,
         failed_step: Optional[str] = None,
         retry_count: int = 0,
+        workflow_version: int = 1,
+        is_terminal: bool = True,
     ) -> WorkflowExecutionFailedEvent:
-        """Create a WorkflowExecutionFailedEvent."""
+        """Create a WorkflowExecutionFailedEvent.
+
+        `workflow_version` doit correspondre à celui de l'événement de démarrage :
+        la consultation d'une exécution choisit le dépôt de définitions de
+        workflows à partir de la version du dernier événement.
+        """
         return WorkflowExecutionFailedEvent(
             event_id=uuid4(),
             workflow_id=workflow_id,
             organization_id=organization_id,
             execution_id=execution_id,
             created_at=datetime.now(UTC),
-            version=1,  # Will be updated when stored
+            version=workflow_version,
             error_type=error_type,
             error_message=error_message,
             failed_step=failed_step,
             retry_count=retry_count,
+            is_terminal=is_terminal,
         )
 
     # High-level workflow event orchestration methods
@@ -297,7 +328,7 @@ class EventStoreService:
         classification_parameters: Optional[ClassificationParameters] = None,
         extraction_parameters: Optional[ExtractionParameters] = None,
         workflow_configuration: Optional[WorkflowV2Dto] = None,
-        event_version: int = 1,
+        workflow_version: int = 1,
     ) -> EventStoreRecord:
         """Emit and store a workflow started event."""
         event = self.create_workflow_started_event(
@@ -310,7 +341,7 @@ class EventStoreService:
             classification_parameters=classification_parameters,
             extraction_parameters=extraction_parameters,
             workflow_configuration=workflow_configuration,
-            event_version=event_version,
+            workflow_version=workflow_version,
         )
         return await self.store_event(event)
 
@@ -346,7 +377,7 @@ class EventStoreService:
         output_summary: Dict[str, Any],
         steps_completed: int,
         workflow_metadata: Optional[list[Any]] = None,
-        event_version: int = 1,
+        workflow_version: int = 1,
     ) -> EventStoreRecord:
         """Emit and store a workflow completed event."""
         event = self.create_workflow_completed_event(
@@ -358,7 +389,7 @@ class EventStoreService:
             output_summary=output_summary,
             steps_completed=steps_completed,
             workflow_metadata=workflow_metadata,
-            event_version=event_version,
+            workflow_version=workflow_version,
         )
         return await self.store_event(event)
 
@@ -371,6 +402,8 @@ class EventStoreService:
         error_message: str,
         failed_step: Optional[str] = None,
         retry_count: int = 0,
+        workflow_version: int = 1,
+        is_terminal: bool = True,
     ) -> EventStoreRecord:
         """Emit and store a workflow failed event."""
         event = self.create_workflow_failed_event(
@@ -381,5 +414,7 @@ class EventStoreService:
             error_message=error_message,
             failed_step=failed_step,
             retry_count=retry_count,
+            workflow_version=workflow_version,
+            is_terminal=is_terminal,
         )
         return await self.store_event(event)

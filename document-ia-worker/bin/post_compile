@@ -4,46 +4,26 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MODEL_SLUG_DIR="$APP_ROOT/.models"
-MODEL_SLUG_PATH="$MODEL_SLUG_DIR/yolov8m-world.pt"
-TESSDATA_DIR="$MODEL_SLUG_DIR/tessdata"
-FRA_TRAINEDDATA_PATH="$TESSDATA_DIR/fra.traineddata"
-
-echo "[post_compile] copy lib to vendor folder"
-cd "$APP_ROOT"
-mkdir -p vendor
-cp -r "$APP_ROOT/../document-ia-schemas" vendor/
-cp -r "$APP_ROOT/../document-ia-infra" vendor/
 
 export UV_SYSTEM_PYTHON=1
 
-echo "[post_compile] install local lib"
-uv pip install -e vendor/document-ia-schemas
-uv pip install -e vendor/document-ia-infra
+# Le monorepo est un unique workspace uv (un seul uv.lock à la racine). `uv sync`
+# du buildpack a donc déjà installé document-ia-schemas et document-ia-infra dans
+# le virtualenv, en copies réelles puisque UV_NO_EDITABLE=1 est défini sur l'app.
+# L'ancienne copie dans vendor/ + `uv pip install -e` n'est plus nécessaire et
+# échouerait de toute façon : ces paquets se déclarent désormais membres du
+# workspace (tool.uv.sources.* = { workspace = true }).
+echo "[post_compile] vérification des libs locales installées par le workspace"
+uv run --no-project python - <<'PY'
+import importlib.util
 
-mkdir -p "$MODEL_SLUG_DIR" "$TESSDATA_DIR"
+for module in ("document_ia_schemas", "document_ia_infra"):
+    if importlib.util.find_spec(module) is None:
+        raise SystemExit(f"[post_compile] {module} est absent du virtualenv")
+PY
 
-if [ ! -f "$MODEL_SLUG_PATH" ]; then
-  echo "[post_compile] Downloading YOLO-World model to $MODEL_SLUG_PATH"
-  uv run python -c "from ultralytics import YOLOWorld; YOLOWorld('$MODEL_SLUG_PATH')"
-fi
-
-echo "[post_compile] YOLO-World model bundled at $MODEL_SLUG_PATH"
-
-QRDET_DIR="$MODEL_SLUG_DIR/qrdet"
-mkdir -p "$QRDET_DIR"
-
-if [ ! -f "$QRDET_DIR/qrdet-s.pt" ]; then
-  echo "[post_compile] Downloading QRDet model to $QRDET_DIR"
-  uv run python -c "from qrdet import QRDetector; QRDetector(model_size='s', weights_folder='$QRDET_DIR')"
-fi
-
-echo "[post_compile] QRDet model bundled at $QRDET_DIR"
-
-if [ ! -f "$FRA_TRAINEDDATA_PATH" ]; then
-  echo "[post_compile] Downloading French Tesseract data to $FRA_TRAINEDDATA_PATH"
-  curl -fL --retry 3 -o "$FRA_TRAINEDDATA_PATH" \
-    https://github.com/tesseract-ocr/tessdata_fast/raw/main/fra.traineddata
-  chmod 0644 "$FRA_TRAINEDDATA_PATH"
-fi
-
-echo "[post_compile] French Tesseract data bundled at $FRA_TRAINEDDATA_PATH"
+echo "[post_compile] Downloading and verifying pinned model artifacts in $MODEL_SLUG_DIR"
+PYTHONPATH="$APP_ROOT/src" uv run --no-project python -m document_ia_worker.core.model_artifacts \
+  --download-and-verify \
+  --models-dir "$MODEL_SLUG_DIR"
+echo "[post_compile] All model artifacts verified in $MODEL_SLUG_DIR"

@@ -1,73 +1,27 @@
+import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import cast
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from document_ia_api.application.services.api_key.api_key_helper import ApiKeyHelper
+from document_ia_api.application.services.api_key.api_key_service import ApiKeyService
 from document_ia_api.core.config import api_key_settings
 from document_ia_infra.data.api_key.dto.api_key_dto import ApiKeyDTO
 from document_ia_infra.data.api_key.enum.api_key_status import ApiKeyStatus
+from document_ia_infra.data.organization.dto.organization_dto import OrganizationDTO
+from document_ia_infra.data.organization.enum.platform_role import PlatformRole
+
+_REAL_GET_FROM_PRESENTED_KEY = ApiKeyService.get_from_presented_key
+
+LEGACY_V1_KEY = "dia_dev_1_WMBUIIAK_WMBUIIAK2QQFKWQ5S7YPQZIUTFHQ2KKNFKPESOLLCQVME2NJFZUQ_BYMQ"  # gitleaks:allow
+LEGACY_V1_HASH = "$argon2id$v=19$m=65536,t=2,p=4$dag2me5gKU9k/N65qZm1lA$edWO9fTYKHBSVbRmV3MnVGdIUPf1ULk+6gJZ66pWjgk"
 
 
-def test_generate_and_verify_api_key():
-    api_key_helper = ApiKeyHelper()
-
-    presented, prefix, chk, key_hash = api_key_helper.generate_new_api_key()
-
-    assert isinstance(presented, str) and presented
-    assert isinstance(prefix, str) and len(prefix) == 8
-    assert isinstance(chk, str) and len(chk) == 4
-    assert isinstance(key_hash, str) and key_hash
-
-    # Regex should match the generated key
-    assert api_key_helper.key_re.match(presented) is not None
-
-    # Check that ENV and VERSION are present in the string
-    assert f"dia_{api_key_settings.APP_ENV}_{api_key_settings.API_KEY_VERSION}_" in presented
-
-def test_verify_api_key_with_valid_key():
-    api_key_helper = ApiKeyHelper()
-    checked_api_key = "dia_dev_1_WMBUIIAK_WMBUIIAK2QQFKWQ5S7YPQZIUTFHQ2KKNFKPESOLLCQVME2NJFZUQ_BYMQ"
-    record = ApiKeyDTO(
-        id=uuid.uuid4(),
-        organization_id=uuid.uuid4(),
-        organization=None,
-        key_hash="$argon2id$v=19$m=65536,t=2,p=4$dag2me5gKU9k/N65qZm1lA$edWO9fTYKHBSVbRmV3MnVGdIUPf1ULk+6gJZ66pWjgk",
-        prefix="WMBUIIAK",
-        status=ApiKeyStatus.ACTIVE,
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-    )
-
-    is_valid = api_key_helper.verify_api_key(checked_api_key, record)
-
-    assert isinstance(is_valid, bool) and is_valid
-
-def test_verify_api_key_with_invalid_key():
-    api_key_helper = ApiKeyHelper()
-    checked_api_key = "dia_dev_1_WMBUIIAK_WMBUIIAK2AAFKWQ5S7YPQZIUTFHQ2KKNFKPESOLLCQVME2NJFZUQ_BYMQ"
-    record = ApiKeyDTO(
-        id=uuid.uuid4(),
-        organization_id=uuid.uuid4(),
-        organization=None,
-        key_hash="$argon2id$v=19$m=65536,t=2,p=4$dag2me5gKU9k/N65qZm1lA$edWO9fTYKHBSVbRmV3MnVGdIUPf1ULk+6gJZ66pWjgk",
-        prefix="WMBUIIAK",
-        status=ApiKeyStatus.ACTIVE,
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-    )
-
-    is_valid = api_key_helper.verify_api_key(checked_api_key, record)
-
-    assert isinstance(is_valid, bool) and not is_valid
-
-def test_internal_get_key_encoding():
-    api_key_helper = ApiKeyHelper()
-    presented = "dia_dev_1_ID5RKLRX_ID5RKLRXQZM52XFUNGUHOBL7MAU3XQDRYN3R4HZH24DGGTFROBLA_5YTN"
-
-    _, _env, _version, prefix, body, chk = presented.split("_", 5)
-
-    key_hash, prefix = api_key_helper.get_key_encoding(presented)
-
-    record = ApiKeyDTO(
+def _make_record(prefix: str, key_hash: str) -> ApiKeyDTO:
+    return ApiKeyDTO(
         id=uuid.uuid4(),
         organization_id=uuid.uuid4(),
         organization=None,
@@ -78,6 +32,465 @@ def test_internal_get_key_encoding():
         updated_at=datetime.now(),
     )
 
-    is_valid = api_key_helper.verify_api_key(presented, record)
 
-    assert isinstance(is_valid, bool) and is_valid
+def test_generate_and_verify_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    api_key_helper = ApiKeyHelper()
+
+    presented, prefix, chk, key_hash = api_key_helper.generate_new_api_key()
+
+    assert isinstance(presented, str) and presented
+    assert isinstance(prefix, str) and len(prefix) == 8
+    assert isinstance(chk, str) and len(chk) == 4
+    assert isinstance(key_hash, str) and key_hash
+
+    assert api_key_helper.key_re.match(presented) is not None
+    assert presented.startswith("dia_dev_2_")
+    assert api_key_helper.get_key_version(presented) == 2
+    assert not api_key_helper.is_legacy_v1_key(presented)
+
+    record = _make_record(prefix=prefix, key_hash=key_hash)
+    assert api_key_helper.verify_api_key(presented, record) is True
+
+
+def test_verify_api_key_with_valid_v1_legacy_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    api_key_helper = ApiKeyHelper()
+    record = _make_record(prefix="WMBUIIAK", key_hash=LEGACY_V1_HASH)
+
+    is_valid = api_key_helper.verify_api_key(LEGACY_V1_KEY, record)
+
+    assert is_valid is True
+    assert api_key_helper.is_legacy_v1_key(LEGACY_V1_KEY) is True
+
+
+def test_verify_api_key_with_invalid_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    api_key_helper = ApiKeyHelper()
+    checked_api_key = "dia_dev_1_WMBUIIAK_WMBUIIAK2AAFKWQ5S7YPQZIUTFHQ2KKNFKPESOLLCQVME2NJFZUQ_BYMQ"  # gitleaks:allow
+    record = _make_record(prefix="WMBUIIAK", key_hash=LEGACY_V1_HASH)
+
+    is_valid = api_key_helper.verify_api_key(checked_api_key, record)
+
+    assert is_valid is False
+
+
+def test_internal_get_key_encoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    api_key_helper = ApiKeyHelper()
+    presented = "dia_dev_1_ID5RKLRX_ID5RKLRXQZM52XFUNGUHOBL7MAU3XQDRYN3R4HZH24DGGTFROBLA_5YTN"  # gitleaks:allow
+
+    key_hash, prefix = api_key_helper.get_key_encoding(presented)
+    record = _make_record(prefix=prefix, key_hash=key_hash)
+
+    assert api_key_helper.verify_api_key(presented, record) is True
+
+
+def test_v2_cryptographic_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    api_key_helper = ApiKeyHelper()
+
+    _, _, _, prefix, body, v1_chk = LEGACY_V1_KEY.split("_", 5)
+    v2_payload = api_key_helper._get_signing_payload("dev", 2, prefix, body)
+    v1_payload = api_key_helper._get_signing_payload("dev", 1, prefix, body)
+
+    assert v2_payload == f"dia_dev_2_{prefix}_{body}"
+    assert v1_payload == body
+
+    v2_chk = api_key_helper._compute_checksum(v2_payload)
+    assert v2_chk != v1_chk
+    assert api_key_helper._compute_mac(v2_payload) != api_key_helper._compute_mac(
+        v1_payload
+    )
+
+    v2_key = f"dia_dev_2_{prefix}_{body}_{v2_chk}"
+    v2_hash, v2_prefix = api_key_helper.get_key_encoding(v2_key)
+    assert v2_prefix == prefix
+    assert api_key_helper.verify_api_key(v2_key, _make_record(v2_prefix, v2_hash))
+
+
+def test_v2_and_v1_encoding_bootstrap_coherence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "staging")
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    api_key_helper = ApiKeyHelper()
+
+    for version in (1, 2):
+        monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", version)
+        presented, prefix, _, key_hash = api_key_helper.generate_new_api_key()
+        assert presented.startswith(f"dia_staging_{version}_")
+        assert api_key_helper.get_key_prefix(presented) == prefix
+        assert api_key_helper.get_key_version(presented) == version
+
+        record = _make_record(prefix=prefix, key_hash=key_hash)
+        assert api_key_helper.verify_api_key(presented, record) is True
+
+        bootstrapped_hash, bootstrapped_prefix = api_key_helper.get_key_encoding(
+            presented
+        )
+        assert bootstrapped_prefix == prefix
+        assert api_key_helper.verify_api_key(
+            presented, _make_record(bootstrapped_prefix, bootstrapped_hash)
+        )
+
+
+def test_reject_env_mutation_on_v1_and_v2(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    api_key_helper = ApiKeyHelper()
+
+    v2_dev_key, prefix, _, v2_hash = api_key_helper.generate_new_api_key()
+    v2_record = _make_record(prefix=prefix, key_hash=v2_hash)
+    v1_record = _make_record(prefix="WMBUIIAK", key_hash=LEGACY_V1_HASH)
+
+    # Mutate env segment to prod while APP_ENV is dev
+    mutated_v2_to_prod = v2_dev_key.replace("dia_dev_2_", "dia_prod_2_", 1)
+    mutated_v1_to_prod = LEGACY_V1_KEY.replace("dia_dev_1_", "dia_prod_1_", 1)
+
+    for mutated in (mutated_v2_to_prod, mutated_v1_to_prod):
+        with pytest.raises(ValueError):
+            api_key_helper.get_key_prefix(mutated)
+        with pytest.raises(ValueError):
+            api_key_helper.get_key_encoding(mutated)
+
+    assert api_key_helper.verify_api_key(mutated_v2_to_prod, v2_record) is False
+    assert api_key_helper.verify_api_key(mutated_v1_to_prod, v1_record) is False
+
+    # Present valid dev keys against APP_ENV="prod"
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "prod")
+    for dev_key in (v2_dev_key, LEGACY_V1_KEY):
+        with pytest.raises(ValueError):
+            api_key_helper.get_key_prefix(dev_key)
+    assert api_key_helper.verify_api_key(v2_dev_key, v2_record) is False
+    assert api_key_helper.verify_api_key(LEGACY_V1_KEY, v1_record) is False
+
+
+def test_reject_version_mutation_and_v_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    api_key_helper = ApiKeyHelper()
+
+    v2_key, prefix, _, v2_hash = api_key_helper.generate_new_api_key()
+    v2_record = _make_record(prefix=prefix, key_hash=v2_hash)
+    v1_record = _make_record(prefix="WMBUIIAK", key_hash=LEGACY_V1_HASH)
+
+    invalid_versions = [
+        v2_key.replace("dia_dev_2_", "dia_dev_v2_", 1),
+        v2_key.replace("dia_dev_2_", "dia_dev_v1_", 1),
+        v2_key.replace("dia_dev_2_", "dia_dev_0_", 1),
+        v2_key.replace("dia_dev_2_", "dia_dev_3_", 1),
+        v2_key.replace("dia_dev_2_", "dia_dev_99_", 1),
+        v2_key.replace("dia_dev_2_", "dia_dev_02_", 1),
+        LEGACY_V1_KEY.replace("dia_dev_1_", "dia_dev_v1_", 1),
+    ]
+    for bad_key in invalid_versions:
+        with pytest.raises(ValueError):
+            api_key_helper.get_key_prefix(bad_key)
+        assert api_key_helper.verify_api_key(bad_key, v2_record) is False
+        assert api_key_helper.verify_api_key(bad_key, v1_record) is False
+
+    # Cross-version downgrade attack: v2 hash in DB, forged v1 key with valid v1 checksum
+    _, _, _, v2_prefix, v2_body, _ = v2_key.split("_", 5)
+    forged_v1_chk = api_key_helper._compute_checksum(v2_body)
+    forged_v1_key = f"dia_dev_1_{v2_prefix}_{v2_body}_{forged_v1_chk}"
+    assert api_key_helper.verify_api_key(forged_v1_key, v2_record) is False
+
+    # Cross-version upgrade attack: v1 hash in DB, forged v2 key with valid v2 checksum
+    _, _, _, v1_prefix, v1_body, _ = LEGACY_V1_KEY.split("_", 5)
+    forged_v2_payload = api_key_helper._get_signing_payload(
+        "dev", 2, v1_prefix, v1_body
+    )
+    forged_v2_chk = api_key_helper._compute_checksum(forged_v2_payload)
+    forged_v2_key = f"dia_dev_2_{v1_prefix}_{v1_body}_{forged_v2_chk}"
+    assert api_key_helper.verify_api_key(forged_v2_key, v1_record) is False
+
+
+def test_reject_prefix_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    api_key_helper = ApiKeyHelper()
+
+    v2_key, prefix, _, v2_hash = api_key_helper.generate_new_api_key()
+    v2_record = _make_record(prefix=prefix, key_hash=v2_hash)
+
+    wrong_prefix = "AAAAAAAA" if prefix != "AAAAAAAA" else "BBBBBBBB"
+    mutated_key = v2_key.replace(f"_{prefix}_", f"_{wrong_prefix}_", 1)
+
+    with pytest.raises(ValueError):
+        api_key_helper.get_key_prefix(mutated_key)
+    with pytest.raises(ValueError):
+        api_key_helper.get_key_encoding(mutated_key)
+    assert api_key_helper.verify_api_key(mutated_key, v2_record) is False
+
+
+def test_disable_v1_keys_via_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    api_key_helper = ApiKeyHelper()
+
+    v2_key, v2_prefix, _, v2_hash = api_key_helper.generate_new_api_key()
+    v2_record = _make_record(prefix=v2_prefix, key_hash=v2_hash)
+    v1_record = _make_record(prefix="WMBUIIAK", key_hash=LEGACY_V1_HASH)
+
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", False)
+
+    with pytest.raises(ValueError):
+        api_key_helper.get_key_prefix(LEGACY_V1_KEY)
+    with pytest.raises(ValueError):
+        api_key_helper.get_key_encoding(LEGACY_V1_KEY)
+    assert api_key_helper.verify_api_key(LEGACY_V1_KEY, v1_record) is False
+
+    # v2 key remains accepted
+    assert api_key_helper.get_key_prefix(v2_key) == v2_prefix
+    assert api_key_helper.verify_api_key(v2_key, v2_record) is True
+
+
+async def test_legacy_v1_logs_warning_without_secret(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+
+    monkeypatch.setattr(
+        ApiKeyService, "get_from_presented_key", _REAL_GET_FROM_PRESENTED_KEY
+    )
+    service = ApiKeyService(db_session=MagicMock())
+    v1_record = _make_record(prefix="WMBUIIAK", key_hash=LEGACY_V1_HASH)
+    service.api_key_repository.get_by_prefix_with_relation = AsyncMock(
+        return_value=v1_record
+    )
+
+    _, _, _, _, v1_body, _ = LEGACY_V1_KEY.split("_", 5)
+
+    with caplog.at_level(logging.WARNING):
+        result = await service.get_from_presented_key(LEGACY_V1_KEY)
+
+    assert result == v1_record
+    warning_messages = [
+        rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING
+    ]
+    assert len(warning_messages) == 1
+    msg = warning_messages[0]
+    assert str(v1_record.id) in msg
+    assert v1_record.prefix in msg
+    assert str(v1_record.organization_id) in msg
+    assert LEGACY_V1_KEY not in msg
+    assert v1_body not in msg
+
+    # v2 key must not emit legacy deprecation warning
+    caplog.clear()
+    v2_key, v2_prefix, _, v2_hash = service.api_key_helper.generate_new_api_key()
+    v2_record = _make_record(prefix=v2_prefix, key_hash=v2_hash)
+    service.api_key_repository.get_by_prefix_with_relation = AsyncMock(
+        return_value=v2_record
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result_v2 = await service.get_from_presented_key(v2_key)
+
+    assert result_v2 == v2_record
+    assert not [rec for rec in caplog.records if rec.levelno == logging.WARNING]
+
+
+def test_reject_trailing_newline_and_non_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    api_key_helper = ApiKeyHelper()
+
+    v2_key, v2_prefix, _, v2_hash = api_key_helper.generate_new_api_key()
+    v2_record = _make_record(prefix=v2_prefix, key_hash=v2_hash)
+    v1_record = _make_record(prefix="WMBUIIAK", key_hash=LEGACY_V1_HASH)
+
+    for key_with_nl in (v2_key + "\n", LEGACY_V1_KEY + "\n", cast(str, None)):
+        with pytest.raises(ValueError):
+            api_key_helper.get_key_prefix(key_with_nl)
+        assert api_key_helper.verify_api_key(key_with_nl, v2_record) is False
+        assert api_key_helper.verify_api_key(key_with_nl, v1_record) is False
+
+
+def test_generate_new_api_key_rejects_invalid_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_key_helper = ApiKeyHelper()
+
+    for bad_env in ("local", "", "development"):
+        monkeypatch.setattr(api_key_settings, "APP_ENV", bad_env)
+        monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+        with pytest.raises(ValueError, match="Unsupported APP_ENV"):
+            api_key_helper.generate_new_api_key()
+
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    for bad_version in (0, 3):
+        monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", bad_version)
+        with pytest.raises(ValueError, match="Unsupported API_KEY_VERSION"):
+            api_key_helper.generate_new_api_key()
+
+
+def test_v2_rejects_checksum_and_body_tampering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    api_key_helper = ApiKeyHelper()
+
+    v2_key, prefix, chk, v2_hash = api_key_helper.generate_new_api_key()
+    v2_record = _make_record(prefix=prefix, key_hash=v2_hash)
+    _, env, version_str, _, body, _ = v2_key.split("_", 5)
+
+    # Tamper checksum
+    bad_chk = chk[:-1] + ("A" if chk[-1] != "A" else "B")
+    tampered_chk_key = f"dia_{env}_{version_str}_{prefix}_{body}_{bad_chk}"
+    assert api_key_helper.verify_api_key(tampered_chk_key, v2_record) is False
+    with pytest.raises(ValueError, match="Invalid API key checksum"):
+        api_key_helper.get_key_encoding(tampered_chk_key)
+
+    # Tamper body (after prefix)
+    bad_body = body[:-1] + ("A" if body[-1] != "A" else "B")
+    tampered_body_key = f"dia_{env}_{version_str}_{prefix}_{bad_body}_{chk}"
+    assert api_key_helper.verify_api_key(tampered_body_key, v2_record) is False
+    with pytest.raises(ValueError, match="Invalid API key checksum"):
+        api_key_helper.get_key_encoding(tampered_body_key)
+
+
+async def test_service_rejects_invalid_keys_before_db_and_without_error_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    monkeypatch.setattr(
+        ApiKeyService, "get_from_presented_key", _REAL_GET_FROM_PRESENTED_KEY
+    )
+
+    service = ApiKeyService(db_session=MagicMock())
+    get_by_prefix_mock = AsyncMock()
+    service.api_key_repository.get_by_prefix_with_relation = get_by_prefix_mock
+
+    v2_key, _, _, _ = service.api_key_helper.generate_new_api_key()
+    invalid_keys = [
+        v2_key.replace("dia_dev_2_", "dia_prod_2_", 1),
+        v2_key.replace("dia_dev_2_", "dia_dev_v2_", 1),
+        v2_key.replace("dia_dev_2_", "dia_dev_99_", 1),
+        v2_key + "\n",
+    ]
+
+    with caplog.at_level(logging.ERROR):
+        for bad_key in invalid_keys:
+            assert await service.get_from_presented_key(bad_key) is None
+
+        monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", False)
+        assert await service.get_from_presented_key(LEGACY_V1_KEY) is None
+
+    get_by_prefix_mock.assert_not_called()
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
+
+
+def test_http_auth_and_rate_limit_integration(
+    monkeypatch: pytest.MonkeyPatch,
+    client_with_api_key_standard,
+    mock_redis_service,
+) -> None:
+    from document_ia_api.api import auth as auth_mod
+    from document_ia_infra.data.database import database_manager
+
+    monkeypatch.setattr(api_key_settings, "APP_ENV", "dev")
+    monkeypatch.setattr(api_key_settings, "API_KEY_VERSION", 2)
+    monkeypatch.setattr(api_key_settings, "API_KEY_ALLOW_V1", True)
+    monkeypatch.setattr(
+        auth_mod.ApiKeyService,
+        "get_from_presented_key",
+        _REAL_GET_FROM_PRESENTED_KEY,
+    )
+
+    async def _fake_async_get_db():
+        yield MagicMock()
+
+    client_with_api_key_standard.app.dependency_overrides[
+        database_manager.async_get_db
+    ] = _fake_async_get_db
+
+    now = datetime.now(timezone.utc)
+    org = OrganizationDTO(
+        id=uuid.uuid4(),
+        contact_email="test@example.org",
+        name="Test Org",
+        platform_role=PlatformRole.STANDARD,
+        created_at=now,
+        updated_at=now,
+    )
+
+    helper = ApiKeyHelper()
+    v2_key, v2_prefix, _, v2_hash = helper.generate_new_api_key()
+    v2_record = ApiKeyDTO(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        organization=org,
+        key_hash=v2_hash,
+        prefix=v2_prefix,
+        status=ApiKeyStatus.ACTIVE,
+        created_at=now,
+        updated_at=now,
+    )
+    v1_record = ApiKeyDTO(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        organization=org,
+        key_hash=LEGACY_V1_HASH,
+        prefix="WMBUIIAK",
+        status=ApiKeyStatus.ACTIVE,
+        created_at=now,
+        updated_at=now,
+    )
+
+    with patch(
+        "document_ia_api.application.services.api_key.api_key_service.ApiKeyRepository"
+    ) as mock_repo_cls:
+        mock_repo = mock_repo_cls.return_value
+        mock_repo.get_by_prefix_with_relation = AsyncMock()
+
+        # 1. Mutated env / version -> 401 before DB & before Redis rate limit
+        for bad_key in (
+            v2_key.replace("dia_dev_2_", "dia_prod_2_", 1),
+            v2_key.replace("dia_dev_2_", "dia_dev_v2_", 1),
+            v2_key + "\n",
+        ):
+            resp = client_with_api_key_standard.get(
+                "/api/test", headers={"X-API-KEY": bad_key}
+            )
+            assert resp.status_code == 401
+
+        mock_repo.get_by_prefix_with_relation.assert_not_called()
+        mock_redis_service.check_rate_limit.assert_not_called()
+
+        # 2. Valid v1 key -> 200 and rate limit keyed by internal UUID v1_record.id
+        mock_repo.get_by_prefix_with_relation.return_value = v1_record
+        resp_v1 = client_with_api_key_standard.get(
+            "/api/test", headers={"X-API-KEY": LEGACY_V1_KEY}
+        )
+        assert resp_v1.status_code == 200
+        mock_redis_service.check_rate_limit.assert_called_once_with(v1_record.id)
+
+        # 3. Valid v2 key -> 200 and rate limit keyed by internal UUID v2_record.id
+        mock_redis_service.check_rate_limit.reset_mock()
+        mock_repo.get_by_prefix_with_relation.return_value = v2_record
+        resp_v2 = client_with_api_key_standard.get(
+            "/api/test", headers={"X-API-KEY": v2_key}
+        )
+        assert resp_v2.status_code == 200
+        mock_redis_service.check_rate_limit.assert_called_once_with(v2_record.id)

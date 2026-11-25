@@ -1,15 +1,26 @@
 from pathlib import Path
 
 import cv2
-import fitz
+import pymupdf as fitz
 import numpy as np
 import pytest
 from pytesseract import get_tesseract_version
 
+import os
+
+from document_ia_worker.core.model_artifacts import (
+    _SYSTEM_TESSDATA_DIRS,
+    TESSERACT_FRA_ARTIFACT,
+    compute_file_sha256,
+    get_default_models_dir,
+    resolve_and_verify_tesseract_lang_data,
+)
 from document_ia_worker.workflow.step.extract_content_ocr.extract_content_ocr import (
     ExtractContentOcrStep,
 )
-from document_ia_worker.workflow.step.preprocess_file.preprocess_file import PreprocessFileStep
+from document_ia_worker.workflow.step.preprocess_file.preprocess_file import (
+    PreprocessFileStep,
+)
 from document_ia_worker.workflow.step.step_result.preprocess_file_result import (
     PreprocessFileResult,
 )
@@ -23,11 +34,24 @@ def _tesseract_available() -> bool:
         return False
 
 
+def _french_traineddata_available() -> bool:
+    if not _tesseract_available():
+        return False
+    env_prefix = os.environ.get("TESSDATA_PREFIX", "").strip()
+    if env_prefix:
+        prefix_path = Path(env_prefix)
+        return (prefix_path / TESSERACT_FRA_ARTIFACT.name).is_file() or (
+            prefix_path / "tessdata" / TESSERACT_FRA_ARTIFACT.name
+        ).is_file()
+    search_dirs = (get_default_models_dir() / "tessdata", *_SYSTEM_TESSDATA_DIRS)
+    return any((d / TESSERACT_FRA_ARTIFACT.name).is_file() for d in search_dirs)
+
+
 def _make_text_image(path: Path, text: str) -> Path:
     # Create a white image and draw high-contrast text, then save as PNG
-    img = np.full((160, 600), 255, dtype=np.uint8)
+    img = np.full((160, 900), 255, dtype=np.uint8)
     font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(img, text, (20, 100), font, 2.0, (0,), 3, cv2.LINE_AA)
+    cv2.putText(img, text, (20, 100), font, 1.6, (0,), 3, cv2.LINE_AA)
     path.parent.mkdir(parents=True, exist_ok=True)
     ok = cv2.imwrite(str(path), img)
     assert ok, f"Failed to write image at {path}"
@@ -35,10 +59,11 @@ def _make_text_image(path: Path, text: str) -> Path:
 
 
 class TestExtractContentOcrStep:
-
     @pytest.mark.skipif(not _tesseract_available(), reason="Tesseract not available")
     @pytest.mark.asyncio
-    async def test_ocr_from_pdf_fixture_two_pages_and_cleanup(self, main_workflow_context):
+    async def test_ocr_from_pdf_fixture_two_pages_and_cleanup(
+        self, main_workflow_context
+    ):
         """Run OCR starting from the PDF fixture via PreprocessFileStep, then ExtractContentOcrStep.
         Use the fixture as-is, assert we get OCR text for all pages, and verify cleanup removes temp files.
         """
@@ -63,7 +88,11 @@ class TestExtractContentOcrStep:
         )
 
         preprocess.inject_workflow_context(
-            {DownloadFileResult.__name__: DownloadFileResult(file_path=str(pdf_path), content_type="application/pdf")}
+            {
+                DownloadFileResult.__name__: DownloadFileResult(
+                    file_path=str(pdf_path), content_type="application/pdf"
+                )
+            }
         )
 
         # Execute preprocessing to generate page images
@@ -77,9 +106,13 @@ class TestExtractContentOcrStep:
         # Run OCR step on generated images
         ocr_step = ExtractContentOcrStep(main_workflow_context=main_workflow_context)
         ocr_step.tesseract_lang = "eng"
-        ocr_step.inject_workflow_context({
-            PreprocessFileResult.__name__: PreprocessFileResult(output_files_path=preprocess_result.output_files_path)
-        })
+        ocr_step.inject_workflow_context(
+            {
+                PreprocessFileResult.__name__: PreprocessFileResult(
+                    output_files_path=preprocess_result.output_files_path
+                )
+            }
+        )
         ocr_result, ocr_meta = await ocr_step.execute()
 
         # Validate OCR output for all pages
@@ -88,7 +121,9 @@ class TestExtractContentOcrStep:
         )
         for i, page in enumerate(ocr_result.pages, start=1):
             assert page.has_failed is False, f"OCR failed on page {i}"
-            assert page.text is not None and page.text.strip() != "", f"Missing OCR text on page {i}"
+            assert page.text is not None and page.text.strip() != "", (
+                f"Missing OCR text on page {i}"
+            )
 
         # Cleanup and ensure temp dir is removed
         tmp_dir = Path(preprocess.tmp_folder_path)
@@ -96,9 +131,59 @@ class TestExtractContentOcrStep:
         await preprocess.cleanup(False)
         assert not tmp_dir.exists(), f"Temporary directory should be deleted: {tmp_dir}"
 
+    @pytest.mark.skipif(
+        not _french_traineddata_available(),
+        reason="Verified French Tesseract traineddata not available",
+    )
+    @pytest.mark.asyncio
+    async def test_ocr_french_traineddata_sha256_and_corpus_parity(
+        self, tmp_path, main_workflow_context
+    ):
+        """Verify that pinned fra.traineddata (tessdata_fast 4.1.0) matches its SHA-256
+        and produces deterministic OCR output on a French mini-corpus.
+        """
+        verified_fra_path = resolve_and_verify_tesseract_lang_data("fra")
+        assert verified_fra_path is not None
+        assert compute_file_sha256(verified_fra_path) == TESSERACT_FRA_ARTIFACT.sha256
+
+        corpus = [
+            ("page_1.png", "REPUBLIQUE FRANCAISE", "REPUBLIQUE"),
+            ("page_2.png", "ATTESTATION DE DOMICILE", "ATTESTATION"),
+            ("page_3.png", "BULLETIN DE SALAIRE 2026", "BULLETIN"),
+        ]
+        image_paths = [
+            str(_make_text_image(tmp_path / filename, text))
+            for filename, text, _ in corpus
+        ]
+
+        step = ExtractContentOcrStep(main_workflow_context=main_workflow_context)
+        assert step.tesseract_lang == "fra"
+        step.inject_workflow_context(
+            {
+                PreprocessFileResult.__name__: PreprocessFileResult(
+                    output_files_path=image_paths
+                )
+            }
+        )
+
+        result_1, _ = await step.execute()
+        result_2, _ = await step.execute()
+
+        assert len(result_1.pages) == len(corpus)
+        for idx, (_, _, expected_token) in enumerate(corpus):
+            page_1 = result_1.pages[idx]
+            page_2 = result_2.pages[idx]
+            assert page_1.has_failed is False
+            assert page_1.text is not None
+            assert expected_token in page_1.text.upper()
+            # Deterministic parity across runs with pinned fra.traineddata
+            assert page_1.text == page_2.text
+
     @pytest.mark.skipif(not _tesseract_available(), reason="Tesseract not available")
     @pytest.mark.asyncio
-    async def test_ocr_timeout_is_handled(self, monkeypatch, tmp_path, main_workflow_context):
+    async def test_ocr_timeout_is_handled(
+        self, monkeypatch, tmp_path, main_workflow_context
+    ):
         """Simulate a Tesseract timeout and verify the exception path is handled gracefully.
         The first page raises a timeout-like exception; the second succeeds.
         """
@@ -110,15 +195,22 @@ class TestExtractContentOcrStep:
         # Build context and OCR step
         step = ExtractContentOcrStep(main_workflow_context=main_workflow_context)
         step.tesseract_lang = "eng"
-        step.tesseract_timeout = 1  # very small, though we simulate timeout via monkeypatch
+        step.tesseract_timeout = (
+            1  # very small, though we simulate timeout via monkeypatch
+        )
 
         # Inject PreprocessFileResult with both images
         step.inject_workflow_context(
-            {PreprocessFileResult.__name__: PreprocessFileResult(output_files_path=[str(img_timeout), str(img_ok)])}
+            {
+                PreprocessFileResult.__name__: PreprocessFileResult(
+                    output_files_path=[str(img_timeout), str(img_ok)]
+                )
+            }
         )
 
         # Monkeypatch image_to_string in the module under test to simulate a timeout on first call
         import document_ia_worker.workflow.step.extract_content_ocr.extract_content_ocr as ocr_mod
+
         call_count = {"n": 0}
 
         def fake_image_to_string(img, output_type, config, lang, timeout):  # noqa: ANN001

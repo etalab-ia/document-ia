@@ -1,11 +1,22 @@
-from enum import Enum
-from typing import Any, Annotated, Union, Literal, Optional
-
-from pydantic import BaseModel, Field
 from datetime import date
+from enum import Enum
+from typing import Annotated, Any, Literal, Optional, Union
 
+from fr_2ddoc_parser.model.models import VerificationStatus
+from pydantic import BaseModel, Field
 
 from document_ia_infra.core.model.typed_generic_model import GenericProperty
+
+__all__ = [
+    "Ants2DDoc",
+    "BarcodeModel",
+    "BarcodePosition",
+    "BarcodeType",
+    "BarcodeVariant",
+    "DataMatrix",
+    "QrCode",
+    "VerificationStatus",
+]
 
 
 class BarcodeType(str, Enum):
@@ -35,6 +46,10 @@ class Ants2DDoc(BarcodeModel):
     type: Literal[BarcodeType.TWO_D_DOC] = BarcodeType.TWO_D_DOC
     position: BarcodePosition
     is_valid: bool
+    verification_status: Optional[VerificationStatus] = Field(
+        default=None,
+        description="Cryptographic and PKI verification status of the 2D-Doc signature.",
+    )
     raw_data: Optional[Any] = Field(default=None, json_schema_extra={"x-mask": True})
     typed_data: list[GenericProperty] = Field(
         default=[], json_schema_extra={"x-mask": True}

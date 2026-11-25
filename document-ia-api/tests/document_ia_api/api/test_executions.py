@@ -243,7 +243,8 @@ class TestExecutions:
 
         assert response.status_code == 500
         body = response.json()
-        assert body["detail"] == "db down"
+        assert body["detail"] == "Internal server error"
+        assert "db down" not in response.text
 
     def test_get_execution_missing_api_key(self, client_without_api_key, execution_id):
         response = client_without_api_key.get(f"/api/v1/executions/{execution_id}")

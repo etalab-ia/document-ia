@@ -1,49 +1,69 @@
 import logging
+import math
+from datetime import datetime
 from typing import cast
 
 from fastapi import Depends, Request
 from fastapi import Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
-from document_ia_api.api.auth import get_api_key
+from document_ia_api.api.auth import verify_api_key
 from document_ia_api.api.exceptions.rate_limit_exception import RateLimitException
 from document_ia_api.infra.redis_service import redis_service
 from document_ia_api.schemas.rate_limiting import RateLimitInfo
+from document_ia_infra.data.api_key.dto.api_key_dto import ApiKeyDTO
 
 logger = logging.getLogger(__name__)
 
 
 async def check_rate_limit(
-    request: Request, api_key: str = Depends(get_api_key)
+    request: Request,
+    api_key_dto: ApiKeyDTO = Depends(verify_api_key),
 ) -> RateLimitInfo:
     """
-    Rate limiting dependency that checks if the API key has exceeded rate limits.
+    Rate limiting dependency that checks if the authenticated API key has exceeded rate limits.
 
     Args:
         request: FastAPI request object
-        api_key: The authenticated API key (automatically validated)
+        api_key_dto: The authenticated API key DTO (automatically validated)
 
     Returns:
         RateLimitInfo containing rate limit information
 
     Raises:
-        HTTPException: If rate limit is exceeded
+        RateLimitException: If rate limit is exceeded
     """
-    is_allowed, rate_limit_info = await redis_service.check_rate_limit(api_key)
+    is_allowed, rate_limit_info = await redis_service.check_rate_limit(api_key_dto.id)
 
     # Store rate limit info in request state for middleware access
     request.state.rate_limit_info = rate_limit_info
 
     if not is_allowed:
-        # TODO: sanitize the api key in the logging service
-        logger.warning(f"Rate limit exceeded for API key {api_key[:8]}...")
+        org_id = getattr(getattr(request.state, "organization", None), "id", None)
+        url_obj = getattr(request, "url", None)
+        path = getattr(url_obj, "path", "unknown") if url_obj else "unknown"
+        logger.warning(
+            "Rate limit exceeded (organization_id=%s, path=%s)",
+            org_id,
+            path,
+        )
 
+        now = datetime.now()
+        resets: list[datetime] = []
+        if rate_limit_info.remaining_minute == 0 and rate_limit_info.reset_minute:
+            resets.append(datetime.fromisoformat(rate_limit_info.reset_minute))
+        if rate_limit_info.remaining_daily == 0 and rate_limit_info.reset_daily:
+            resets.append(datetime.fromisoformat(rate_limit_info.reset_daily))
+        retry_after = (
+            max(1, math.ceil((max(resets) - now).total_seconds())) if resets else 60
+        )
         raise RateLimitException(
             detail={
                 "error": "Rate limit exceeded",
                 "message": "Too many requests. Please try again later.",
                 "rate_limit_info": rate_limit_info.model_dump(),
-            }
+            },
+            headers={"Retry-After": str(retry_after)},
         )
 
     return rate_limit_info

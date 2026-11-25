@@ -102,7 +102,7 @@ async def list_webhooks(
         service = WebHookService(db_session)
         return await service.list_by_organization(organization_id)
     except Exception as err:
-        logger.error(f"Error listing webhooks: {err}")
+        logger.error("Error listing webhooks: %s", type(err).__name__)
         raise
 
 
@@ -178,10 +178,10 @@ async def create_webhook(
         return await service.create(
             organization_id=organization_id,
             url=payload.url,
-            headers=payload.headers or {},
+            headers=payload.headers,
         )
     except Exception as err:
-        logger.error(f"Error creating webhook: {err}")
+        logger.error("Error creating webhook: %s", type(err).__name__)
         raise
 
 
@@ -228,13 +228,13 @@ async def delete_webhook(
     webhook_id: UUID = Path(..., description="Webhook id (UUID)"),
     db_session: AsyncSession = Depends(database_manager.async_get_db),
 ) -> None:
-    logger.info(f"Deleting webhook {webhook_id} for organization {organization_id}")
+    logger.info("Deleting webhook %s for organization %s", webhook_id, organization_id)
     try:
         service = WebHookService(db_session)
-        await service.delete(webhook_id)
+        await service.delete(webhook_id, organization_id=organization_id)
         return None
     except HttpEntityNotFoundException:
         raise
     except Exception as err:
-        logger.error(f"Error deleting webhook: {err}")
+        logger.error("Error deleting webhook: %s", type(err).__name__)
         raise

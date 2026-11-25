@@ -4,6 +4,7 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+from document_ia_evals.components.auth_ui import enforce_page_auth
 
 from document_ia_evals.database.connection import init_db, test_db_connection
 from document_ia_evals.services.experiment_service import (
@@ -27,11 +28,12 @@ def format_datetime(dt_str: str) -> str:
     try:
         dt = datetime.fromisoformat(dt_str)
         return dt.strftime("%Y-%m-%d %H:%M")
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return dt_str
 
 
 def main():
+    enforce_page_auth(required_role="admin")
     """Main experiment history page."""
 
     st.title("📚 Experiment History")
