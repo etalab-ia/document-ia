@@ -1,8 +1,7 @@
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
-from fastapi import HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from document_ia_api.api.config import settings
@@ -119,6 +118,7 @@ router = APIRouter()
     tags=["Health"],
 )
 async def health_check(
+    request: Request,
     db: AsyncSession = Depends(database_manager.async_get_db),
 ) -> HealthCheckResponse:
     """
@@ -142,6 +142,11 @@ async def health_check(
 
         # Perform Redis connectivity check
         redis_connectivity = await redis_service.check_connectivity()
+        request.state.aggregator_metrics = {
+            "nb_execution_to_process": redis_connectivity.nb_execution_to_process,
+            "nb_execution_undelivered": redis_connectivity.nb_execution_undelivered,
+            "nb_execution_being_processed": redis_connectivity.nb_execution_being_processed,
+        }
 
         # Perform Database connectivity check
         database_connectivity = await database_service.check_database_connectivity(db)

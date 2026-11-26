@@ -442,7 +442,7 @@ async def test_start_aborted_during_save_failure_event_does_not_purge_s3(
     async def failing_execute():
         raise RuntimeError("Execution failed")
 
-    async def aborted_save_failure(_session, _exc):
+    async def aborted_save_failure(_session, _exc, **_kwargs):
         fake_tracker.is_aborted = True
         raise ProcessingAbortedException("Fenced by watchdog")
 
@@ -615,3 +615,145 @@ async def test_start_purges_s3_when_download_step_delete_returns_false(
     assert download_step.s3_cleanup_succeeded is False
     assert manager._s3_cleaned_up is False
     assert deleted_keys == [raw_s3_key, raw_s3_key]
+
+
+async def test_save_failure_event_preserves_workflow_version_v2(
+    _patch_workflow_resources, monkeypatch
+):
+    from datetime import datetime, UTC
+    from document_ia_worker.exception.workflow_step_exception import (
+        WorkflowStepException,
+    )
+    from document_ia_worker.workflow.main_workflow_context import (
+        MainWorkflowContext,
+    )
+
+    exec_id = str(uuid4())
+    started_v2_event = _event(
+        "WorkflowExecutionStarted",
+        payload={"version": 2},
+        execution_id=exec_id,
+    )
+    started_v2_event.workflow_id = "document-barcode-extraction-v2"
+
+    class _FakeEventRepo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_created_event_if_execution_not_completed_or_failed(
+            self, _exec_id: str
+        ) -> Any:
+            return started_v2_event
+
+    monkeypatch.setattr(workflow_manager_module, "EventRepository", _FakeEventRepo)
+    monkeypatch.setattr(
+        workflow_manager_module.workflow_v2_repository,
+        "get_raw_workflow_by_id",
+        lambda _wf_id: {"id": "document-barcode-extraction-v2"},
+    )
+
+    manager = WorkflowManager(
+        WorkflowExecutionMessage(workflow_execution_id=exec_id),
+        0,
+        is_last_retry=True,
+    )
+    manager.main_workflow_context = MainWorkflowContext(
+        execution_id=exec_id,
+        organization_id=None,
+        start_time=datetime.now(UTC),
+        steps_metadata=[],
+    )
+    assert manager.main_workflow_context.workflow_version is None
+
+    session = _FakeSession()
+
+    # Case A: before _prepare_workflow populates main_workflow_context.workflow_version,
+    # _save_failure_event falls back to self.event_dto.event["version"].
+    manager.event_dto = started_v2_event
+    await manager._save_failure_event(
+        session,  # type: ignore[arg-type]
+        WorkflowStepException("prepare_workflow", ValueError("Pre-prepare failure")),
+    )
+    assert len(_FakeEventStoreService.emitted) == 1
+    assert _FakeEventStoreService.emitted[0]["workflow_version"] == 2
+    assert _FakeEventStoreService.emitted[0]["failed_step"] == "prepare_workflow"
+
+    # Case B: after _prepare_workflow populates main_workflow_context.workflow_version == 2
+    _FakeEventStoreService.emitted.clear()
+    is_dup = await manager._prepare_workflow(session)  # type: ignore[arg-type]
+    assert is_dup is False
+    assert manager.main_workflow_context.workflow_version == 2
+
+    await manager._save_failure_event(
+        session,  # type: ignore[arg-type]
+        WorkflowStepException("DownloadFileStep", ValueError("SSRF blocked")),
+    )
+
+    assert len(_FakeEventStoreService.emitted) == 1
+    emitted = _FakeEventStoreService.emitted[0]
+    assert emitted["workflow_id"] == "document-barcode-extraction-v2"
+    assert emitted["execution_id"] == exec_id
+    assert emitted["error_type"] == "ValueError"
+    assert emitted["failed_step"] == "DownloadFileStep"
+    assert emitted["workflow_version"] == 2
+
+
+async def test_record_terminal_failure_finalizes_non_terminal_retry_scheduling_error(
+    _patch_workflow_resources, monkeypatch
+):
+    """When retry scheduling fails after a non-terminal failure, finalize DB event, purge S3, and notify webhook."""
+    from unittest.mock import AsyncMock
+    from pydantic import SecretStr
+
+    exec_id = str(uuid4())
+    raw_s3_key = "sensitive/requeue_error/document.pdf"
+    started_event_obj = SimpleNamespace(
+        s3_file_info=SimpleNamespace(s3_key=SecretStr(raw_s3_key)),
+    )
+    non_terminal_failed_event = _event(
+        "WorkflowExecutionFailed",
+        payload={
+            "error_type": "RetryableException",
+            "failed_step": "ocr",
+            "is_terminal": False,
+            "version": 2,
+        },
+        execution_id=exec_id,
+    )
+    _FakeEventStoreService.last_event = non_terminal_failed_event
+    _FakeEventStoreService.started_event = (
+        non_terminal_failed_event,
+        started_event_obj,
+    )
+
+    deleted_keys: list[str] = []
+
+    class _FakeS3Manager:
+        def delete_file(self, s3_key: str) -> bool:
+            deleted_keys.append(s3_key)
+            return True
+
+    monkeypatch.setattr(workflow_manager_module, "S3Manager", _FakeS3Manager)
+
+    manager = WorkflowManager(
+        WorkflowExecutionMessage(workflow_execution_id=exec_id),
+        retry_count=1,
+        is_last_retry=True,
+    )
+    webhook_mock = AsyncMock()
+    monkeypatch.setattr(manager, "_notify_webhook_execution_finished", webhook_mock)
+
+    await manager.record_watchdog_terminal_failure("error_requeueing_message")
+
+    assert len(_FakeEventStoreService.emitted) == 1
+    emitted = _FakeEventStoreService.emitted[0]
+    assert emitted["is_terminal"] is True
+    assert emitted["error_type"] == "RetrySchedulingError"
+    assert emitted["failed_step"] == "ocr"
+    assert emitted["workflow_version"] == 2
+    assert emitted["retry_count"] == 1
+    assert "error_requeueing_message" in emitted["error_message"]
+    assert deleted_keys == [raw_s3_key]
+    assert webhook_mock.await_count == 1
+    assert _FakeDatabaseManager.instances[-1].disposed is True
+    assert manager._webhook_redis_manager.closed is True

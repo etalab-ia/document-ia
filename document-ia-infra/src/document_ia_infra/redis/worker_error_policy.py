@@ -32,6 +32,8 @@ class WorkerErrorPolicy:
         delivery: StreamDelivery,
         requeue: Callable[..., Awaitable[bool]],
         retain: Callable[..., Awaitable[bool]],
+        on_terminal_failure: Callable[[str, dict[str, Any], str], None] | None = None,
+        has_scheduled_retry: Callable[[Redis, str], Awaitable[bool]] | None = None,
     ) -> None:
         reason = ""
         error = ""
@@ -63,7 +65,28 @@ class WorkerErrorPolicy:
                     if not await requeue(redis, entry_id, fields, retries + 1):
                         return
                 except Exception as exc:
-                    reason, error = "error_requeueing_message", type(exc).__name__
+                    if has_scheduled_retry is not None:
+                        try:
+                            if await has_scheduled_retry(redis, entry_id):
+                                logger.warning(
+                                    "Retry for message %s already scheduled after ambiguous error (%s); skipping DLQ",
+                                    entry_id,
+                                    type(exc).__name__,
+                                )
+                            else:
+                                reason, error = (
+                                    "error_requeueing_message",
+                                    type(exc).__name__,
+                                )
+                        except Exception as check_exc:
+                            logger.error(
+                                "Cannot verify retry state for message %s after requeue error (%s); leaving entry pending in PEL",
+                                entry_id,
+                                type(check_exc).__name__,
+                            )
+                            return
+                    else:
+                        reason, error = "error_requeueing_message", type(exc).__name__
             elif isinstance(exc, RetryableException):
                 reason = "max_retries_exceeded"
             else:
@@ -74,3 +97,5 @@ class WorkerErrorPolicy:
             await delivery.ack(redis, entry_id)
         except Exception as exc:
             logger.error("ACK failed for message %s: %s", entry_id, type(exc).__name__)
+        if reason == "error_requeueing_message" and on_terminal_failure is not None:
+            on_terminal_failure(entry_id, fields, reason)

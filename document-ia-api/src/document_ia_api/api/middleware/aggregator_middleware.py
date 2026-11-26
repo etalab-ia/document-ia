@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import time
 from typing import (
     Any,
@@ -26,6 +27,36 @@ from document_ia_infra.core.security.safe_logging import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_aggregator_metrics(
+    raw_metrics: Any,
+) -> dict[str, int | float | bool | None]:
+    """Sanitize opt-in route metrics to enforce the S2 safe-logging invariant.
+
+    Only non-empty string keys without control characters and safe scalar values
+    (None, bool, int, finite float) are retained. Strings, bytes, nested
+    structures, arbitrary objects, and non-finite floats (NaN/Inf) are strictly
+    rejected so secrets or PII can never leak through `request.state.aggregator_metrics`.
+    """
+    if not isinstance(raw_metrics, dict):
+        return {}
+
+    metrics_dict = cast(dict[object, object], raw_metrics)
+    safe_metrics: dict[str, int | float | bool | None] = {}
+    for key, value in metrics_dict.items():
+        if (
+            not isinstance(key, str)
+            or not key.strip()
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in key)
+        ):
+            continue
+        if value is None or type(value) is bool or type(value) is int:
+            safe_metrics[key] = value
+        elif type(value) is float and math.isfinite(value):
+            safe_metrics[key] = value
+
+    return safe_metrics
 
 
 async def get_request_payload_safely(request: Request) -> None:
@@ -81,18 +112,36 @@ async def get_request_payload_safely(request: Request) -> None:
         }
 
 
+def _extract_route_path(route_obj: Any) -> str | None:
+    """Extract a non-empty string path template from a route or route context."""
+    if route_obj is None:
+        return None
+    for attr in ("path", "path_format"):
+        candidate = getattr(route_obj, attr, None)
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
 def _get_route_paths(request: Request) -> str:
-    """Return route template or URL path."""
+    """Return full normalized route template or URL path.
+
+    In FastAPI >= 0.162 with included routers, ``scope["route"].path`` only
+    holds the sub-router relative path (e.g. ``"/health"``), whereas the full
+    effective route template (e.g. ``"/api/v1/health"``) is exposed via
+    ``scope["fastapi"]["effective_route_context"]``.
+    """
     normalized_path: str | None = None
     try:
         scope = cast(dict[str, Any], getattr(request, "scope", {}))
-        route = cast(Any, scope.get("route"))
-        if route is not None:
-            route_path = getattr(route, "path", None) or getattr(
-                route, "path_format", None
+        fastapi_scope = scope.get("fastapi")
+        if isinstance(fastapi_scope, dict):
+            fastapi_scope_dict = cast(dict[str, Any], fastapi_scope)
+            normalized_path = _extract_route_path(
+                fastapi_scope_dict.get("effective_route_context")
             )
-            if isinstance(route_path, str):
-                normalized_path = route_path
+        if not normalized_path:
+            normalized_path = _extract_route_path(scope.get("route"))
     except Exception:
         pass
     if not normalized_path:
@@ -182,6 +231,12 @@ def _emit_aggregation_log(
 
     if resp_body is not None:
         entry["response_body"] = resp_body
+
+    safe_metrics = _sanitize_aggregator_metrics(
+        getattr(request.state, "aggregator_metrics", None)
+    )
+    if safe_metrics:
+        entry["metrics"] = safe_metrics
 
     try:
         tags = {

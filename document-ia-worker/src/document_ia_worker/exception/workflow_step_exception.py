@@ -9,8 +9,7 @@ class WorkflowStepException(Exception):
 
     @staticmethod
     def is_retryable_exception(exception: Exception):
-        if isinstance(exception, WorkflowStepException) and isinstance(
-            exception.inner_exception, RetryableException
-        ):
-            return True
-        return False
+        return isinstance(exception, RetryableException) or (
+            isinstance(exception, WorkflowStepException)
+            and isinstance(exception.inner_exception, RetryableException)
+        )

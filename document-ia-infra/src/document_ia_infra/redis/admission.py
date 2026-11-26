@@ -17,16 +17,22 @@ class AdmissionUnavailableError(Exception):
     """Capacity is exhausted or cannot be established safely."""
 
 
-# No scans over retained history: inspect group lag, PEL summary and at most one
-# undelivered entry per queue. Redis TIME makes age independent of API clocks.
+# No scans over retained history: inspect group lag, PEL summary, at most one
+# undelivered entry per queue, and the bounded delayed-retry ZSET. Redis TIME
+# makes age independent of API clocks.
 ADMISSION_SCRIPT = """
 local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+local high = tonumber(ARGV[3])
+local low = tonumber(ARGV[4])
+local age_high = tonumber(ARGV[5]) * 1000
+local age_low = tonumber(ARGV[6]) * 1000
 local blocked = false
 for i = 1, 2 do
     local stream = KEYS[i]
     local state = KEYS[i + 2]
     local group_name = ARGV[i]
+    local delayed_key = stream .. ':retry_delayed'
     local groups = {}
     if redis.call('EXISTS', stream) == 1 then
         groups = redis.call('XINFO', 'GROUPS', stream)
@@ -38,39 +44,50 @@ for i = 1, 2 do
         if item['name'] == group_name then group = item end
     end
     local count = 0
-    local oldest = nil
+    local oldest_ms = nil
     if group then
         if type(group['lag']) ~= 'number' then
             return redis.error_reply('Admission lag unavailable')
         end
         count = group['lag'] + group['pending']
         local pending = redis.call('XPENDING', stream, group_name)
-        if pending[1] > 0 then oldest = pending[2] end
+        if pending[1] > 0 then
+            oldest_ms = tonumber(string.match(pending[2], '^(%d+)'))
+        end
         if group['lag'] > 0 then
             local waiting = redis.call('XRANGE', stream,
                 '(' .. group['last-delivered-id'], '+', 'COUNT', 1)
             if #waiting == 0 then
                 return redis.error_reply('Admission backlog unavailable')
             end
-            if not oldest or tonumber(string.match(waiting[1][1], '^(%d+)')) <
-                tonumber(string.match(oldest, '^(%d+)')) then
-                oldest = waiting[1][1]
+            local waiting_ms = tonumber(string.match(waiting[1][1], '^(%d+)'))
+            if waiting_ms and (not oldest_ms or waiting_ms < oldest_ms) then
+                oldest_ms = waiting_ms
             end
         end
     elseif redis.call('EXISTS', stream) == 1 then
         count = redis.call('XLEN', stream)
         local waiting = redis.call('XRANGE', stream, '-', '+', 'COUNT', 1)
-        if #waiting > 0 then oldest = waiting[1][1] end
+        if #waiting > 0 then
+            oldest_ms = tonumber(string.match(waiting[1][1], '^(%d+)'))
+        end
+    end
+    local delayed_count = redis.call('ZCARD', delayed_key)
+    count = count + delayed_count
+    if delayed_count > 0 and count < high then
+        local delayed_members = redis.call('ZRANGE', delayed_key, 0, -1)
+        for _, member in ipairs(delayed_members) do
+            local member_ms = tonumber(string.match(member, '^(%d+)%-'))
+            if member_ms and (not oldest_ms or member_ms < oldest_ms) then
+                oldest_ms = member_ms
+            end
+        end
     end
     local age = 0
-    if oldest then
-        age = math.max(0, now_ms - tonumber(string.match(oldest, '^(%d+)')))
+    if oldest_ms then
+        age = math.max(0, now_ms - oldest_ms)
     end
-    local high = tonumber(ARGV[3])
-    local low = tonumber(ARGV[4])
-    local age_high = tonumber(ARGV[5]) * 1000
-    local age_low = tonumber(ARGV[6]) * 1000
-    local retained = redis.call('XLEN', stream) + redis.call('XLEN', stream .. ':dlq')
+    local retained = redis.call('XLEN', stream) + redis.call('XLEN', stream .. ':dlq') + delayed_count
     local closed = redis.call('GET', state) == 'closed'
     if count >= high or age >= age_high or retained >= tonumber(ARGV[10]) then
         closed = true

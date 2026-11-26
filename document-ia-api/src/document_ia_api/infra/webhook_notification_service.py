@@ -178,6 +178,15 @@ class WebhookNotificationService:
                 event_dto = await event_repo.get_last_event_by_execution_id(
                     webhook_message.workflow_execution_id
                 )
+        except RetryableException:
+            logger.warning(
+                "Transient database error handling webhook notification (retry_count=%d): RetryableException",
+                retry_count,
+            )
+            await self._sleep_before_retry(
+                retry_count=retry_count, is_last_retry=is_last_retry
+            )
+            raise
         except (
             OperationalError,
             InterfaceError,

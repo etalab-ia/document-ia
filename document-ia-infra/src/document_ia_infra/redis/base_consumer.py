@@ -6,13 +6,14 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import secrets
 import socket
 import time
 from abc import ABC, abstractmethod
 from asyncio import Task
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Generic, TypeVar, cast
@@ -122,6 +123,9 @@ class BaseConsumer(ABC, Generic[T]):
         on_terminal_failure: (
             Callable[[str, dict[str, Any], str], Coroutine[Any, Any, None]] | None
         ) = None,
+        retry_backoff_delays_s: Sequence[float] = (0.0, 1.0, 10.0),
+        delayed_retry_poll_interval_s: float = 0.5,
+        requeue_on_shutdown: bool = False,
     ) -> None:
         if max_retry_number < 1:
             raise ValueError("max_retry_number must be >= 1")
@@ -139,12 +143,25 @@ class BaseConsumer(ABC, Generic[T]):
             raise ValueError("step_progress_timeout_s must be > 0")
         if lease_ttl_ms is not None and lease_ttl_ms <= 0:
             raise ValueError("lease_ttl_ms must be > 0")
+        if (
+            not math.isfinite(delayed_retry_poll_interval_s)
+            or delayed_retry_poll_interval_s <= 0
+        ):
+            raise ValueError("delayed_retry_poll_interval_s must be finite and > 0")
+        validated_backoff_delays: list[float] = []
+        for delay in retry_backoff_delays_s:
+            if not math.isfinite(delay) or delay < 0.0:
+                raise ValueError(
+                    "retry_backoff_delays_s elements must be finite and >= 0.0"
+                )
+            validated_backoff_delays.append(float(delay))
 
         self.redis: Redis | None = None
         self._custom_redis_manager = current_redis_manager
         self.listener_task: Task[Any] | None = None
         self.reclaimer_task: Task[Any] | None = None
         self.heartbeat_task: Task[Any] | None = None
+        self.delayed_retry_task: Task[Any] | None = None
         self.stop_flag = asyncio.Event()
 
         self.consumer_name = consumer_name
@@ -157,6 +174,8 @@ class BaseConsumer(ABC, Generic[T]):
         self.block_time = block_time  # en ms pour xreadgroup
         self.max_in_flight = max_in_flight
         self.max_retry_number = max_retry_number
+        self.retry_backoff_delays_s: tuple[float, ...] = tuple(validated_backoff_delays)
+        self.delayed_retry_poll_interval_s = float(delayed_retry_poll_interval_s)
         self.start_from = start_from
         self._reclaim_idle_ms_override = reclaim_idle_ms
         self.reclaim_batch_size = (
@@ -171,6 +190,7 @@ class BaseConsumer(ABC, Generic[T]):
         self.max_processing_time_s = max_processing_time_s
         self.step_progress_timeout_s = step_progress_timeout_s
         self.use_execution_lease = use_execution_lease
+        self.requeue_on_shutdown = requeue_on_shutdown
         self.on_terminal_failure = on_terminal_failure
         self.lease_ttl_ms = (
             lease_ttl_ms
@@ -267,10 +287,15 @@ class BaseConsumer(ABC, Generic[T]):
         self._heartbeat_interval_s_override = value
 
     def is_healthy(self) -> bool:
-        """Indique si les trois tâches de fond du consommateur sont actives."""
+        """Indique si les quatre tâches de fond du consommateur sont actives."""
         if self.stop_flag.is_set():
             return False
-        tasks = (self.listener_task, self.reclaimer_task, self.heartbeat_task)
+        tasks = (
+            self.listener_task,
+            self.reclaimer_task,
+            self.heartbeat_task,
+            self.delayed_retry_task,
+        )
         return all(t is not None and not t.done() for t in tasks)
 
     def _prepare_execution_resources(self) -> None:
@@ -279,35 +304,136 @@ class BaseConsumer(ABC, Generic[T]):
     async def _release_execution_resources(self) -> None:
         """Hook de libération des ressources propres au mode d'exécution."""
 
-    async def _abort_unfinished_futures(
+    def _reserve_unfinished_contexts_for_shutdown(
         self, unfinished: list[asyncio.Future[Any]]
-    ) -> None:
-        """Hook appelé en sortie de boucle sur les futures non terminées après vidange."""
-        if not self.use_execution_lease:
-            return
+    ) -> list[InFlightContext]:
+        """Fence et réserve les contextes en cours pour l'arrêt gracieux.
+
+        Doit être appelé de manière synchrone avant tout ``await`` (annulation de
+        tâches asyncio ou I/O Redis) afin d'empêcher ``_heartbeat_in_flight_entries``
+        de traiter ces entrées comme des timeouts watchdog (incrément de ``retries``
+        ou bascule en DLQ) pendant l'arrêt.
+        """
         unfinished_futures = set(unfinished)
-        for ctx in list(self._in_flight_contexts.values()):
-            if ctx.handled or not ctx.execution_id or not ctx.lease_token:
-                continue
-            if ctx.future is not None and ctx.future not in unfinished_futures:
-                continue
-            # Fencer le handler AVANT de libérer son bail : un handler threadé
-            # n'est pas interruptible et peut encore committer. Libérer le bail
-            # en premier laisserait une livraison concurrente démarrer pendant
-            # que l'ancien handler passe encore les gardes `is_aborted`.
+        contexts_to_abort = [
+            ctx
+            for ctx in list(self._in_flight_contexts.values())
+            if not ctx.handled
+            and (ctx.future is None or ctx.future in unfinished_futures)
+        ]
+        for ctx in contexts_to_abort:
+            # Fencer le handler AVANT toute I/O Redis (reconnexion, libération de
+            # bail ou remise en file) : un handler threadé n'est pas interruptible
+            # et peut encore committer. Libérer le bail en premier laisserait une
+            # livraison concurrente démarrer pendant que l'ancien handler passe
+            # encore les gardes `is_aborted`.
             if not ctx.tracker.is_aborted:
                 ctx.tracker.abort("shutdown")
             # Marquer la livraison comme traitée : le handler fencé peut revenir
             # « en succès » (il saute la persistance). Sans cette marque il serait
-            # acquitté normalement et l'exécution resterait inachevée, sans message
-            # en attente ni reprise planifiée. La laisser dans la PEL permet à la
-            # récupération de la reprendre.
+            # acquitté normalement ou intercepté par le watchdog de battement.
             ctx.handled = True
-            if self.redis is not None:
-                with contextlib.suppress(Exception):
-                    await self.delivery.release_lease(
-                        self.redis, ctx.execution_id, ctx.lease_token
+        return contexts_to_abort
+
+    async def _release_and_requeue_shutdown_contexts(
+        self, contexts_to_abort: list[InFlightContext]
+    ) -> None:
+        """Libère les baux et remet optionnellement en file les contextes réservés."""
+        if not contexts_to_abort:
+            return
+
+        redis_conn: Redis | None = self.redis
+        if redis_conn is None:
+            try:
+                redis_conn = await self._ensure_connection()
+            except Exception as conn_err:
+                logger.warning(
+                    "Failed to acquire Redis connection during shutdown abort: %s; "
+                    "leaving %d unfinished entry(ies) pending",
+                    type(conn_err).__name__,
+                    len(contexts_to_abort),
+                )
+                redis_conn = None
+
+        for ctx in contexts_to_abort:
+            lease_released = not self.use_execution_lease
+            if self.use_execution_lease and ctx.execution_id and ctx.lease_token:
+                if redis_conn is not None:
+                    try:
+                        lease_released = bool(
+                            await self.delivery.release_lease(
+                                redis_conn, ctx.execution_id, ctx.lease_token
+                            )
+                        )
+                        if not lease_released:
+                            logger.warning(
+                                "Execution lease not owned on shutdown "
+                                "(msg_id=%s); skipping immediate requeue and leaving entry pending",
+                                ctx.msg_id,
+                            )
+                    except Exception as lease_err:
+                        lease_released = False
+                        logger.warning(
+                            "Failed to release execution lease on shutdown "
+                            "(msg_id=%s): %s; leaving entry pending",
+                            ctx.msg_id,
+                            type(lease_err).__name__,
+                        )
+                else:
+                    lease_released = False
+                    logger.warning(
+                        "No Redis connection to release execution lease on shutdown "
+                        "(msg_id=%s); skipping immediate requeue and leaving entry pending",
+                        ctx.msg_id,
                     )
+
+            if self.requeue_on_shutdown and lease_released:
+                if redis_conn is None:
+                    logger.warning(
+                        "No Redis connection to requeue unfinished message on shutdown "
+                        "(msg_id=%s); leaving entry pending",
+                        ctx.msg_id,
+                    )
+                    continue
+                try:
+                    retry_count = self._parse_retry_count(ctx.fields)
+                except Exception:
+                    retry_count = 0
+                try:
+                    requeued = await self._requeue_once(
+                        redis_conn,
+                        ctx.msg_id,
+                        ctx.fields,
+                        retry_count,
+                        immediate=True,
+                    )
+                    if requeued:
+                        await self.delivery.ack(redis_conn, ctx.msg_id)
+                        self._in_flight_ids.discard(ctx.msg_id)
+                        logger.info(
+                            "Requeued unfinished message on graceful shutdown "
+                            "(msg_id=%s, retries=%d)",
+                            ctx.msg_id,
+                            retry_count,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to requeue unfinished message on shutdown "
+                        "(msg_id=%s): %s; leaving entry pending",
+                        ctx.msg_id,
+                        type(exc).__name__,
+                    )
+
+    async def _abort_unfinished_futures(
+        self, unfinished: list[asyncio.Future[Any]]
+    ) -> None:
+        """Hook appelé en sortie de boucle sur les futures non terminées après vidange."""
+        if not self.use_execution_lease and not self.requeue_on_shutdown:
+            return
+        contexts_to_abort = self._reserve_unfinished_contexts_for_shutdown(unfinished)
+        if not contexts_to_abort:
+            return
+        await self._release_and_requeue_shutdown_contexts(contexts_to_abort)
 
     @abstractmethod
     def _submit_message(
@@ -325,7 +451,12 @@ class BaseConsumer(ABC, Generic[T]):
             return
         if any(
             t is not None and not t.done()
-            for t in (self.listener_task, self.reclaimer_task, self.heartbeat_task)
+            for t in (
+                self.listener_task,
+                self.reclaimer_task,
+                self.heartbeat_task,
+                self.delayed_retry_task,
+            )
         ):
             await self._stop_tasks_only()
 
@@ -360,6 +491,10 @@ class BaseConsumer(ABC, Generic[T]):
             self._heartbeat_in_flight_entries(),
             name=f"consumer-heartbeat:{self.stream_name}",
         )
+        self.delayed_retry_task = asyncio.create_task(
+            self._delayed_retry_promotion_loop(),
+            name=f"consumer-delayed-retry:{self.stream_name}",
+        )
         logger.info(
             "%s started in background (stream='%s', group='%s', consumer='%s', max_in_flight=%d)",
             type(self).__name__,
@@ -375,7 +510,11 @@ class BaseConsumer(ABC, Generic[T]):
 
         worker_tasks = [
             t
-            for t in (self.listener_task, self.reclaimer_task)
+            for t in (
+                self.listener_task,
+                self.reclaimer_task,
+                self.delayed_retry_task,
+            )
             if t is not None and not t.done()
         ]
         if worker_tasks:
@@ -434,6 +573,7 @@ class BaseConsumer(ABC, Generic[T]):
         self.listener_task = None
         self.reclaimer_task = None
         self.heartbeat_task = None
+        self.delayed_retry_task = None
 
     async def stop(self) -> None:
         """Arrête proprement les tâches de fond en maintenant le battement pendant la vidange."""
@@ -473,6 +613,10 @@ class BaseConsumer(ABC, Generic[T]):
                 self.reclaimer_task = tg.create_task(
                     self._reclaim_pending_messages(),
                     name=f"reclaimer-{self.consumer_name}",
+                )
+                self.delayed_retry_task = tg.create_task(
+                    self._delayed_retry_promotion_loop(),
+                    name=f"delayed-retry-{self.consumer_name}",
                 )
                 self.listener_task = tg.create_task(
                     self._start_listening_messages(),
@@ -610,33 +754,10 @@ class BaseConsumer(ABC, Generic[T]):
 
                 # 1. Nettoyage des tâches terminées (ACK/DLQ)
                 done_futures = [f for f in active_futures if f.done()]
-
-                for fut in done_futures:
-                    msg_id, fields = active_futures.pop(fut)
-                    self._processing_futures.discard(fut)
-                    ctx = self._in_flight_contexts.pop(msg_id, None)
-                    # Un tracker avorté (bail expiré, arrêt) ne doit jamais être
-                    # acquitté comme un succès : la tentative a été fencée, sa
-                    # persistance sautée. La laisser dans la PEL la rend récupérable.
-                    if ctx is not None and (ctx.handled or ctx.tracker.is_aborted):
-                        self._in_flight_ids.discard(msg_id)
-                        continue
-                    try:
-                        await self._handle_finished_future(
-                            fut, msg_id, fields, redis_conn
-                        )
-                    finally:
-                        if (
-                            self.use_execution_lease
-                            and ctx is not None
-                            and ctx.execution_id
-                            and ctx.lease_token
-                        ):
-                            with contextlib.suppress(Exception):
-                                await self.delivery.release_lease(
-                                    redis_conn, ctx.execution_id, ctx.lease_token
-                                )
-                        self._in_flight_ids.discard(msg_id)
+                if done_futures:
+                    await self._finalize_done_futures(
+                        done_futures, active_futures, redis_conn
+                    )
 
                 # 2. Calcul de la capacité restante
                 running_count = len(active_futures)
@@ -807,6 +928,7 @@ class BaseConsumer(ABC, Generic[T]):
                         ctx.future = fut
                         active_futures[fut] = (msg_id, fields)
                         self._processing_futures.add(fut)
+                        fut.add_done_callback(self._processing_futures.discard)
                     except Exception as submit_err:
                         logger.error(
                             "Failed to submit message %s for processing: %s",
@@ -861,6 +983,12 @@ class BaseConsumer(ABC, Generic[T]):
                         if unfinished:
                             await self._abort_unfinished_futures(unfinished)
                 finally:
+                    for f in list(active_futures):
+                        msg_id, _ = active_futures[f]
+                        ctx = self._in_flight_contexts.get(msg_id)
+                        if ctx is not None and ctx.handled:
+                            active_futures.pop(f, None)
+                            self._in_flight_contexts.pop(msg_id, None)
                     pending = {f for f in active_futures if not f.done()}
                     if pending:
                         pending_ids = {
@@ -873,7 +1001,9 @@ class BaseConsumer(ABC, Generic[T]):
                     else:
                         self._listener_done.set()
                         self._in_flight_ids.clear()
-                        self._processing_futures.clear()
+                        self._processing_futures.difference_update(
+                            {f for f in self._processing_futures if f.done()}
+                        )
                     self._listener_active = False
 
     async def _drain_pending(
@@ -920,15 +1050,30 @@ class BaseConsumer(ABC, Generic[T]):
                 continue
             msg_id, fields = popped
             ctx = self._in_flight_contexts.pop(msg_id, None)
-            # Idem dans le drain : un tracker avorté n'est jamais acquitté en succès.
+            # Un tracker avorté (bail expiré, arrêt) ne doit jamais être
+            # acquitté comme un succès : la tentative a été fencée, sa
+            # persistance sautée. La laisser dans la PEL la rend récupérable.
             if ctx is not None and (ctx.handled or ctx.tracker.is_aborted):
                 self._in_flight_ids.discard(msg_id)
                 continue
+            lease_released = False
             try:
+                if (
+                    self.use_execution_lease
+                    and ctx is not None
+                    and ctx.execution_id
+                    and ctx.lease_token
+                ):
+                    with contextlib.suppress(Exception):
+                        await self.delivery.release_lease(
+                            redis_conn, ctx.execution_id, ctx.lease_token
+                        )
+                    lease_released = True
                 await self._handle_finished_future(fut, msg_id, fields, redis_conn)
             finally:
                 if (
-                    self.use_execution_lease
+                    not lease_released
+                    and self.use_execution_lease
                     and ctx is not None
                     and ctx.execution_id
                     and ctx.lease_token
@@ -955,6 +1100,8 @@ class BaseConsumer(ABC, Generic[T]):
             self.delivery,
             self._requeue_once,
             self._send_to_dlq,
+            on_terminal_failure=self._notify_terminal_failure,
+            has_scheduled_retry=self.delivery.has_scheduled_retry,
         )
 
     async def _ensure_consumer_group(self, redis_connection: Redis) -> None:
@@ -1146,14 +1293,22 @@ class BaseConsumer(ABC, Generic[T]):
             )
             return False
 
+    def _get_retry_backoff_delay_s(self, attempts: int) -> float:
+        if not self.retry_backoff_delays_s:
+            return 0.0
+        index = min(max(attempts - 1, 0), len(self.retry_backoff_delays_s) - 1)
+        return float(self.retry_backoff_delays_s[index])
+
     async def _requeue_once(
         self,
         redis_connection: Redis,
         msg_id: str,
         data_or_fields: str | dict[str, Any],
         attempts: int,
+        *,
+        immediate: bool = False,
     ) -> bool:
-        """Remet une entrée en file de façon atomique et idempotente via Lua.
+        """Remet une entrée en file (immédiate ou différée via ZSET) de façon atomique et idempotente via Lua.
 
         Retourne True si l'opération a réussi (copie créée ou déjà présente) ;
         lève une exception sur erreur Redis afin que l'appelant laisse l'entrée
@@ -1166,8 +1321,61 @@ class BaseConsumer(ABC, Generic[T]):
         else:
             fields = data_or_fields
         requeued_fields = self._build_requeue_fields(fields, msg_id, attempts)
-        return await self.delivery.requeue(
-            redis_connection, msg_id, requeued_fields, attempts
+        delay_s = 0.0 if immediate else self._get_retry_backoff_delay_s(attempts)
+        if delay_s <= 0.0:
+            return await self.delivery.requeue(
+                redis_connection, msg_id, requeued_fields, attempts
+            )
+        due_at_ms = int(time.time() * 1000) + int(delay_s * 1000)
+        execution_id = self._extract_execution_id(None, requeued_fields)
+        scheduled = await self.delivery.schedule_delayed_retry(
+            redis_connection, msg_id, requeued_fields, attempts, due_at_ms
+        )
+        logger.info(
+            "Scheduled delayed retry stream='%s' msg_id=%s execution_id=%s retries=%d delay_s=%.3f",
+            self.stream_name,
+            msg_id,
+            execution_id or "unknown",
+            attempts,
+            delay_s,
+        )
+        return scheduled
+
+    async def _delayed_retry_promotion_loop(self) -> None:
+        """Promeut périodiquement les messages arrivés à échéance depuis le ZSET de retry différé."""
+        logger.info(
+            "Delayed retry promoter task started (stream='%s', poll_interval=%.3fs)",
+            self.stream_name,
+            self.delayed_retry_poll_interval_s,
+        )
+        while not self.stop_flag.is_set():
+            try:
+                redis_conn = await self._ensure_connection()
+                if redis_conn is None:
+                    await self._sleep_unless_stopped(2.0)
+                    continue
+                now_ms = int(time.time() * 1000)
+                promoted_count = await self.delivery.promote_due_retries(
+                    redis_conn, now_ms=now_ms, batch_size=100
+                )
+                if promoted_count > 0:
+                    logger.info(
+                        "Promoted delayed retries stream='%s' promoted_count=%d",
+                        self.stream_name,
+                        promoted_count,
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self._invalidate_connection_on_transport_error(exc)
+                logger.warning(
+                    "Delayed retry promotion failed for stream='%s': %s",
+                    self.stream_name,
+                    type(exc).__name__,
+                )
+            await self._sleep_unless_stopped(self.delayed_retry_poll_interval_s)
+        logger.info(
+            "Delayed retry promoter task stopped (stream='%s')", self.stream_name
         )
 
     def _worker_tasks_done(self) -> bool:
@@ -1444,7 +1652,7 @@ class BaseConsumer(ABC, Generic[T]):
             )
             try:
                 requeued = await self._requeue_once(
-                    redis_conn, msg_id, ctx.fields, attempts
+                    redis_conn, msg_id, ctx.fields, attempts, immediate=True
                 )
                 if requeued:
                     await self.delivery.ack(redis_conn, msg_id)
@@ -1634,6 +1842,34 @@ class BaseConsumer(ABC, Generic[T]):
 
         attempts = retry_count + 1
         if attempts >= self.max_retry_number:
+            # Un arrêt gracieux peut avoir remis en file la dernière tentative en
+            # préservant `retries`, puis échoué sur l'ACK : si une copie existe déjà,
+            # acquitter l'original sans basculer en DLQ ni signaler un échec terminal.
+            try:
+                if await self.delivery.has_scheduled_retry(redis_connection, msg_id):
+                    logger.info(
+                        "Reclaimed message %s already has a replacement copy; "
+                        "acknowledging without DLQ",
+                        msg_id,
+                    )
+                    try:
+                        await self.delivery.ack(redis_connection, msg_id)
+                        logger.info(
+                            "Acknowledged reclaimed message %s (replacement already exists)",
+                            msg_id,
+                        )
+                    except Exception:
+                        logger.error("ACK failed for reclaimed message %s", msg_id)
+                    return
+            except Exception as check_err:
+                logger.error(
+                    "Failed to check existing replacement copy for reclaimed message %s: %s; "
+                    "leaving entry pending",
+                    msg_id,
+                    type(check_err).__name__,
+                )
+                return
+
             logger.error(
                 "Max attempts exceeded for reclaimed message %s. Moving to DLQ.",
                 msg_id,
@@ -1676,7 +1912,9 @@ class BaseConsumer(ABC, Generic[T]):
             return
 
         try:
-            await self._requeue_once(redis_connection, msg_id, fields, attempts)
+            await self._requeue_once(
+                redis_connection, msg_id, fields, attempts, immediate=True
+            )
             try:
                 await self.delivery.ack(redis_connection, msg_id)
                 logger.info("Acknowledged reclaimed message %s", msg_id)

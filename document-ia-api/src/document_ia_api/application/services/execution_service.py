@@ -2,24 +2,25 @@ import logging
 from typing import Any, Optional
 
 from fastapi import HTTPException
+from pydantic import SecretStr
 
 from document_ia_api.api.contracts.execution.failed import (
-    ExecutionFailedModel,
     ExecutionFailedData,
+    ExecutionFailedModel,
 )
 from document_ia_api.api.contracts.execution.result import (
     ClassificationResult,
     ExtractionResult,
 )
 from document_ia_api.api.contracts.execution.started import (
-    ExecutionStartedModel,
     ExecutionStartedData,
+    ExecutionStartedModel,
     S3FileInfo,
 )
 from document_ia_api.api.contracts.execution.success import (
     ExecutionSuccessModel,
-    SuccessResult,
     SuccessData,
+    SuccessResult,
 )
 from document_ia_api.api.contracts.execution.types import ExecutionStatus
 from document_ia_infra.core.model.typed_generic_model import GenericProperty
@@ -52,8 +53,42 @@ class ExecutionService:
     def __init__(self):
         pass
 
+    @staticmethod
+    def _build_started_model(
+        execution_id: str,
+        event_dto: EventDTO,
+        event_data: WorkflowExecutionStartedEvent,
+        *,
+        is_purged: bool = False,
+    ) -> ExecutionStartedModel:
+        file_info: Optional[S3FileInfo] = None
+        if event_data.s3_file_info is not None:
+            file_info = S3FileInfo(
+                file_name=event_data.s3_file_info.filename,
+                content_type=event_data.s3_file_info.content_type,
+                presigned_url=event_data.s3_file_info.presigned_url,
+            )
+        return ExecutionStartedModel(
+            id=execution_id,
+            status=ExecutionStatus.STARTED,
+            data=ExecutionStartedData(
+                created_at=event_dto.created_at,
+                s3_file_info=file_info,
+                file_url=(
+                    SecretStr(event_data.file_url)
+                    if event_data.file_url is not None
+                    else None
+                ),
+            ),
+            purged=is_purged,
+        )
+
     def get_event_model(
-        self, event_dto: EventDTO, execution_id: str, is_debug_mode: bool
+        self,
+        event_dto: EventDTO,
+        execution_id: str,
+        is_debug_mode: bool,
+        started_event_dto: Optional[EventDTO] = None,
     ) -> ExecutionStartedModel | ExecutionSuccessModel | ExecutionFailedModel:
         if event_dto.event_type not in (
             EventType.WORKFLOW_EXECUTION_STARTED,
@@ -66,24 +101,34 @@ class ExecutionService:
         event_data = decode_event_dto(event_dto)
         match event_data:
             case WorkflowExecutionStartedEvent():
-                file_info: Optional[S3FileInfo] = None
-                if event_data.s3_file_info is not None:
-                    file_info = S3FileInfo(
-                        file_name=event_data.s3_file_info.filename,
-                        content_type=event_data.s3_file_info.content_type,
-                        presigned_url=event_data.s3_file_info.presigned_url,
-                    )
-                return ExecutionStartedModel(
-                    id=execution_id,
-                    status=ExecutionStatus.STARTED,
-                    data=ExecutionStartedData(
-                        created_at=event_dto.created_at,
-                        s3_file_info=file_info,
-                        file_url=event_data.file_url,
-                    ),
-                    purged=is_purged,
+                return self._build_started_model(
+                    execution_id, event_dto, event_data, is_purged=is_purged
                 )
             case WorkflowExecutionFailedEvent():
+                if event_data.is_terminal is False:
+                    if started_event_dto is not None:
+                        started_data = decode_event_dto(started_event_dto)
+                        if isinstance(started_data, WorkflowExecutionStartedEvent):
+                            started_is_purged = (
+                                started_event_dto.anonymization_status
+                                == AnonymizationStatus.DONE
+                            )
+                            return self._build_started_model(
+                                execution_id,
+                                started_event_dto,
+                                started_data,
+                                is_purged=started_is_purged,
+                            )
+                    return ExecutionStartedModel(
+                        id=execution_id,
+                        status=ExecutionStatus.STARTED,
+                        data=ExecutionStartedData(
+                            created_at=event_dto.created_at,
+                            s3_file_info=None,
+                            file_url=None,
+                        ),
+                        purged=is_purged,
+                    )
                 return ExecutionFailedModel(
                     id=execution_id,
                     status=ExecutionStatus.FAILED,

@@ -820,3 +820,68 @@ async def test_call_webhook_notification_rejects_event_mapping_without_organizat
 
     get_event_model_mock.assert_not_called()
     mock_client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_webhook_notification_applies_backoff_on_event_repo_retryable_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When EventRepository translates a transient DB error into RetryableException,
+    WebhookNotificationService must still apply exponential backoff via _sleep_before_retry.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from document_ia_api.infra import webhook_notification_service as svc_mod
+
+    execution_id = str(uuid4())
+    webhook_dto = _sample_webhook_dto()
+    msg = WebHookMessage(workflow_execution_id=execution_id, webhook_id=webhook_dto.id)
+
+    class TooManyConnectionsError(Exception):
+        pass
+
+    transient_errors = (
+        OperationalError("SELECT 1", {}, ConnectionError("db down")),
+        DBAPIError.instance(
+            "SELECT 1",
+            {},
+            TooManyConnectionsError("remaining connection slots are reserved"),
+            Exception,
+        ),
+    )
+
+    class _FakeWebhookRepo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_by_id(self, _wid: Any) -> WebHookDTO | None:
+            return webhook_dto
+
+    monkeypatch.setattr(svc_mod, "WebHookRepository", _FakeWebhookRepo)
+
+    for db_exc in transient_errors:
+        mock_session = MagicMock()
+        mock_session.execute = AsyncMock(side_effect=db_exc)
+        mock_session.rollback = AsyncMock()
+
+        @asynccontextmanager
+        async def _fake_local_session():
+            yield mock_session
+
+        monkeypatch.setattr(
+            svc_mod.database_manager, "local_session", _fake_local_session
+        )
+
+        service = WebhookNotificationService(retry_initial_delay_seconds=1.0)
+        sleep_calls: list[tuple[int, bool]] = []
+
+        async def _record_sleep(*, retry_count: int, is_last_retry: bool) -> None:
+            sleep_calls.append((retry_count, is_last_retry))
+
+        monkeypatch.setattr(service, "_sleep_before_retry", _record_sleep)
+
+        with pytest.raises(RetryableException):
+            await service.handle_webhook_notification(
+                msg, retry_count=2, is_last_retry=False
+            )
+
+        assert sleep_calls == [(2, False)]

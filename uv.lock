@@ -646,7 +646,7 @@ wheels = [
 
 [[package]]
 name = "document-ia-api"
-version = "1.0.11"
+version = "1.1.1"
 source = { editable = "document-ia-api" }
 dependencies = [
     { name = "alembic" },
@@ -723,7 +723,7 @@ dev = [
 
 [[package]]
 name = "document-ia-auto-scaler"
-version = "1.0.1"
+version = "1.1.1"
 source = { editable = "document-ia-auto-scaler" }
 dependencies = [
     { name = "document-ia-infra" },
@@ -758,7 +758,7 @@ dev = [
 
 [[package]]
 name = "document-ia-evals"
-version = "1.0.11"
+version = "1.1.1"
 source = { editable = "document-ia-evals" }
 dependencies = [
     { name = "alembic" },
@@ -823,7 +823,7 @@ dev = [
 
 [[package]]
 name = "document-ia-infra"
-version = "1.0.11"
+version = "1.1.1"
 source = { editable = "document-ia-infra" }
 dependencies = [
     { name = "2ddoc-parser" },
@@ -896,7 +896,7 @@ dev = [
 
 [[package]]
 name = "document-ia-schemas"
-version = "1.0.11"
+version = "1.1.1"
 source = { editable = "document-ia-schemas" }
 dependencies = [
     { name = "pydantic" },
@@ -919,7 +919,7 @@ dev = [
 
 [[package]]
 name = "document-ia-worker"
-version = "1.0.11"
+version = "1.1.1"
 source = { editable = "document-ia-worker" }
 dependencies = [
     { name = "2ddoc-parser" },
