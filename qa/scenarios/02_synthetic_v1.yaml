@@ -1,0 +1,40 @@
+# Synthetic backward-compatibility tests for v1 workflow endpoints.
+scenarios:
+  - id: func-v1-2ddoc-compat
+    description: "v1 legacy document-2ddoc-extraction executes cleanly on minimal PDF"
+    tags: [baseline, functional, synthetic, v1]
+    request:
+      api_version: v1
+      mode: async
+      workflow_id: document-2ddoc-extraction
+      file: synthetic:minimal_pdf
+      metadata:
+        qa_scenario: func-v1-2ddoc-compat
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      barcodes:
+        min_count: 0
+
+  - id: func-v1-extraction-mistral-compat
+    description: "v1 legacy document-extraction-mistral-v1 extracts synthetic CNI fields"
+    tags: [baseline, functional, synthetic, v1]
+    request:
+      api_version: v1
+      mode: async
+      workflow_id: document-extraction-mistral-v1
+      file: synthetic:cni_pdf
+      extraction_parameters:
+        document-type: cni
+      metadata:
+        qa_scenario: func-v1-extraction-mistral-compat
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      extraction:
+        type: cni
+        properties:
+          nom: { iequals: "DUPONT" }
+          prenom: { iequals: "JEAN" }

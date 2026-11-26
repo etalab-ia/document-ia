@@ -1,0 +1,52 @@
+# Environment catalog for Document IA QA tool (NO SECRETS HERE).
+# Secrets are loaded from environment variables or .env.qa:
+#   QA_<ENV>_API_KEY
+#   QA_<ENV>_ADMIN_API_KEY
+#   QA_<ENV>_BASE_URL (optional override)
+
+environments:
+  local:
+    base_url: "http://localhost:8000"
+    profile: develop
+    api_key_env: dev
+    allow_load: true
+    allow_chaos: true
+    requires_explicit_allow: false
+    default_timeout_s: 30.0
+    default_poll_interval_s: 1.0
+    default_poll_timeout_s: 120.0
+
+  sandbox:
+    base_url: "https://api.sandbox.document-ia.beta.gouv.fr"
+    profile: baseline
+    api_key_env: sandbox
+    allow_load: true
+    allow_chaos: true
+    requires_explicit_allow: false
+    default_timeout_s: 60.0
+    default_poll_interval_s: 2.0
+    default_poll_timeout_s: 180.0
+
+  staging:
+    base_url: "https://api.staging.document-ia.beta.gouv.fr"
+    profile: develop
+    api_key_env: staging
+    aliases:
+      - develop
+    allow_load: true
+    allow_chaos: true
+    requires_explicit_allow: false
+    default_timeout_s: 60.0
+    default_poll_interval_s: 2.0
+    default_poll_timeout_s: 180.0
+
+  prod:
+    base_url: "https://api.document-ia.beta.gouv.fr"
+    profile: baseline
+    api_key_env: prod
+    allow_load: false
+    allow_chaos: false
+    requires_explicit_allow: true
+    default_timeout_s: 60.0
+    default_poll_interval_s: 2.0
+    default_poll_timeout_s: 180.0

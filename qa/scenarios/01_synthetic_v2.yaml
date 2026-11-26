@@ -1,0 +1,127 @@
+# Synthetic functional tests for v2 workflows (async, sync, overrides, and #170 date anomaly).
+scenarios:
+  - id: func-v2-barcode-async
+    description: "v2 barcode workflow processes a valid minimal PDF end-to-end"
+    tags: [baseline, functional, synthetic, v2]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-barcode-extraction-v2
+      file: synthetic:minimal_pdf
+      metadata:
+        qa_scenario: func-v2-barcode-async
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      barcodes:
+        min_count: 0
+
+  - id: func-v2-sync-png
+    description: "v2 synchronous execution processes a valid synthetic PNG"
+    tags: [baseline, functional, synthetic, v2]
+    request:
+      api_version: v2
+      mode: sync
+      workflow_id: document-barcode-extraction-v2
+      file: synthetic:valid_png
+      metadata:
+        qa_scenario: func-v2-sync-png
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      barcodes:
+        min_count: 0
+
+  - id: func-v2-cni-classification-extraction
+    description: "v2 full classification + extraction on synthetic CNI PDF"
+    tags: [baseline, functional, synthetic, v2]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-classification-extraction-v2
+      file: synthetic:cni_pdf
+      metadata:
+        qa_scenario: func-v2-cni-classification-extraction
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      classification:
+        document_type: cni
+        confidence: { gte: 0.7 }
+      extraction:
+        type: cni
+        properties:
+          nom: { iequals: "DUPONT" }
+          prenom: { iequals: "JEAN" }
+          date_naissance: { equals: "1990-05-14" }
+
+  - id: func-v2-extraction-forced-cni
+    description: "v2 forced extraction with document_type override on synthetic CNI PDF"
+    tags: [baseline, functional, synthetic, v2]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-extraction-v2
+      file: synthetic:cni_pdf
+      override:
+        llm_extract_data:
+          - param: document_type
+            value: cni
+      metadata:
+        qa_scenario: func-v2-extraction-forced-cni
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      extraction:
+        type: cni
+        properties:
+          nom: { iequals: "DUPONT" }
+          prenom: { iequals: "JEAN" }
+
+  - id: func-v2-classification-only
+    description: "v2 classification-only workflow identifies synthetic CNI PDF"
+    tags: [baseline, functional, synthetic, v2]
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-classification-v2
+      file: synthetic:cni_pdf
+      metadata:
+        qa_scenario: func-v2-classification-only
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      classification:
+        document_type: cni
+        confidence: { gte: 0.7 }
+
+  - id: func-v2-invalid-date-anomaly
+    description: "Impossible date (29/02/2026) yields value=null and anomaly.code=invalid_date (#170)"
+    tags: [develop, functional, synthetic, v2]
+    min_profile: develop
+    request:
+      api_version: v2
+      mode: async
+      workflow_id: document-extraction-v2
+      file: synthetic:invalid_date_pdf
+      override:
+        llm_extract_data:
+          - param: document_type
+            value: cni
+      metadata:
+        qa_scenario: func-v2-invalid-date-anomaly
+    expect:
+      http_status: 200
+      execution_status: SUCCESS
+      purged: false
+      extraction:
+        type: cni
+        properties:
+          date_expiration:
+            value: null
+            anomaly_code: "invalid_date"

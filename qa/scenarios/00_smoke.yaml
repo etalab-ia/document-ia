@@ -1,0 +1,44 @@
+# Smoke tests verifying API health, workflows catalog, and extraction schemas.
+scenarios:
+  - id: smoke-health
+    description: "GET /api/v1/health returns 200 with healthy S3, Redis, and PostgreSQL"
+    tags: [baseline, smoke, synthetic]
+    request:
+      mode: http
+      method: GET
+      path: /api/v1/health
+      auth: none
+    expect:
+      http_status: 200
+      json_path:
+        status: { equals: "healthy" }
+        s3.is_healthy: { equals: true }
+        redis.is_healthy: { equals: true }
+        database.is_healthy: { equals: true }
+
+  - id: smoke-workflows-v2
+    description: "GET /api/v2/workflows/ returns the 4 configured v2 workflows"
+    tags: [baseline, smoke, synthetic]
+    request:
+      mode: http
+      method: GET
+      path: /api/v2/workflows/
+      auth: default
+    expect:
+      http_status: 200
+      json_path:
+        status: { equals: "success" }
+        data.$length: { gte: 4 }
+
+  - id: smoke-extraction-schemas
+    description: "GET /api/v1/extraction-schemas returns a non-empty list of document schemas"
+    tags: [baseline, smoke, synthetic]
+    request:
+      mode: http
+      method: GET
+      path: /api/v1/extraction-schemas
+      auth: none
+    expect:
+      http_status: 200
+      json_path:
+        $length: { gte: 1 }
