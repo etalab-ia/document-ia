@@ -281,8 +281,14 @@ This rewrites **all** snapshots under `tests/snapshots/prompts/extraction/`. Rev
 - `REDIS_URL` (str, default: `None`)
 - `EVENT_STREAM_NAME` (str, default: `"event_stream"`)
 - `EVENT_STREAM_EXPIRATION` (int, default: `300`)
-- `EVENT_STREAM_MAXLEN` (int, default: `1000`)
+- `EVENT_STREAM_MAXLEN` (int, default: `100000`, legacy — publishers no longer trim)
 - `EVENT_CONSUMER_GROUP` (str, default: `"workflow_execution_consumer"`)
+- `STREAM_COMPLETED_RETENTION_SECONDS` (int, default: `86400`) — minimum retention age for completed stream entries before automatic cleanup
+- `STREAM_DLQ_RETENTION_SECONDS` (int, default: `604800`) — minimum retention age for DLQ entries before automatic cleanup
+- `STREAM_CLEANUP_BATCH_SIZE` (int, default: `100`, max `1000`) — max entries deleted per stream per Lua batch
+- `STREAM_MAINTENANCE_ENABLED` (bool, default: `True`) — enable automatic background Redis stream maintenance in the worker
+- `STREAM_MAINTENANCE_INTERVAL_SECONDS` (float, default: `60.0`) — interval in seconds between background maintenance passes (cluster-coordinated via Redis lock)
+- `STREAM_MAINTENANCE_MAX_BATCHES_PER_TICK` (int, default: `10`, max `100`) — maximum bounded batches per stream on each maintenance tick
 
 ### S3 / MinIO
 - `S3_ENDPOINT_URL` (str, default: `"http://localhost:9000"`)

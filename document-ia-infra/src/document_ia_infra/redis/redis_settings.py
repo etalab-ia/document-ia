@@ -51,6 +51,10 @@ class RedisSettings(BaseDocumentIaSettings):
     STREAM_COMPLETED_RETENTION_SECONDS: int = Field(default=86400, ge=1)
     STREAM_DLQ_RETENTION_SECONDS: int = Field(default=604800, ge=1)
     STREAM_CLEANUP_BATCH_SIZE: int = Field(default=100, ge=1, le=1000)
+    # Automatic background Redis stream maintenance (worker)
+    STREAM_MAINTENANCE_ENABLED: bool = Field(default=True)
+    STREAM_MAINTENANCE_INTERVAL_SECONDS: float = Field(default=60.0, gt=0.0, le=86400.0)
+    STREAM_MAINTENANCE_MAX_BATCHES_PER_TICK: int = Field(default=10, ge=1, le=100)
     # Operator-enabled, shared across instances; 0 keeps normal throughput.
     STREAM_RECOVERY_INTERVAL_MS: int = Field(default=0, ge=0, le=60000)
 
@@ -81,11 +85,13 @@ class RedisSettings(BaseDocumentIaSettings):
                 )
         return value
 
-    @field_validator("RETRY_DELAYED_POLL_INTERVAL_S")
+    @field_validator(
+        "RETRY_DELAYED_POLL_INTERVAL_S", "STREAM_MAINTENANCE_INTERVAL_SECONDS"
+    )
     @classmethod
-    def validate_delayed_retry_poll_interval(cls, value: float) -> float:
+    def validate_positive_finite_intervals(cls, value: float) -> float:
         if not math.isfinite(value):
-            raise ValueError("RETRY_DELAYED_POLL_INTERVAL_S must be finite")
+            raise ValueError("Interval settings must be finite")
         return value
 
     @field_validator("WORKER_DRAIN_TIMEOUT_S", "WORKER_SHUTDOWN_TIMEOUT_S")

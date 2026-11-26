@@ -16,6 +16,7 @@ from document_ia_infra.redis.model.workflow_execution_message import (
 from document_ia_infra.redis.redis_manager import RedisManager
 from document_ia_infra.redis.redis_settings import redis_settings
 from document_ia_worker.config.logging import setup_logging
+from document_ia_worker.core.redis_stream_maintainer import RedisStreamMaintainer
 from document_ia_worker.core.temp_file_sweeper import TempFileSweeper
 from document_ia_worker.core.two_ddoc_crl_refresher import TwoDDocCrlRefresher
 from document_ia_worker.workflow.message_handler import process_message
@@ -224,9 +225,10 @@ async def main() -> None:
     stop_event = asyncio.Event()
     registered_sigs = _register_signal_handlers(stop_event)
 
-    # Startup cleanup and periodic background sweeper for temporary files
+    # Startup cleanup and periodic background tasks (temp files & Redis stream retention)
     sweeper_redis_manager = RedisManager()
     sweeper_task: asyncio.Task[None] | None = None
+    maintenance_task: asyncio.Task[None] | None = None
     consumer_task: asyncio.Task[None] | None = None
     stop_wait: asyncio.Task[bool] | None = None
 
@@ -234,6 +236,11 @@ async def main() -> None:
         sweeper = TempFileSweeper(redis_manager=sweeper_redis_manager)
         await sweeper.startup_cleanup()
         sweeper_task = asyncio.create_task(sweeper.run_periodic_sweep(stop_event))
+
+        stream_maintainer = RedisStreamMaintainer(redis_manager=sweeper_redis_manager)
+        maintenance_task = asyncio.create_task(
+            stream_maintainer.run_periodic_maintenance(stop_event)
+        )
 
         consumer_task = asyncio.create_task(run_consumer(stop_event))
         stop_wait = asyncio.create_task(stop_event.wait())
@@ -296,6 +303,10 @@ async def main() -> None:
             sweeper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sweeper_task
+        if maintenance_task is not None and not maintenance_task.done():
+            maintenance_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await maintenance_task
         try:
             await asyncio.wait_for(sweeper_redis_manager.close(), timeout=2.0)
         except Exception as exc:

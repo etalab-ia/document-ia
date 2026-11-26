@@ -25,6 +25,21 @@ def _mock_two_ddoc_crl_refresher(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(worker_main, "TwoDDocCrlRefresher", NoOpCrlRefresher)
 
 
+@pytest.fixture(autouse=True)
+def _mock_redis_stream_maintainer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent any real Redis maintenance I/O in worker main shutdown unit tests."""
+    from document_ia_worker import main as worker_main
+
+    class NoOpStreamMaintainer:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run_periodic_maintenance(self, stop_event: asyncio.Event) -> None:
+            await stop_event.wait()
+
+    monkeypatch.setattr(worker_main, "RedisStreamMaintainer", NoOpStreamMaintainer)
+
+
 @pytest.mark.asyncio
 async def test_worker_main_sigterm_waits_for_consumer_graceful_drain(
     monkeypatch: pytest.MonkeyPatch,
@@ -344,3 +359,49 @@ async def test_run_consumer_passes_reclaim_drain_and_requeue_on_shutdown_setting
     )
     assert captured_kwargs["drain_timeout_s"] == redis_settings.WORKER_DRAIN_TIMEOUT_S
     assert captured_kwargs["requeue_on_shutdown"] is True
+
+
+@pytest.mark.asyncio
+async def test_worker_main_starts_and_stops_periodic_redis_stream_maintainer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """main() must start RedisStreamMaintainer in the background and stop it cleanly on shutdown."""
+    from document_ia_worker import main as worker_main
+
+    monkeypatch.setattr(worker_main, "_prewarm_models_and_trust_store", lambda: None)
+
+    maintainer_started = asyncio.Event()
+    maintainer_stopped = asyncio.Event()
+    received_managers: list[Any] = []
+
+    class TrackingStreamMaintainer:
+        def __init__(self, *, redis_manager: Any) -> None:
+            received_managers.append(redis_manager)
+
+        async def run_periodic_maintenance(self, stop_event: asyncio.Event) -> None:
+            maintainer_started.set()
+            try:
+                await stop_event.wait()
+            finally:
+                maintainer_stopped.set()
+
+    class FakeConsumer[T]:
+        def __init__(self, **_kwargs: Any) -> None:
+            self.stop_flag = asyncio.Event()
+            self.has_running_handlers = False
+
+        async def start_consumer(self) -> None:
+            await asyncio.wait_for(maintainer_started.wait(), timeout=2.0)
+            await self.stop_flag.wait()
+
+    monkeypatch.setattr(worker_main, "RedisStreamMaintainer", TrackingStreamMaintainer)
+    monkeypatch.setattr(worker_main, "ThreadConsumer", FakeConsumer)
+
+    main_task = asyncio.create_task(worker_main.main())
+    await asyncio.wait_for(maintainer_started.wait(), timeout=2.0)
+
+    os.kill(os.getpid(), signal.SIGTERM)
+    await asyncio.wait_for(main_task, timeout=2.0)
+
+    assert len(received_managers) == 1
+    assert maintainer_stopped.is_set()
