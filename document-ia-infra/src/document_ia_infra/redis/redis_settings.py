@@ -53,7 +53,7 @@ class RedisSettings(BaseDocumentIaSettings):
     STREAM_CLEANUP_BATCH_SIZE: int = Field(default=100, ge=1, le=1000)
     # Automatic background Redis stream maintenance (worker)
     STREAM_MAINTENANCE_ENABLED: bool = Field(default=True)
-    STREAM_MAINTENANCE_INTERVAL_SECONDS: float = Field(default=60.0, gt=0.0, le=86400.0)
+    STREAM_MAINTENANCE_INTERVAL_SECONDS: float = Field(default=60.0, ge=5.0, le=86400.0)
     STREAM_MAINTENANCE_MAX_BATCHES_PER_TICK: int = Field(default=10, ge=1, le=100)
     # Operator-enabled, shared across instances; 0 keeps normal throughput.
     STREAM_RECOVERY_INTERVAL_MS: int = Field(default=0, ge=0, le=60000)

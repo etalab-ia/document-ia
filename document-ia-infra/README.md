@@ -139,8 +139,8 @@ The first command is read-only. The second deletes at most
 `STREAM_CLEANUP_BATCH_SIZE` entries (default 100, maximum 1000) from each source
 and each DLQ. By default, `document-ia-worker` runs this cleanup automatically in
 the background (`RedisStreamMaintainer`, controlled by `STREAM_MAINTENANCE_ENABLED`,
-`STREAM_MAINTENANCE_INTERVAL_SECONDS=60`, and `STREAM_MAINTENANCE_MAX_BATCHES_PER_TICK=10`),
-coordinated across worker replicas with a Redis lock so retained history stays
+`STREAM_MAINTENANCE_INTERVAL_SECONDS=60` [min 5s], and `STREAM_MAINTENANCE_MAX_BATCHES_PER_TICK=10`),
+coordinated across worker replicas with a per-stream Redis lock (`<stream>:maintenance:lock`) so retained history stays
 below `ADMISSION_MAX_RETAINED` without requiring an external cron job. The CLI
 remains available for one-off inspection, manual cleanup, and webhook DLQ replay.
 Use a shorter interval or larger batch only after measuring Redis latency and

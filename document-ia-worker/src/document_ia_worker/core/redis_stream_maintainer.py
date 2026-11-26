@@ -8,9 +8,10 @@ counts stay below the API admission ceiling without manual cron intervention.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import logging
 import math
+import time
+from dataclasses import dataclass
 from uuid import uuid4
 
 from redis.asyncio import Redis
@@ -21,7 +22,7 @@ from document_ia_infra.redis.redis_settings import redis_settings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAINTENANCE_LOCK_KEY = "stream_maintenance:lock"
+DEFAULT_MAINTENANCE_LOCK_SUFFIX = "maintenance:lock"
 DEFAULT_OPERATION_TIMEOUT_SECONDS = 5.0
 
 
@@ -43,9 +44,10 @@ class StreamMaintenanceSummary:
 class RedisStreamMaintainer:
     """Periodic background service applying completion-aware Redis stream retention.
 
-    Coordinates across multiple worker replicas with a short-lived Redis lock so
-    that at most one instance runs maintenance per interval. Never raises on
-    Redis errors and never logs document payloads or raw exception details.
+    Coordinates across multiple worker replicas with a short-lived per-stream
+    Redis lock (`<stream>:maintenance:lock`) so that at most one instance runs
+    maintenance per stream and interval. Never raises on Redis errors and never
+    logs document payloads or raw exception details.
     """
 
     def __init__(
@@ -56,7 +58,7 @@ class RedisStreamMaintainer:
         interval_seconds: float | None = None,
         max_batches_per_tick: int | None = None,
         streams: tuple[str, ...] | None = None,
-        lock_key: str = DEFAULT_MAINTENANCE_LOCK_KEY,
+        lock_key_suffix: str = DEFAULT_MAINTENANCE_LOCK_SUFFIX,
         operation_timeout_seconds: float = DEFAULT_OPERATION_TIMEOUT_SECONDS,
     ) -> None:
         self.redis_manager: RedisManager = redis_manager
@@ -81,13 +83,15 @@ class RedisStreamMaintainer:
             if streams is None
             else streams
         )
-        self.lock_key: str = lock_key
+        self.lock_key_suffix: str = lock_key_suffix.strip()
         self.operation_timeout_seconds: float = float(operation_timeout_seconds)
 
         if not math.isfinite(self.interval_seconds) or self.interval_seconds <= 0:
             raise ValueError("interval_seconds must be finite and strictly positive")
         if self.max_batches_per_tick < 1:
             raise ValueError("max_batches_per_tick must be at least 1")
+        if not self.lock_key_suffix:
+            raise ValueError("lock_key_suffix must be a non-empty string")
         if (
             not math.isfinite(self.operation_timeout_seconds)
             or self.operation_timeout_seconds <= 0
@@ -101,11 +105,15 @@ class RedisStreamMaintainer:
         """Distributed slot duration in milliseconds (90% of the maintenance interval)."""
         return max(1, int(self.interval_seconds * 900.0))
 
-    async def _acquire_maintenance_slot(self, conn: Redis) -> bool:
-        """Acquire the cluster-wide maintenance slot for the current interval."""
+    def _lock_key_for_stream(self, stream: str) -> str:
+        """Build the Redis lock key scoped to a single stream."""
+        return f"{stream}:{self.lock_key_suffix}"
+
+    async def _acquire_maintenance_slot(self, conn: Redis, stream: str) -> bool:
+        """Acquire the cluster-wide maintenance slot for one stream."""
         acquired = await asyncio.wait_for(
             conn.set(
-                self.lock_key,
+                self._lock_key_for_stream(stream),
                 uuid4().hex,
                 nx=True,
                 px=self.lock_ttl_ms,
@@ -118,6 +126,9 @@ class RedisStreamMaintainer:
         self,
         conn: Redis,
         stream: str,
+        *,
+        stop_event: asyncio.Event | None = None,
+        deadline: float | None = None,
     ) -> StreamMaintenanceSummary | None:
         """Run bounded completion-aware retention batches on a single stream."""
         batch_size = redis_settings.STREAM_CLEANUP_BATCH_SIZE
@@ -128,6 +139,14 @@ class RedisStreamMaintainer:
 
         try:
             for _ in range(self.max_batches_per_tick):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if (
+                    deadline is not None
+                    and batches_run > 0
+                    and time.monotonic() >= deadline
+                ):
+                    break
                 result = await asyncio.wait_for(
                     maintain(conn, stream, apply=True),
                     timeout=self.operation_timeout_seconds,
@@ -145,9 +164,13 @@ class RedisStreamMaintainer:
             raise
         except Exception as exc:
             logger.warning(
-                "[stream-maintenance] Retention pass failed for stream=%s (%s)",
+                "[stream-maintenance] Retention pass failed for stream=%s (%s) "
+                "after batches=%d completed_deleted=%d dlq_deleted=%d",
                 stream,
                 type(exc).__name__,
+                batches_run,
+                completed_deleted,
+                dlq_deleted,
             )
             return None
 
@@ -194,13 +217,20 @@ class RedisStreamMaintainer:
 
         return summary
 
-    async def maintain_once(self) -> dict[str, StreamMaintenanceSummary] | None:
+    async def maintain_once(
+        self,
+        *,
+        stop_event: asyncio.Event | None = None,
+    ) -> dict[str, StreamMaintenanceSummary] | None:
         """Execute one cluster-coordinated maintenance pass across configured streams."""
         if not self.enabled:
             logger.debug(
                 "[stream-maintenance] Automatic Redis stream maintenance is disabled; skipping"
             )
             return None
+
+        if not self.streams:
+            return {}
 
         try:
             conn = await self.redis_manager.get_connection()
@@ -219,24 +249,37 @@ class RedisStreamMaintainer:
             )
             return None
 
-        try:
-            if not await self._acquire_maintenance_slot(conn):
-                logger.debug(
-                    "[stream-maintenance] Maintenance slot already held by another worker; skipping"
-                )
-                return None
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                "[stream-maintenance] Failed to acquire maintenance lock (%s)",
-                type(exc).__name__,
-            )
-            return None
-
         summaries: dict[str, StreamMaintenanceSummary] = {}
         for stream in self.streams:
-            summary = await self._maintain_stream(conn, stream)
+            if stop_event is not None and stop_event.is_set():
+                break
+
+            try:
+                acquired = await self._acquire_maintenance_slot(conn, stream)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[stream-maintenance] Failed to acquire maintenance lock for stream=%s (%s)",
+                    stream,
+                    type(exc).__name__,
+                )
+                continue
+
+            if not acquired:
+                logger.debug(
+                    "[stream-maintenance] Maintenance slot already held for stream=%s; skipping",
+                    stream,
+                )
+                continue
+
+            deadline = time.monotonic() + (self.lock_ttl_ms / 1000.0)
+            summary = await self._maintain_stream(
+                conn,
+                stream,
+                stop_event=stop_event,
+                deadline=deadline,
+            )
             if summary is not None:
                 summaries[stream] = summary
         return summaries
@@ -258,15 +301,18 @@ class RedisStreamMaintainer:
             self.max_batches_per_tick,
         )
 
-        while not stop_event.is_set():
-            await self.maintain_once()
-            try:
-                await asyncio.wait_for(
-                    stop_event.wait(),
-                    timeout=self.interval_seconds,
-                )
-                break
-            except TimeoutError:
-                pass
-
-        logger.info("[stream-maintenance] Periodic Redis stream maintenance stopped")
+        try:
+            while not stop_event.is_set():
+                await self.maintain_once(stop_event=stop_event)
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(),
+                        timeout=self.interval_seconds,
+                    )
+                    break
+                except TimeoutError:
+                    pass
+        finally:
+            logger.info(
+                "[stream-maintenance] Periodic Redis stream maintenance stopped"
+            )

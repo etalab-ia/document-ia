@@ -405,3 +405,92 @@ async def test_worker_main_starts_and_stops_periodic_redis_stream_maintainer(
 
     assert len(received_managers) == 1
     assert maintainer_stopped.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["normal", "consumer_crash"])
+async def test_run_consumer_starts_stream_maintainer_after_prewarm_and_cancels_before_closing_redis(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """run_consumer() must start RedisStreamMaintainer strictly after pre-warm and
+    cancel + await its task strictly before closing maintenance_redis_manager
+    (even when the consumer crashes without stop_event.set())."""
+    from document_ia_worker import main as worker_main
+
+    events: list[str] = []
+    maintainer_started = asyncio.Event()
+
+    def fake_prewarm() -> None:
+        events.append("prewarm")
+
+    class TrackingRedisManager:
+        def __init__(self, label: str) -> None:
+            self.label = label
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+            events.append(f"close:{self.label}")
+
+    created_managers: list[TrackingRedisManager] = []
+
+    def manager_factory() -> TrackingRedisManager:
+        label = "consumer" if not created_managers else "maintenance"
+        mgr = TrackingRedisManager(label)
+        created_managers.append(mgr)
+        return mgr
+
+    class TrackingStreamMaintainer:
+        def __init__(self, *, redis_manager: Any) -> None:
+            self.redis_manager = redis_manager
+            events.append("maintainer_init")
+
+        async def run_periodic_maintenance(self, stop_event: asyncio.Event) -> None:
+            events.append("maintainer_started")
+            maintainer_started.set()
+            try:
+                await stop_event.wait()
+            except asyncio.CancelledError:
+                events.append("maintainer_cancelled")
+                raise
+            finally:
+                events.append("maintainer_finished")
+
+    class TrackingConsumer[T]:
+        def __init__(self, **_kwargs: Any) -> None:
+            self.stop_flag = asyncio.Event()
+            self.has_running_handlers = False
+
+        async def start_consumer(self) -> None:
+            events.append("start_consumer")
+            await asyncio.wait_for(maintainer_started.wait(), timeout=2.0)
+            if outcome == "consumer_crash":
+                raise RuntimeError("consumer boom")
+
+    monkeypatch.setattr(worker_main, "_consumer", None)
+    monkeypatch.setattr(worker_main, "_prewarm_models_and_trust_store", fake_prewarm)
+    monkeypatch.setattr(worker_main, "RedisManager", manager_factory)
+    monkeypatch.setattr(worker_main, "RedisStreamMaintainer", TrackingStreamMaintainer)
+    monkeypatch.setattr(worker_main, "ThreadConsumer", TrackingConsumer)
+
+    external_stop_event = asyncio.Event()
+    if outcome == "consumer_crash":
+        with pytest.raises(RuntimeError, match="consumer boom"):
+            await asyncio.wait_for(
+                worker_main.run_consumer(external_stop_event),
+                timeout=2.0,
+            )
+    else:
+        await asyncio.wait_for(
+            worker_main.run_consumer(external_stop_event),
+            timeout=2.0,
+        )
+
+    assert len(created_managers) == 2
+    assert all(m.closed for m in created_managers)
+    assert events.index("prewarm") < events.index("maintainer_init")
+    assert events.index("prewarm") < events.index("maintainer_started")
+    assert events.index("maintainer_cancelled") < events.index("maintainer_finished")
+    assert events.index("maintainer_finished") < events.index("close:maintenance")
+    assert events.index("close:maintenance") < events.index("close:consumer")
