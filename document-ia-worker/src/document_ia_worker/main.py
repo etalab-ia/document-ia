@@ -16,6 +16,7 @@ from document_ia_infra.redis.model.workflow_execution_message import (
 from document_ia_infra.redis.redis_manager import RedisManager
 from document_ia_infra.redis.redis_settings import redis_settings
 from document_ia_worker.config.logging import setup_logging
+from document_ia_worker.core.redis_stream_maintainer import RedisStreamMaintainer
 from document_ia_worker.core.temp_file_sweeper import TempFileSweeper
 from document_ia_worker.core.two_ddoc_crl_refresher import TwoDDocCrlRefresher
 from document_ia_worker.workflow.message_handler import process_message
@@ -144,13 +145,16 @@ async def run_consumer(stop_event: asyncio.Event | None = None) -> None:
 
     crl_refresher = TwoDDocCrlRefresher()
     await crl_refresher.startup_refresh()
-    crl_stop_event = stop_event if stop_event is not None else asyncio.Event()
+    bg_stop_event = stop_event if stop_event is not None else asyncio.Event()
     crl_refresh_task: asyncio.Task[None] | None = None
+    maintenance_task: asyncio.Task[None] | None = None
 
     logger.info("Register redis stream consumer for workflow execution")
 
-    # This runtime owns the main-loop Redis pool; the consumer borrows it.
+    # This runtime owns the main-loop Redis pools; consumer and maintainer borrow them.
     redis_manager = RedisManager()
+    maintenance_redis_manager = RedisManager()
+    stream_maintainer = RedisStreamMaintainer(redis_manager=maintenance_redis_manager)
     _consumer = ThreadConsumer[WorkflowExecutionMessage](
         consumer_name=build_instance_consumer_name("document-ia-worker"),
         consumer_group=redis_settings.EVENT_CONSUMER_GROUP,
@@ -177,17 +181,35 @@ async def run_consumer(stop_event: asyncio.Event | None = None) -> None:
 
     try:
         crl_refresh_task = asyncio.create_task(
-            crl_refresher.run_periodic_refresh(crl_stop_event)
+            crl_refresher.run_periodic_refresh(bg_stop_event)
+        )
+        maintenance_task = asyncio.create_task(
+            stream_maintainer.run_periodic_maintenance(bg_stop_event)
         )
         await _consumer.start_consumer()
     finally:
         if stop_event is None:
-            crl_stop_event.set()
-        if crl_refresh_task is not None and not crl_refresh_task.done():
-            crl_refresh_task.cancel()
-        if crl_refresh_task is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await crl_refresh_task
+            bg_stop_event.set()
+        for bg_task in (crl_refresh_task, maintenance_task):
+            if bg_task is not None:
+                if not bg_task.done():
+                    bg_task.cancel()
+                try:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await bg_task
+                except Exception as exc:
+                    logger.warning(
+                        "Background worker task ended with error (%s)",
+                        type(exc).__name__,
+                    )
+        if maintenance_redis_manager is not redis_manager:
+            try:
+                await asyncio.wait_for(maintenance_redis_manager.close(), timeout=2.0)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to close stream maintenance Redis resources (%s)",
+                    type(exc).__name__,
+                )
         try:
             await asyncio.wait_for(redis_manager.close(), timeout=5)
         except Exception as exc:
@@ -224,7 +246,7 @@ async def main() -> None:
     stop_event = asyncio.Event()
     registered_sigs = _register_signal_handlers(stop_event)
 
-    # Startup cleanup and periodic background sweeper for temporary files
+    # Startup cleanup and periodic background temp file sweeping
     sweeper_redis_manager = RedisManager()
     sweeper_task: asyncio.Task[None] | None = None
     consumer_task: asyncio.Task[None] | None = None

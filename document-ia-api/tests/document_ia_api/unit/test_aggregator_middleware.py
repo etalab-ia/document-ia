@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from fastapi import Request
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse, Response
 
 from document_ia_api.api.middleware.aggregator_middleware import (
     AggregationMiddleware,
+    _get_route_paths,
+    _sanitize_aggregator_metrics,
     _wrap_response_and_capture,
     get_request_payload_safely,
 )
@@ -248,3 +252,269 @@ async def test_aggregation_middleware_zero_body_preview_in_entry(monkeypatch):
     assert entry["path_params"] == {"workflow_id": "wf-1"}
     assert entry["request_body"]["content_type"] == "application/json"
     assert entry["response_body"]["bytes"] > 0
+
+
+def test_sanitize_aggregator_metrics_allows_only_safe_scalars_and_keys():
+    secret_marker = "SECRET_SYNTHETIC_METRICS_VALUE_42"  # gitleaks:allow
+
+    assert _sanitize_aggregator_metrics(None) == {}
+    assert _sanitize_aggregator_metrics(["not", "a", "dict"]) == {}
+    assert _sanitize_aggregator_metrics(secret_marker) == {}
+
+    sanitized = _sanitize_aggregator_metrics(
+        {
+            "count_int": 12,
+            "ratio_float": 0.75,
+            "is_healthy": True,
+            "optional_none": None,
+            "forbidden_str": secret_marker,
+            "forbidden_bytes": b"secret_bytes",
+            "forbidden_dict": {"nested": secret_marker},
+            "forbidden_list": [1, 2, 3],
+            "forbidden_obj": object(),
+            "forbidden_nan": float("nan"),
+            "forbidden_inf": float("inf"),
+            "forbidden_neg_inf": float("-inf"),
+            "": 1,
+            "   ": 2,
+            "bad\nkey": 3,
+            "bad\rkey": 4,
+            "bad\x00key": 5,
+            123: 6,
+        }
+    )
+
+    assert sanitized == {
+        "count_int": 12,
+        "ratio_float": 0.75,
+        "is_healthy": True,
+        "optional_none": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_aggregation_middleware_emits_sanitized_metrics_only(monkeypatch):
+    logged_entries: list[dict] = []
+
+    mock_logger = MagicMock()
+    mock_logger.info.side_effect = lambda msg, extra=None: logged_entries.append(
+        json.loads(msg)
+    )
+    orig_get_logger = logging.getLogger
+
+    def patched_get_logger(name=None):
+        if name == "aggregator":
+            return mock_logger
+        return orig_get_logger(name)
+
+    monkeypatch.setattr(
+        "document_ia_api.api.middleware.aggregator_middleware.logging.getLogger",
+        patched_get_logger,
+    )
+
+    middleware = AggregationMiddleware(app=MagicMock())
+    secret_marker = "SECRET_SYNTHETIC_METRIC_LEAK_999"  # gitleaks:allow
+
+    request = MagicMock(spec=Request)
+    request.method = "GET"
+    request.url.path = "/api/v1/health"
+    request.client.host = "127.0.0.1"
+    request.headers = Headers({"x-request-id": "req-metrics-1"})
+    request.query_params = {}
+    request.path_params = {}
+    request.scope = {"route": MagicMock(path="/api/v1/health")}
+    request.state = SimpleNamespace(
+        request_id="req-metrics-1",
+        organization=None,
+        aggregator_payload={
+            "query_params": {},
+            "path_params": {},
+            "request_body": None,
+        },
+    )
+
+    async def call_next(req: Request) -> Response:
+        req.state.aggregator_metrics = {
+            "nb_execution_to_process": 10,
+            "queue_ratio": 0.5,
+            "redis_healthy": True,
+            "nullable_counter": None,
+            "secret_str": secret_marker,
+            "secret_dict": {"token": secret_marker},
+            "secret_list": [secret_marker],
+            "secret_bytes": secret_marker.encode(),
+            "nan_value": float("nan"),
+            "inf_value": float("inf"),
+            "bad\nkey": 99,
+            "": 1,
+        }
+        return JSONResponse(content={"status": "healthy"}, status_code=200)
+
+    response = await middleware.dispatch(request, call_next)
+    assert response.status_code == 200
+    assert len(logged_entries) == 1
+
+    entry = logged_entries[0]
+    assert entry["metrics"] == {
+        "nb_execution_to_process": 10,
+        "queue_ratio": 0.5,
+        "redis_healthy": True,
+        "nullable_counter": None,
+    }
+    assert secret_marker not in json.dumps(entry)
+
+
+@pytest.mark.asyncio
+async def test_aggregation_middleware_omits_metrics_when_absent_or_all_rejected(
+    monkeypatch,
+):
+    logged_entries: list[dict] = []
+
+    mock_logger = MagicMock()
+    mock_logger.info.side_effect = lambda msg, extra=None: logged_entries.append(
+        json.loads(msg)
+    )
+    orig_get_logger = logging.getLogger
+
+    def patched_get_logger(name=None):
+        if name == "aggregator":
+            return mock_logger
+        return orig_get_logger(name)
+
+    monkeypatch.setattr(
+        "document_ia_api.api.middleware.aggregator_middleware.logging.getLogger",
+        patched_get_logger,
+    )
+
+    middleware = AggregationMiddleware(app=MagicMock())
+
+    def _make_request(request_id: str) -> Request:
+        req = MagicMock(spec=Request)
+        req.method = "GET"
+        req.url.path = "/api/v1/health"
+        req.client.host = "127.0.0.1"
+        req.headers = Headers({"x-request-id": request_id})
+        req.query_params = {}
+        req.path_params = {}
+        req.scope = {"route": MagicMock(path="/api/v1/health")}
+        req.state = SimpleNamespace(
+            request_id=request_id,
+            organization=None,
+            aggregator_payload={
+                "query_params": {},
+                "path_params": {},
+                "request_body": None,
+            },
+        )
+        return req
+
+    # Case 1: request.state.aggregator_metrics not set at all
+    async def call_next_without_metrics(_: Request) -> Response:
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+    await middleware.dispatch(
+        _make_request("req-no-metrics"), call_next_without_metrics
+    )
+
+    # Case 2: request.state.aggregator_metrics contains only rejected keys/values
+    async def call_next_rejected_metrics(req: Request) -> Response:
+        req.state.aggregator_metrics = {
+            "secret": "SECRET_VALUE_MUST_BE_DROPPED",  # gitleaks:allow
+            "nested": {"a": 1},
+            "bad\rkey": 42,
+            "nan_val": float("nan"),
+        }
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+    await middleware.dispatch(
+        _make_request("req-rejected-metrics"), call_next_rejected_metrics
+    )
+
+    assert len(logged_entries) == 2
+    assert "metrics" not in logged_entries[0]
+    assert "metrics" not in logged_entries[1]
+    assert "SECRET_VALUE_MUST_BE_DROPPED" not in json.dumps(logged_entries[1])
+
+
+def test_aggregation_middleware_resolves_full_normalized_path_for_nested_routers(
+    monkeypatch,
+):
+    logged_records: list[tuple[dict, dict | None]] = []
+
+    def capture_log(msg: str, extra: dict | None = None) -> None:
+        logged_records.append((json.loads(msg), extra))
+
+    mock_logger = MagicMock()
+    mock_logger.info.side_effect = capture_log
+    orig_get_logger = logging.getLogger
+
+    def patched_get_logger(name=None):
+        if name == "aggregator":
+            return mock_logger
+        return orig_get_logger(name)
+
+    monkeypatch.setattr(
+        "document_ia_api.api.middleware.aggregator_middleware.logging.getLogger",
+        patched_get_logger,
+    )
+
+    app = FastAPI()
+    app.add_middleware(AggregationMiddleware)
+
+    v1_router = APIRouter(prefix="/v1")
+
+    @v1_router.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @v1_router.get("/executions/{execution_id}")
+    async def get_execution(execution_id: str) -> dict[str, str]:
+        return {"execution_id": execution_id}
+
+    api_router = APIRouter()
+    api_router.include_router(v1_router)
+    app.include_router(api_router, prefix="/api")
+
+    client = TestClient(app)
+
+    health_resp = client.get("/api/v1/health")
+    assert health_resp.status_code == 200
+
+    exec_resp = client.get("/api/v1/executions/exec-123")
+    assert exec_resp.status_code == 200
+
+    assert len(logged_records) == 2
+
+    health_entry, health_extra = logged_records[0]
+    assert health_entry["path"] == "/api/v1/health"
+    assert health_entry["normalized_path"] == "/api/v1/health"
+    assert health_extra is not None
+    assert health_extra["tags"]["normalized_path"] == "/api/v1/health"
+
+    exec_entry, exec_extra = logged_records[1]
+    assert exec_entry["path"] == "/api/v1/executions/exec-123"
+    assert exec_entry["normalized_path"] == "/api/v1/executions/{execution_id}"
+    assert exec_extra is not None
+    assert exec_extra["tags"]["normalized_path"] == "/api/v1/executions/{execution_id}"
+
+
+def test_get_route_paths_fallbacks_when_fastapi_scope_absent():
+    # Fallback 1: scope["fastapi"] absent, falls back to scope["route"].path
+    req_with_route = MagicMock(spec=Request)
+    req_with_route.url.path = "/direct/123"
+    req_with_route.scope = {"route": SimpleNamespace(path="/direct/{item_id}")}
+    assert _get_route_paths(req_with_route) == "/direct/{item_id}"
+
+    # Fallback 2: scope["route"].path empty, falls back to path_format
+    req_with_path_format = MagicMock(spec=Request)
+    req_with_path_format.url.path = "/direct/456"
+    req_with_path_format.scope = {
+        "route": SimpleNamespace(path="", path_format="/direct/{item_id}")
+    }
+    assert _get_route_paths(req_with_path_format) == "/direct/{item_id}"
+
+    # Fallback 3: neither fastapi nor route in scope, falls back to request.url.path
+    req_without_route = MagicMock(spec=Request)
+    req_without_route.url.path = "/unmatched/path"
+    req_without_route.scope = {}
+    assert _get_route_paths(req_without_route) == "/unmatched/path"
