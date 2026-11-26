@@ -1,7 +1,16 @@
-from unittest.mock import patch
+import json
+import logging
+from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from document_ia_api.api.exceptions.handler.exception_handlers import (
+    setup_exception_handlers,
+)
+from document_ia_api.api.middleware.aggregator_middleware import AggregationMiddleware
+from document_ia_api.api.routes import router
 from document_ia_api.infra.database.database_connectivity_status import (
     DatabaseConnectivityStatus,
 )
@@ -9,6 +18,14 @@ from document_ia_api.infra.redis.redis_connectivity_status import (
     RedisConnectivityStatus,
 )
 from document_ia_api.infra.s3.s3_connectivity_status import S3ConnectivityStatus
+
+
+def _create_aggregator_client() -> TestClient:
+    app = FastAPI(title="API Document IA - Health Aggregator Test")
+    app.add_middleware(AggregationMiddleware)
+    setup_exception_handlers(app)
+    app.include_router(router, prefix="/api", tags=["API"])
+    return TestClient(app)
 
 
 class TestHealthCheck:
@@ -199,6 +216,116 @@ class TestHealthCheck:
             assert "detail" in data
             assert "Internal Server Error" in data["detail"]
             assert "S3 service unavailable" in data["detail"]
+
+    @pytest.mark.asyncio
+    async def test_health_check_emits_redis_metrics_in_aggregator_log_on_200(
+        self, monkeypatch
+    ):
+        """Test GET /api/v1/health emits Redis queue metrics in aggregator log on HTTP 200."""
+        logged_entries: list[dict] = []
+
+        mock_logger = MagicMock()
+        mock_logger.info.side_effect = lambda msg, extra=None: logged_entries.append(
+            json.loads(msg)
+        )
+        orig_get_logger = logging.getLogger
+
+        def patched_get_logger(name=None):
+            if name == "aggregator":
+                return mock_logger
+            return orig_get_logger(name)
+
+        monkeypatch.setattr(
+            "document_ia_api.api.middleware.aggregator_middleware.logging.getLogger",
+            patched_get_logger,
+        )
+
+        client = _create_aggregator_client()
+
+        with (
+            patch(
+                "document_ia_api.infra.s3_service.s3_service.check_connectivity"
+            ) as mock_s3_check,
+            patch(
+                "document_ia_api.infra.redis_service.redis_service.check_connectivity"
+            ) as mock_redis_check,
+            patch(
+                "document_ia_api.infra.database_service.database_service.check_database_connectivity"
+            ) as mock_db_check,
+        ):
+            mock_s3_check.return_value = TestHealthCheck._getHealthyS3Connectivity()
+            mock_redis_check.return_value = (
+                TestHealthCheck._getHealthyRedisConnectivity()
+            )
+            mock_db_check.return_value = TestHealthCheck._getHealthyDBConnectivity()
+
+            response = client.get("/api/v1/health")
+
+        assert response.status_code == 200
+        assert len(logged_entries) == 1
+        entry = logged_entries[0]
+        assert entry["status_code"] == 200
+        assert entry["metrics"] == {
+            "nb_execution_to_process": 10,
+            "nb_execution_undelivered": 8,
+            "nb_execution_being_processed": 2,
+        }
+        assert "response_body_preview" not in entry
+
+    @pytest.mark.asyncio
+    async def test_health_check_emits_redis_metrics_in_aggregator_log_on_503(
+        self, monkeypatch
+    ):
+        """Test GET /api/v1/health emits Redis queue metrics in aggregator log on HTTP 503."""
+        logged_entries: list[dict] = []
+
+        mock_logger = MagicMock()
+        mock_logger.info.side_effect = lambda msg, extra=None: logged_entries.append(
+            json.loads(msg)
+        )
+        orig_get_logger = logging.getLogger
+
+        def patched_get_logger(name=None):
+            if name == "aggregator":
+                return mock_logger
+            return orig_get_logger(name)
+
+        monkeypatch.setattr(
+            "document_ia_api.api.middleware.aggregator_middleware.logging.getLogger",
+            patched_get_logger,
+        )
+
+        client = _create_aggregator_client()
+
+        with (
+            patch(
+                "document_ia_api.infra.s3_service.s3_service.check_connectivity"
+            ) as mock_s3_check,
+            patch(
+                "document_ia_api.infra.redis_service.redis_service.check_connectivity"
+            ) as mock_redis_check,
+            patch(
+                "document_ia_api.infra.database_service.database_service.check_database_connectivity"
+            ) as mock_db_check,
+        ):
+            mock_s3_check.return_value = TestHealthCheck._getUnhealthyS3Connectivity()
+            mock_redis_check.return_value = (
+                TestHealthCheck._getHealthyRedisConnectivity()
+            )
+            mock_db_check.return_value = TestHealthCheck._getHealthyDBConnectivity()
+
+            response = client.get("/api/v1/health")
+
+        assert response.status_code == 503
+        assert len(logged_entries) == 1
+        entry = logged_entries[0]
+        assert entry["status_code"] == 503
+        assert entry["metrics"] == {
+            "nb_execution_to_process": 10,
+            "nb_execution_undelivered": 8,
+            "nb_execution_being_processed": 2,
+        }
+        assert "response_body_preview" not in entry
 
     @staticmethod
     def _getHealthyS3Connectivity():
