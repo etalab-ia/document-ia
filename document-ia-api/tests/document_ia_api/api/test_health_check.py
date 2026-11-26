@@ -223,11 +223,14 @@ class TestHealthCheck:
     ):
         """Test GET /api/v1/health emits Redis queue metrics in aggregator log on HTTP 200."""
         logged_entries: list[dict] = []
+        logged_extras: list[dict | None] = []
+
+        def capture_log(msg: str, extra: dict | None = None) -> None:
+            logged_entries.append(json.loads(msg))
+            logged_extras.append(extra)
 
         mock_logger = MagicMock()
-        mock_logger.info.side_effect = lambda msg, extra=None: logged_entries.append(
-            json.loads(msg)
-        )
+        mock_logger.info.side_effect = capture_log
         orig_get_logger = logging.getLogger
 
         def patched_get_logger(name=None):
@@ -265,6 +268,9 @@ class TestHealthCheck:
         assert len(logged_entries) == 1
         entry = logged_entries[0]
         assert entry["status_code"] == 200
+        assert entry["normalized_path"] == "/api/v1/health"
+        assert logged_extras[0] is not None
+        assert logged_extras[0]["tags"]["normalized_path"] == "/api/v1/health"
         assert entry["metrics"] == {
             "nb_execution_to_process": 10,
             "nb_execution_undelivered": 8,
@@ -278,11 +284,14 @@ class TestHealthCheck:
     ):
         """Test GET /api/v1/health emits Redis queue metrics in aggregator log on HTTP 503."""
         logged_entries: list[dict] = []
+        logged_extras: list[dict | None] = []
+
+        def capture_log(msg: str, extra: dict | None = None) -> None:
+            logged_entries.append(json.loads(msg))
+            logged_extras.append(extra)
 
         mock_logger = MagicMock()
-        mock_logger.info.side_effect = lambda msg, extra=None: logged_entries.append(
-            json.loads(msg)
-        )
+        mock_logger.info.side_effect = capture_log
         orig_get_logger = logging.getLogger
 
         def patched_get_logger(name=None):
@@ -320,6 +329,9 @@ class TestHealthCheck:
         assert len(logged_entries) == 1
         entry = logged_entries[0]
         assert entry["status_code"] == 503
+        assert entry["normalized_path"] == "/api/v1/health"
+        assert logged_extras[0] is not None
+        assert logged_extras[0]["tags"]["normalized_path"] == "/api/v1/health"
         assert entry["metrics"] == {
             "nb_execution_to_process": 10,
             "nb_execution_undelivered": 8,

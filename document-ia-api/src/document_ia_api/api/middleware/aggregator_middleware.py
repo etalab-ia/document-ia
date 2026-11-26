@@ -112,18 +112,36 @@ async def get_request_payload_safely(request: Request) -> None:
         }
 
 
+def _extract_route_path(route_obj: Any) -> str | None:
+    """Extract a non-empty string path template from a route or route context."""
+    if route_obj is None:
+        return None
+    for attr in ("path", "path_format"):
+        candidate = getattr(route_obj, attr, None)
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
 def _get_route_paths(request: Request) -> str:
-    """Return route template or URL path."""
+    """Return full normalized route template or URL path.
+
+    In FastAPI >= 0.162 with included routers, ``scope["route"].path`` only
+    holds the sub-router relative path (e.g. ``"/health"``), whereas the full
+    effective route template (e.g. ``"/api/v1/health"``) is exposed via
+    ``scope["fastapi"]["effective_route_context"]``.
+    """
     normalized_path: str | None = None
     try:
         scope = cast(dict[str, Any], getattr(request, "scope", {}))
-        route = cast(Any, scope.get("route"))
-        if route is not None:
-            route_path = getattr(route, "path", None) or getattr(
-                route, "path_format", None
+        fastapi_scope = scope.get("fastapi")
+        if isinstance(fastapi_scope, dict):
+            fastapi_scope_dict = cast(dict[str, Any], fastapi_scope)
+            normalized_path = _extract_route_path(
+                fastapi_scope_dict.get("effective_route_context")
             )
-            if isinstance(route_path, str):
-                normalized_path = route_path
+        if not normalized_path:
+            normalized_path = _extract_route_path(scope.get("route"))
     except Exception:
         pass
     if not normalized_path:

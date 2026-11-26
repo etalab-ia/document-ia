@@ -6,12 +6,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from fastapi import Request
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse, Response
 
 from document_ia_api.api.middleware.aggregator_middleware import (
     AggregationMiddleware,
+    _get_route_paths,
     _sanitize_aggregator_metrics,
     _wrap_response_and_capture,
     get_request_payload_safely,
@@ -432,3 +434,87 @@ async def test_aggregation_middleware_omits_metrics_when_absent_or_all_rejected(
     assert "metrics" not in logged_entries[0]
     assert "metrics" not in logged_entries[1]
     assert "SECRET_VALUE_MUST_BE_DROPPED" not in json.dumps(logged_entries[1])
+
+
+def test_aggregation_middleware_resolves_full_normalized_path_for_nested_routers(
+    monkeypatch,
+):
+    logged_records: list[tuple[dict, dict | None]] = []
+
+    def capture_log(msg: str, extra: dict | None = None) -> None:
+        logged_records.append((json.loads(msg), extra))
+
+    mock_logger = MagicMock()
+    mock_logger.info.side_effect = capture_log
+    orig_get_logger = logging.getLogger
+
+    def patched_get_logger(name=None):
+        if name == "aggregator":
+            return mock_logger
+        return orig_get_logger(name)
+
+    monkeypatch.setattr(
+        "document_ia_api.api.middleware.aggregator_middleware.logging.getLogger",
+        patched_get_logger,
+    )
+
+    app = FastAPI()
+    app.add_middleware(AggregationMiddleware)
+
+    v1_router = APIRouter(prefix="/v1")
+
+    @v1_router.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @v1_router.get("/executions/{execution_id}")
+    async def get_execution(execution_id: str) -> dict[str, str]:
+        return {"execution_id": execution_id}
+
+    api_router = APIRouter()
+    api_router.include_router(v1_router)
+    app.include_router(api_router, prefix="/api")
+
+    client = TestClient(app)
+
+    health_resp = client.get("/api/v1/health")
+    assert health_resp.status_code == 200
+
+    exec_resp = client.get("/api/v1/executions/exec-123")
+    assert exec_resp.status_code == 200
+
+    assert len(logged_records) == 2
+
+    health_entry, health_extra = logged_records[0]
+    assert health_entry["path"] == "/api/v1/health"
+    assert health_entry["normalized_path"] == "/api/v1/health"
+    assert health_extra is not None
+    assert health_extra["tags"]["normalized_path"] == "/api/v1/health"
+
+    exec_entry, exec_extra = logged_records[1]
+    assert exec_entry["path"] == "/api/v1/executions/exec-123"
+    assert exec_entry["normalized_path"] == "/api/v1/executions/{execution_id}"
+    assert exec_extra is not None
+    assert exec_extra["tags"]["normalized_path"] == "/api/v1/executions/{execution_id}"
+
+
+def test_get_route_paths_fallbacks_when_fastapi_scope_absent():
+    # Fallback 1: scope["fastapi"] absent, falls back to scope["route"].path
+    req_with_route = MagicMock(spec=Request)
+    req_with_route.url.path = "/direct/123"
+    req_with_route.scope = {"route": SimpleNamespace(path="/direct/{item_id}")}
+    assert _get_route_paths(req_with_route) == "/direct/{item_id}"
+
+    # Fallback 2: scope["route"].path empty, falls back to path_format
+    req_with_path_format = MagicMock(spec=Request)
+    req_with_path_format.url.path = "/direct/456"
+    req_with_path_format.scope = {
+        "route": SimpleNamespace(path="", path_format="/direct/{item_id}")
+    }
+    assert _get_route_paths(req_with_path_format) == "/direct/{item_id}"
+
+    # Fallback 3: neither fastapi nor route in scope, falls back to request.url.path
+    req_without_route = MagicMock(spec=Request)
+    req_without_route.url.path = "/unmatched/path"
+    req_without_route.scope = {}
+    assert _get_route_paths(req_without_route) == "/unmatched/path"
