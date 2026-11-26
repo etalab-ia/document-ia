@@ -102,6 +102,26 @@ Instead of raw body strings or recursively dumped models, logs record structured
 }
 ```
 
+### 2.6 Opt-In Route Metrics (`metrics`)
+Endpoints that need to expose operational counters to Grafana/Loki without re-enabling response body capture (for example, `GET /api/v1/health` reporting Redis queue depths) may opt in by assigning a dictionary to `request.state.aggregator_metrics`.
+
+Before emitting the `aggregator` JSON log record, `AggregationMiddleware` passes this dictionary through `_sanitize_aggregator_metrics(...)`, which enforces a strict S2 scalar-only invariant:
+- **Keys**: must be non-empty `str` values without ASCII control characters (including `\n` and `\r`).
+- **Values**: only `int | float | bool | None` scalars are accepted (with `math.isfinite(value)` required for `float`).
+- **Strict Rejection**: any `str`, `bytes`, `list`, `dict`, arbitrary object, or non-finite float (`NaN`/`Inf`) is discarded, preventing secrets or PII from ever leaking through `metrics`.
+- **Omission when empty**: if `request.state.aggregator_metrics` is unset or all entries are rejected, the `"metrics"` field is omitted from the log entry.
+
+Example emitted by `GET /api/v1/health`:
+```json
+{
+  "metrics": {
+    "nb_execution_to_process": 10,
+    "nb_execution_undelivered": 8,
+    "nb_execution_being_processed": 2
+  }
+}
+```
+
 ---
 
 ## 3. Remote URLs and Webhook Security
